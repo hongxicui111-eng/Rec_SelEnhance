@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# CodeFlicker internal
+.codeflicker/
+
+# PyTorch model files
+*.pt
+*.pth
+*.bin
+
+# Log files
+*.log
+logs/
+
+# Large data files (keep data processing scripts)
+Recmodel/data/Beauty_train.txt
+Recmodel/data/Beauty_test.txt
+Recmodel/data/Beauty_val.txt
+Recmodel/data/id_meta_data.json
+
+# VLLM cache and models
+*.cache/
