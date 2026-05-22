@@ -26,6 +26,7 @@ from .prompts import MLE_ANALYSIS_PROMPT, STRUCTURE_OPTIMIZATION_PROMPT, ERROR_F
 from .llm_analyzer import LLMCaseAnalyzer
 from .structure_applier import StructureApplier
 from .iterative_memory import IterativeMemory
+from .context_compressor import LLMContextCompressor
 
 logger = logging.getLogger("rec_self_evolve.core")
 
@@ -58,6 +59,8 @@ class RecSelfEvolveAgent:
             model=self.config.llm_model,
             timeout=self.config.llm_timeout,
             max_retries=self.config.llm_max_retries,
+            max_context_tokens=self.config.llm_max_context_tokens,
+            prompt_safety_ratio=self.config.llm_prompt_safety_ratio,
         )
         self.trainer = FaultTolerantTrainRunner(
             adapter=self.adapter,
@@ -89,6 +92,12 @@ class RecSelfEvolveAgent:
         )
         self.parser = ProposalParser()
         self.fixer = LLMFixer(self.llm)
+        self.context_compressor = LLMContextCompressor(
+            self.llm,
+            enable_cache=self.config.llm_compression_enable_cache,
+            cache_ttl_seconds=self.config.llm_compression_cache_ttl_seconds,
+            cache_path=self.config.llm_compression_cache_path,
+        )
 
         # ---- 惊喜评估与案例分析 ----
         self.item_text_map = self._load_item_text_map()
@@ -530,6 +539,7 @@ class RecSelfEvolveAgent:
             # ── 构建当前源码上下文 ──
             source_code_ctx = self.adapter.build_source_code_context(
                 include_files=["models.py", "modules.py", "trainers.py"],
+                max_total_chars=7000,
             )
             
             # ── 构建错误详情 ──
@@ -933,6 +943,7 @@ class RecSelfEvolveAgent:
         # ── 构建源码上下文 ──
         source_code_ctx = self.adapter.build_source_code_context(
             include_files=["models.py", "modules.py", "trainers.py"],
+            max_total_chars=7000,
             iterative_memory=self.iter_memory,
         )
         
@@ -1152,6 +1163,7 @@ class RecSelfEvolveAgent:
         
         source_code_ctx = self.adapter.build_source_code_context(
             include_files=["models.py", "modules.py", "trainers.py"],
+            max_total_chars=7000,
             iterative_memory=self.iter_memory,
         )
         
@@ -1267,6 +1279,7 @@ class RecSelfEvolveAgent:
         
         source_code_ctx = self.adapter.build_source_code_context(
             include_files=["models.py", "modules.py", "trainers.py"],
+            max_total_chars=7000,
             iterative_memory=self.iter_memory,
         )
         
@@ -1686,7 +1699,8 @@ class RecSelfEvolveAgent:
             print(f"  🧠 LLM analyzing wrong cases (with source code context)...")
             # 获取模型源码摘要供案例分析使用
             source_summary = self.adapter.build_source_code_context(
-                include_files=["models.py", "modules.py"]
+                include_files=["models.py", "modules.py"],
+                max_total_chars=5000,
             )
             case_analysis = self.case_analyzer.analyze_wrong_cases(
                 text_cases=wrong_text_cases,
@@ -1830,11 +1844,21 @@ class RecSelfEvolveAgent:
         # 不再使用旧的截断方式，而是让 IterativeMemory 优先展示修改区域
         source_code_ctx = self.adapter.build_source_code_context(
             include_files=["models.py", "modules.py"],
+            max_total_chars=6500,
             iterative_memory=self.iter_memory,  # 传入 IterativeMemory → 智能截断!
         )
 
-        # 构建历史摘要
+        # 构建历史摘要（先取再限长，避免历史日志无限膨胀）
         journal_summary = self.journal.summarize(n=8)
+        if self.config.llm_enable_semantic_compression:
+            journal_summary = self.context_compressor.compress_text(
+                journal_summary,
+                chunk_chars=self.config.llm_compression_chunk_chars,
+                target_chars=self.config.llm_compression_target_chars,
+                section_name="journal_summary",
+                profile="journal",
+            )
+        journal_summary = self._clip_text_by_chars(journal_summary, max_chars=4500)
 
         # ── 构建结构修改历史 (使用 IterativeMemory 的完整因果链!) ──
         # 不再是旧的简短 60 字描述，而是完整的修改→效果→是否回滚 的因果链
@@ -1842,6 +1866,15 @@ class RecSelfEvolveAgent:
             current_iteration=self.current_iteration,
             current_metrics=metrics,
         )
+        if self.config.llm_enable_semantic_compression:
+            structural_history = self.context_compressor.compress_text(
+                structural_history,
+                chunk_chars=self.config.llm_compression_chunk_chars,
+                target_chars=max(4200, self.config.llm_compression_target_chars),
+                section_name="structural_history",
+                profile="history",
+            )
+        structural_history = self._clip_text_by_chars(structural_history, max_chars=6000)
 
         # ── 构建回滚黑名单 (如果有的话，这是让 LLM 不再踩坑的关键!) ──
         rollback_warning = self.iter_memory.build_rollback_aware_context()
@@ -2328,18 +2361,46 @@ class RecSelfEvolveAgent:
             # ── 1. 构建当前源码上下文 ──
             source_code_ctx = self.adapter.build_source_code_context(
                 include_files=["models.py", "modules.py", "trainers.py"],
+                max_total_chars=6500,
                 iterative_memory=self.iter_memory,
             )
             
             # ── 2. 构建历史摘要 ──
             journal_summary = self.journal.summarize(n=5)
-            
+            if self.config.llm_enable_semantic_compression:
+                journal_summary = self.context_compressor.compress_text(
+                    journal_summary,
+                    chunk_chars=self.config.llm_compression_chunk_chars,
+                    target_chars=3000,
+                    section_name="self_correction_journal",
+                    profile="journal",
+                )
+            journal_summary = self._clip_text_by_chars(journal_summary, max_chars=3000)
+
             # ── 3. 构建回滚黑名单 ──
             rollback_warning = self.iter_memory.build_rollback_aware_context()
+            if self.config.llm_enable_semantic_compression:
+                rollback_warning = self.context_compressor.compress_text(
+                    rollback_warning,
+                    chunk_chars=self.config.llm_compression_chunk_chars,
+                    target_chars=2200,
+                    section_name="rollback_warning",
+                    profile="rollback",
+                )
+            rollback_warning = self._clip_text_by_chars(rollback_warning, max_chars=3000)
             structural_history = self.iter_memory.build_history_context_for_llm(
                 current_iteration=iteration,
                 current_metrics=metrics_before,
             )
+            if self.config.llm_enable_semantic_compression:
+                structural_history = self.context_compressor.compress_text(
+                    structural_history,
+                    chunk_chars=self.config.llm_compression_chunk_chars,
+                    target_chars=3600,
+                    section_name="self_correction_struct_history",
+                    profile="history",
+                )
+            structural_history = self._clip_text_by_chars(structural_history, max_chars=4500)
             
             # ── 4. 构建 ERROR_FEEDBACK_PROMPT ──
             # 判断错误类型
@@ -2574,6 +2635,7 @@ class RecSelfEvolveAgent:
             # ── 1. 构建当前源码上下文 ──
             source_code_ctx = self.adapter.build_source_code_context(
                 include_files=["models.py", "modules.py", "trainers.py"],
+                max_total_chars=6500,
                 iterative_memory=self.iter_memory,
             )
             
@@ -2827,6 +2889,19 @@ class RecSelfEvolveAgent:
         temps = {"balanced": 0.7, "aggressive": 0.9,
                  "explorative": 0.85, "conservative": 0.4, "focused": 0.6}
         return temps.get(self.current_strategy, 0.7)
+
+    @staticmethod
+    def _clip_text_by_chars(text: str, max_chars: int) -> str:
+        """按字符裁剪上下文，保留头尾，避免单段文本无限增长。"""
+        if not text:
+            return ""
+        if len(text) <= max_chars:
+            return text
+        if max_chars < 120:
+            return text[:max_chars]
+        head = int(max_chars * 0.7)
+        tail = max_chars - head - 30
+        return text[:head] + "\n\n... [CLIPPED] ...\n\n" + text[-max(0, tail):]
 
     @staticmethod
     def _print_final_report(result: dict):

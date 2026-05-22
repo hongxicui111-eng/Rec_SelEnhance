@@ -36,6 +36,14 @@ def parse_args():
                            help="API Key")
     llm_group.add_argument("--llm-model", default=None,
                            help="模型名 (默认: Qwen2.5-72B-Instruct)")
+    llm_group.add_argument("--disable-semantic-compression", action="store_true",
+                           help="禁用 LLM 语义压缩")
+    llm_group.add_argument("--compression-chunk-chars", type=int, default=None,
+                           help="语义压缩分块字符数")
+    llm_group.add_argument("--compression-target-chars", type=int, default=None,
+                           help="语义压缩目标字符数")
+    llm_group.add_argument("--disable-compression-cache", action="store_true",
+                           help="禁用语义压缩缓存")
 
     # ---- 项目配置 ----
     proj_group = parser.add_argument_group("推荐模型配置")
@@ -121,6 +129,15 @@ def build_config(args) -> AgentConfig:
     config.llm_api_url = args.llm_url or os.environ.get("LLM_API_URL") or config.llm_api_url
     config.llm_api_key = args.llm_key or os.environ.get("LLM_API_KEY") or config.llm_api_key
     config.llm_model = args.llm_model or os.environ.get("LLM_MODEL") or config.llm_model
+
+    if args.disable_semantic_compression:
+        config.llm_enable_semantic_compression = False
+    if args.compression_chunk_chars is not None and args.compression_chunk_chars > 0:
+        config.llm_compression_chunk_chars = args.compression_chunk_chars
+    if args.compression_target_chars is not None and args.compression_target_chars > 0:
+        config.llm_compression_target_chars = args.compression_target_chars
+    if args.disable_compression_cache:
+        config.llm_compression_enable_cache = False
 
     # 项目
     config.project_root = args.project or os.environ.get("PROJECT_ROOT") or config.project_root

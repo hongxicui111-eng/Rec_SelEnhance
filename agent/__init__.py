@@ -18,5 +18,6 @@ from .config import AgentConfig
 from .llm_analyzer import LLMCaseAnalyzer
 from .structure_applier import StructureApplier
 from .iterative_memory import IterativeMemory
+from .context_compressor import LLMContextCompressor
 
 __version__ = "0.4.0"

@@ -314,7 +314,8 @@ class IterativeMemory:
 
     def build_history_context_for_llm(self, current_iteration: int,
                                        current_metrics: Optional[Dict] = None,
-                                       max_detail_iterations: int = 5) -> str:
+                                       max_detail_iterations: int = 5,
+                                       max_chars: int = 9000) -> str:
         """
         为 LLM 生成完整的历史修改感知上下文
         
@@ -437,8 +438,13 @@ class IterativeMemory:
         
         # ─── Section 5: 修改建议 ───
         parts.append(self._build_strategy_guidance())
-        
-        return "\n".join(parts)
+
+        full_text = "\n".join(parts)
+        if len(full_text) > max_chars:
+            head = int(max_chars * 0.7)
+            tail = max_chars - head - 30
+            full_text = full_text[:head] + "\n\n... [HISTORY CLIPPED] ...\n\n" + full_text[-max(0, tail):]
+        return full_text
 
     def build_rollback_aware_context(self) -> str:
         """

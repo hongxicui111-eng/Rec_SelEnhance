@@ -17,6 +17,16 @@ class AgentConfig:
     llm_max_retries: int = 3
     llm_temperature: float = 0.7
     llm_max_tokens: int = 8192
+    # LLM 上下文控制：防止 prompt 过长导致 context overflow
+    llm_max_context_tokens: int = 32768
+    llm_prompt_safety_ratio: float = 0.75
+    # LLM 语义压缩配置
+    llm_enable_semantic_compression: bool = True
+    llm_compression_chunk_chars: int = 5000
+    llm_compression_target_chars: int = 3500
+    llm_compression_enable_cache: bool = True
+    llm_compression_cache_ttl_seconds: int = 86400
+    llm_compression_cache_path: str = "logs/context_compression_cache.json"
 
     # ---- 项目路径 ----
     project_root: str = "/path/to/your/rec_project"
