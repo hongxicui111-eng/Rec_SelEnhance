@@ -89,11 +89,20 @@ class SeqRecAdapter:
     # --- 源码文件: LLM 可以修改项目中任何 .py 文件 ---
     # 不预设范围，LLM 可以直接指定任意 .py 文件路径
     SOURCE_FILE_MAP = {
+        # ── 核心模型文件 ──
         "models.py": "models.py",
         "modules.py": "modules.py",
         "trainers.py": "trainers.py",
         "datasets.py": "datasets.py",
-        # LLM 可以通过完整路径指定其他文件，如 "Recmodel/layers.py"
+        # ── 工具与评估文件 ──
+        "utils.py": "utils.py",
+        "error_case_extractor.py": "error_case_extractor.py",
+        "surprise_eval.py": "surprise_eval.py",
+        # ── 训练脚本 ──
+        "run_finetune_full.py": "run_finetune_full.py",
+        # ── 数据处理 ──
+        "data_process.py": "data/data_process.py",
+        # LLM 也可以通过完整路径指定其他文件
     }
 
     # --- 结构修改类型: 完全开放，没有预定义限制 ---
@@ -117,7 +126,7 @@ class SeqRecAdapter:
         },
         "replace_backbone": {
             "desc": "替换整个模型 backbone",
-            "note": "可以用任何模型替代 SASRec"},
+            "note": "可以用任何模型替代 SASRec"
         },
         "custom": {
             "desc": "任何其他自定义修改",
@@ -156,7 +165,7 @@ class SeqRecAdapter:
 
         # === 损失函数 (完全开放，LLM 可以探索任何损失) ===
         "loss_type": {"type": "str", "choices": None, "default": "InfoNCE", "soft_limit": True,
-                      "desc": "损失函数类型 (完全开放，自主选择)"}},
+                      "desc": "损失函数类型 (完全开放，自主选择)"},
         "temperature": {"type": "float", "range": [0.01, 2.0], "default": 0.1, "soft_limit": True,
                         "desc": "温度系数 (用于 InfoNCE 等对比学习损失，LLM 可探索 0.001~10.0)"},
         "margin": {"type": "float", "range": [0.0, 5.0], "default": 1.0, "soft_limit": True,
@@ -166,7 +175,7 @@ class SeqRecAdapter:
 
         # === 负采样策略 (完全开放，LLM 可以发明新采样策略) ===
         "neg_sampler": {"type": "str", "choices": None, "default": "Uniform", "soft_limit": True,
-                        "desc": "负采样策略 (完全开放，自主选择)"}},
+                        "desc": "负采样策略 (完全开放，自主选择)"},
         "N": {"type": "int", "range": [1, 10000], "default": 200, "soft_limit": True,
               "desc": "负采样候选数 (LLM 可探索 1~100000)"},
         "M": {"type": "int", "range": [1, 1000], "default": 10, "soft_limit": True,
@@ -174,7 +183,7 @@ class SeqRecAdapter:
 
         # === 对比学习 (完全开放) ===
         "CL_type": {"type": "str", "choices": None, "default": "Radical", "soft_limit": True,
-                    "desc": "对比学习类型 (完全开放，自主选择)"}},
+                    "desc": "对比学习类型 (完全开放，自主选择)"},
         "start_epoch": {"type": "int", "range": [0, 1000], "default": 30, "soft_limit": True,
                         "desc": "开始困难负采样的轮次 (LLM 可探索 0~10000)"},
         "K": {"type": "float", "range": [0.0, 1.0], "default": 0.05, "soft_limit": True,
@@ -188,7 +197,7 @@ class SeqRecAdapter:
 
         # === 模型结构参数 (新增，完全开放) ===
         "backbone": {"type": "str", "choices": None, "default": "SASRec", "soft_limit": True,
-                     "desc": "模型 backbone (完全开放，自主选择)"}},
+                     "desc": "模型 backbone (完全开放，自主选择)"},
         "embedding_dim": {"type": "int", "range": [16, 2048], "default": 64, "soft_limit": True,
                          "desc": "嵌入维度 (与 hidden_size 类似但独立，LLM 可探索 16~4096)"},
         "num_layers": {"type": "int", "range": [1, 32], "default": 2, "soft_limit": True,
@@ -196,7 +205,7 @@ class SeqRecAdapter:
 
         # === 优化器参数 (新增) ===
         "optimizer": {"type": "str", "choices": None, "default": "Adam", "soft_limit": True,
-                     "desc": "优化器类型 (完全开放，自主选择)"}},
+                     "desc": "优化器类型 (完全开放，自主选择)"},
         "adam_beta1": {"type": "float", "range": [0.0, 1.0], "default": 0.9, "soft_limit": True,
                        "desc": "Adam beta1 (0.0-1.0)"},
         "adam_beta2": {"type": "float", "range": [0.0, 1.0], "default": 0.999, "soft_limit": True,
@@ -206,7 +215,7 @@ class SeqRecAdapter:
 
         # === 学习率调度 (新增) ===
         "lr_scheduler": {"type": "str", "choices": None, "default": "none", "soft_limit": True,
-                        "desc": "学习率调度器 (完全开放，自主选择)"}},
+                        "desc": "学习率调度器 (完全开放，自主选择)"},
         "lr_decay_step": {"type": "int", "range": [1, 10000], "default": 1000, "soft_limit": True,
                           "desc": "学习率衰减步数"},
         "lr_decay_rate": {"type": "float", "range": [0.01, 1.0], "default": 0.5, "soft_limit": True,
@@ -566,10 +575,16 @@ Batch Size: {args.get('batch_size', '?')}
 }, indent=2, ensure_ascii=False)}
 ```
 
-**重要**: 上述修改类型不是限制! LLM 可以:
+### 可修改的源码文件 (Recmodel 目录下全部 .py 文件)
+```
+{json.dumps(self.SOURCE_FILE_MAP, indent=2, ensure_ascii=False)}
+```
+
+**重要**: 上述修改类型和文件列表不是限制! LLM 可以:
 1. 提出任何类型的结构修改，不需要局限于预定义类型
 2. 完全替换或重写任何组件
-3. 从对推荐系统的深度理解出发提出创新方案
+3. 修改任何 Recmodel 目录下的源码文件
+4. 从对推荐系统的深度理解出发提出创新方案
 
 ### 注意事项
 1. 训练脚本是 `run_finetune_full.py`，所有参数通过命令行传入
@@ -626,7 +641,7 @@ Batch Size: {args.get('batch_size', '?')}
         Returns:
             str: 格式化的源码上下文
         """
-        include_files = include_files or ["models.py", "modules.py", "trainers.py"]
+        include_files = include_files
         
         # ── 如果有 IterativeMemory，使用智能截断 ──
         if iterative_memory is not None:

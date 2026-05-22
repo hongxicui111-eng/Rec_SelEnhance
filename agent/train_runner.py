@@ -746,7 +746,7 @@ class FaultTolerantTrainRunner:
         预检: 在训练前先检查源码文件是否语法正确、能否导入
         
         Args:
-            source_files: 需要检查的源码文件列表 (默认: models.py, modules.py, trainers.py)
+            source_files: 需要检查的源码文件列表 (默认: Recmodel 目录下所有 .py 文件)
         
         Returns:
             {
@@ -756,7 +756,11 @@ class FaultTolerantTrainRunner:
             }
         """
         if source_files is None:
-            source_files = ["models.py", "modules.py", "trainers.py"]
+            source_files = [
+                "models.py", "modules.py", "trainers.py", "datasets.py",
+                "utils.py", "error_case_extractor.py", "surprise_eval.py",
+                "run_finetune_full.py",
+            ]
         
         errors = []
         files_checked = []

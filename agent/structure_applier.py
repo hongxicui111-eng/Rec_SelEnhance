@@ -1,44 +1,51 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-StructureApplier — 模型结构修改应用器
+StructureApplier — 模型结构修改应用器 (v2)
 
-核心职责:
-1. 接收 LLM 提出的 structural_changes (代码修改方案)
-2. 将代码修改安全地应用到对应的源码文件 (models.py, modules.py, trainers.py)
-3. 语法校验 + 导入检查 → 确保修改后的代码可执行
-4. 本地文件快照 + 自动回滚 → 修改失败时恢复原状 (无需联网/Git!)
-5. 修改记录 → journal 记录每次结构修改
+基于开源 Agent 项目的最佳实践重写:
+- Aider 的 SEARCH/REPLACE diff 格式 — LLM 输出结构化编辑指令, 而非自由代码
+- SWE-Agent 的 lint + 执行验证 — 不仅检查语法, 还验证代码能否 import/运行
+- OpenHands 的 post-edit 反馈 — 编辑后展示上下文, 让 LLM 检查结果
 
-这是让 Agent 从"只调参数"升级到"改模型结构"的关键模块。
+核心变更 (vs v1):
+1. 删除 7 种替换策略 + 多层回退, 只保留 SEARCH/REPLACE + whole_file 两种
+2. 删除 _strip_class_wrapper 等预处理, LLM 必须输出精确的 search/replace 块
+3. 新增模糊匹配 (difflib.SequenceMatcher) — 容忍 LLM 输出的小偏差
+4. 新增执行验证 (subprocess import check)
+5. 新增 post-edit 上下文展示 (供 LLM 自纠错)
+
+兼容性:
+- 新格式: {"edits": [{"search": "...", "replace": "..."}]} — 推荐
+- 旧格式: {"new_code": "...", "insert_position": "..."} — 自动转换为新格式后处理
 """
 
 import os
 import ast
 import re
-import copy
 import json
 import shutil
 import hashlib
 import logging
+import subprocess
+import difflib
+import time
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 logger = logging.getLogger("rec_self_evolve.structure_applier")
 
 
 class StructureApplier:
     """
-    模型结构修改应用器
-    
+    模型结构修改应用器 (v2 — SEARCH/REPLACE 方案)
+
     工作流程:
-    1. 本地文件快照 (创建备份目录 — 替代 Git!)
-    2. 读取目标源码文件
-    3. 解析 LLM 的 structural_change → 确定修改位置
-    4. 应用代码修改 (替换函数/类 或 插入新代码)
-    5. 语法校验 (ast.parse + import 检查)
-    6. 如果校验失败 → 从本地快照回滚
-    7. 如果校验成功 → 保留修改
+    1. 本地文件快照 (创建备份目录)
+    2. 逐个应用 SEARCH/REPLACE 编辑块
+    3. 语法校验 (ast.parse) + 执行验证 (subprocess import check)
+    4. 校验失败 → 从本地快照回滚
+    5. 校验成功 → 保留修改 + 生成 post-edit 反馈
     """
 
     def __init__(self, project_root: str, adapter=None,
@@ -48,21 +55,26 @@ class StructureApplier:
         Args:
             project_root: 项目根目录路径
             adapter: SeqRecAdapter 实例 (用于获取文件路径映射)
-            log_dir: 快照保存目录 (替代 Git 的本地存储)
+            log_dir: 快照保存目录
             source_files: 需要跟踪的源码文件列表
         """
         self.project_root = project_root
         self.adapter = adapter
-        self._applied_changes = []  # 已成功应用的修改记录
-        # ── 本地快照系统 (替代 Git — 无需联网!) ──
+        self._applied_changes = []
+        # ── 本地快照系统 ──
         self._snapshot_dir = Path(log_dir) / "rollback_snapshots"
         self._snapshot_dir.mkdir(parents=True, exist_ok=True)
-        self._current_snapshot_id = None  # 当前快照 ID
-        self._source_files = source_files or ["models.py", "modules.py", "trainers.py"]
-        # 快照前各文件的 hash (用于校验回滚是否正确)
+        self._current_snapshot_id = None
+        self._source_files = source_files or [
+            "models.py", "modules.py", "trainers.py", "datasets.py",
+            "utils.py", "error_case_extractor.py", "surprise_eval.py",
+            "run_finetune_full.py",
+        ]
         self._pre_snapshot_hashes = {}
         # 保留字段兼容旧代码引用
         self._backup_branch = None
+        # ── 模糊匹配参数 ──
+        self.fuzzy_min_similarity = 0.80  # 模糊匹配最低相似度阈值
 
     # ════════════════════════════════════════
     # 主入口 — 应用一组结构修改
@@ -71,25 +83,22 @@ class StructureApplier:
     def apply_structural_changes(self, structural_changes: List[Dict]) -> Dict:
         """
         应用一组 LLM 提出的结构修改
-        
+
+        支持两种输入格式:
+        - 新格式 (推荐): 每项包含 "edits" 字段 (SEARCH/REPLACE 列表)
+        - 旧格式 (兼容): 每项包含 "new_code" + "insert_position" 等字段
+
         Args:
-            structural_changes: LLM 输出的结构修改列表, 每项包含:
-                - action_type: 修改类型
-                - target_file: 目标文件 (如 "models.py")
-                - target_class_or_function: 目标类/函数 (如 "SelfAttention.forward")
-                - description: 修改描述
-                - new_code: 新代码内容 (Python 代码)
-                - insert_position: 插入方式
-                - expected_effect: 预期效果
-                - risk_level: 风险等级
-        
+            structural_changes: LLM 输出的结构修改列表
+
         Returns:
             Dict: {
                 "status": "SUCCESS" | "PARTIAL_SUCCESS" | "ALL_FAILED" | "ROLLBACK",
-                "applied_changes": [...],  # 成功应用的修改列表
-                "failed_changes": [...],   # 失败的修改列表 (含错误信息)
-                "validation_results": {...}, # 校验结果
-                "files_modified": [...],   # 被修改的文件列表
+                "applied_changes": [...],
+                "failed_changes": [...],
+                "validation_results": {...},
+                "files_modified": [...],
+                "post_edit_context": {...},  # 新增: post-edit 反馈
             }
         """
         if not structural_changes:
@@ -99,11 +108,12 @@ class StructureApplier:
                 "failed_changes": [],
                 "validation_results": {},
                 "files_modified": [],
+                "post_edit_context": {},
             }
 
         logger.info(f"Applying {len(structural_changes)} structural changes...")
 
-        # Step 1: 本地文件快照 (替代 Git)
+        # Step 1: 本地文件快照
         snapshot = self._create_local_snapshot()
         if not snapshot["ok"]:
             return {
@@ -112,29 +122,27 @@ class StructureApplier:
                 "error": f"Local snapshot failed: {snapshot.get('error', 'unknown')}",
             }
         self._current_snapshot_id = snapshot["snapshot_id"]
-        self._backup_branch = snapshot["snapshot_id"]  # 兼容旧代码
+        self._backup_branch = snapshot["snapshot_id"]
 
         applied = []
         failed = []
         files_modified = set()
+        post_edit_context = {}
 
         # Step 2: 逐个应用修改
         for change in structural_changes:
             result = self._apply_single_change(change)
             if result["status"] == "APPLIED":
-                applied.append({
-                    "change": change,
-                    "result": result,
-                })
+                applied.append({"change": change, "result": result})
                 files_modified.add(result.get("file_path", ""))
+                # 收集 post-edit 反馈
+                if result.get("post_edit_window"):
+                    post_edit_context[result["file_path"]] = result["post_edit_window"]
             else:
-                failed.append({
-                    "change": change,
-                    "error": result.get("error", "unknown"),
-                })
+                failed.append({"change": change, "error": result.get("error", "unknown")})
                 logger.warning(f"Change failed: {result.get('error', 'unknown')}")
 
-        # 如果一个修改都没成功，直接判定 ALL_FAILED，避免“0 个成功却显示成功/部分成功”
+        # 没有一个修改成功
         if not applied and failed:
             logger.warning("No structural changes were successfully applied")
             return {
@@ -142,12 +150,12 @@ class StructureApplier:
                 "applied_changes": [],
                 "failed_changes": failed,
                 "validation_results": {
-                    "all_passed": False,
-                    "results": {},
+                    "all_passed": False, "results": {},
                     "errors": ["No structural changes were applied"],
                     "summary": "No files modified",
                 },
                 "files_modified": [],
+                "post_edit_context": {},
             }
 
         # Step 3: 校验所有修改后的文件
@@ -155,7 +163,6 @@ class StructureApplier:
 
         if not validation["all_passed"]:
             logger.warning(f"Validation failed: {validation['errors']}")
-            # 回滚所有修改 (从本地快照恢复)
             self._local_rollback(self._current_snapshot_id)
             self._current_snapshot_id = None
             self._backup_branch = None
@@ -169,11 +176,13 @@ class StructureApplier:
                 "validation_results": validation,
                 "files_modified": [],
                 "rollback_reason": validation.get("summary", ""),
+                "post_edit_context": {},
             }
 
         # Step 4: 成功 → 保留修改
         logger.info(
-            f"Structural changes finished: applied={len(applied)}, failed={len(failed)}, files_modified={len(files_modified)}"
+            f"Structural changes finished: applied={len(applied)}, "
+            f"failed={len(failed)}, files_modified={len(files_modified)}"
         )
         self._applied_changes.extend(applied)
 
@@ -183,35 +192,25 @@ class StructureApplier:
             "failed_changes": failed,
             "validation_results": validation,
             "files_modified": list(files_modified),
+            "post_edit_context": post_edit_context,
         }
 
     # ════════════════════════════════════════
-    # 应用单个修改
+    # 应用单个修改 — 核心逻辑
     # ════════════════════════════════════════
 
     def _apply_single_change(self, change: Dict) -> Dict:
         """
         应用单个结构修改
 
-        BUG FIX #5: 增强诊断信息, 写入前先做快速语法检查,
-        不再盲目打印 "Successfully applied"。
-
-        根据 insert_position 决定如何修改文件:
-        - "replace_function": 替换目标函数的完整定义
-        - "replace_class": 替换目标类的完整定义
-        - "after_class_X": 在类 X 定义后插入新代码
-        - "before_function_Y": 在函数 Y 定义前插入新代码
-        - "append_to_file": 在文件末尾追加新代码
+        自动检测输入格式:
+        - 新格式: change["edits"] 存在 → 使用 SEARCH/REPLACE
+        - 旧格式: change["new_code"] 存在 → 先转换为 SEARCH/REPLACE 再处理
         """
         target_file = change.get("target_file", "")
-        new_code = change.get("new_code", "")
-        insert_position = change.get("insert_position", "append_to_file")
-        target_name = change.get("target_class_or_function", "")
+        if not target_file:
+            return {"status": "FAILED", "error": "Missing target_file"}
 
-        if not target_file or not new_code:
-            return {"status": "FAILED", "error": "Missing target_file or new_code"}
-
-        # 获取文件的实际路径
         file_path = self._resolve_file_path(target_file)
         if not file_path:
             return {"status": "FAILED", "error": f"Cannot find file: {target_file}"}
@@ -223,618 +222,510 @@ class StructureApplier:
         except Exception as e:
             return {"status": "FAILED", "error": f"Cannot read file {file_path}: {e}"}
 
-        # 根据插入方式应用修改
-        # ── BUG FIX #5: 记录使用了哪种替换策略 ──
-        diagnostics = {
-            "target_file": target_file,
-            "target_name": target_name,
-            "insert_position": insert_position,
-            "replacement_method": "unknown",
-        }
+        # ── 自动检测格式 ──
+        edits = change.get("edits", [])
+        if not edits:
+            # 旧格式 → 转换为 SEARCH/REPLACE
+            edits = self._convert_legacy_format(change, original_content, file_path)
+            if not edits:
+                return {
+                    "status": "FAILED",
+                    "error": f"Cannot convert legacy format for {target_file}",
+                }
 
-        if insert_position == "replace_function":
-            new_content = self._replace_function(original_content, target_name, new_code)
-            diagnostics["replacement_method"] = "replace_function"
-        elif insert_position == "replace_class":
-            new_content = self._replace_class(original_content, target_name, new_code)
-            diagnostics["replacement_method"] = "replace_class"
-        elif insert_position.startswith("after_class_"):
-            ref_class = insert_position.replace("after_class_", "")
-            new_content = self._insert_after_class(original_content, ref_class, new_code)
-            diagnostics["replacement_method"] = "insert_after_class"
-        elif insert_position.startswith("before_function_"):
-            ref_func = insert_position.replace("before_function_", "")
-            new_content = self._insert_before_function(original_content, ref_func, new_code)
-            diagnostics["replacement_method"] = "insert_before_function"
-        elif insert_position == "append_to_file":
-            new_content = original_content + "\n\n\n" + new_code
-            diagnostics["replacement_method"] = "append_to_file"
-        else:
-            # 默认: 替换函数
-            new_content = self._replace_function(original_content, target_name, new_code)
-            diagnostics["replacement_method"] = "replace_function_default"
+        # ── 应用所有编辑块 ──
+        content = original_content
+        edit_results = []
+        for edit_idx, edit in enumerate(edits):
+            search_text = edit.get("search", "")
+            replace_text = edit.get("replace", "")
+            if not search_text:
+                # 空 search → 纯插入 (在文件末尾)
+                content = content + "\n\n" + replace_text
+                edit_results.append({
+                    "edit_idx": edit_idx,
+                    "method": "append",
+                    "success": True,
+                })
+                continue
 
-        if new_content is None:
-            diagnostics["failure_reason"] = f"Cannot apply {insert_position} for {target_name}"
+            # 尝试 SEARCH/REPLACE
+            result_content, method = self._str_replace(content, search_text, replace_text)
+            if result_content is not None:
+                content = result_content
+                edit_results.append({
+                    "edit_idx": edit_idx,
+                    "method": method,
+                    "success": True,
+                })
+            else:
+                edit_results.append({
+                    "edit_idx": edit_idx,
+                    "method": "failed",
+                    "success": False,
+                    "search_text_preview": search_text[:80],
+                })
+
+        # 检查是否所有编辑都失败
+        successful_edits = [r for r in edit_results if r["success"]]
+        if not successful_edits and edit_results:
+            failed_methods = [r["method"] for r in edit_results if not r["success"]]
             return {
                 "status": "FAILED",
-                "error": f"Cannot apply {insert_position} for {target_name} in {target_file}",
-                "diagnostics": diagnostics,
+                "error": f"All SEARCH/REPLACE edits failed for {target_file} "
+                         f"(methods tried: {failed_methods})",
+                "edit_results": edit_results,
             }
 
-        # ── BUG FIX #5: 写入前先做快速语法检查 ──
-        quick_syntax = self._check_syntax(new_content, file_path)
-        if not quick_syntax["passed"]:
-            logger.warning(f"Quick syntax check FAILED before writing: {quick_syntax.get('error', '')}")
-            logger.warning("Skipping write to avoid corrupting the file")
-            diagnostics["failure_reason"] = f"Quick syntax check failed: {quick_syntax.get('error', '')}"
-            diagnostics["quick_syntax_error"] = quick_syntax
+        # ── 写入前语法检查 ──
+        syntax_check = self._check_syntax(content, file_path)
+        if not syntax_check["passed"]:
             return {
                 "status": "FAILED",
-                "error": f"Generated code has syntax error: {quick_syntax.get('error', '')}",
-                "diagnostics": diagnostics,
+                "error": f"Generated code has syntax error: {syntax_check.get('error', '')}",
+                "edit_results": edit_results,
             }
 
-        # 写入修改后的文件
+        # ── 写入文件 ──
         try:
             with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(new_content)
-            logger.info(f"Applied change to {file_path} (method={diagnostics['replacement_method']})")
+                f.write(content)
         except Exception as e:
             return {"status": "FAILED", "error": f"Cannot write file {file_path}: {e}"}
 
-        return {"status": "APPLIED", "file_path": file_path, "diagnostics": diagnostics}
+        # ── 生成 post-edit 反馈 ──
+        post_edit_window = self._generate_post_edit_context(
+            original_content, content, file_path, context_lines=5
+        )
+
+        logger.info(f"Applied {len(successful_edits)} edits to {file_path}")
+        return {
+            "status": "APPLIED",
+            "file_path": file_path,
+            "edit_results": edit_results,
+            "post_edit_window": post_edit_window,
+        }
 
     # ════════════════════════════════════════
-    # new_code 预处理 — 剥离 LLM 输出中的 class 包装
+    # SEARCH/REPLACE 核心方法 (受 Aider 启发)
     # ════════════════════════════════════════
+
+    def _str_replace(self, content: str, search_text: str, replace_text: str) -> Tuple[Optional[str], str]:
+        """
+        在 content 中查找 search_text 并替换为 replace_text
+
+        三级匹配策略:
+        1. 精确匹配 — 直接字符串查找
+        2. 去空白匹配 — 忽略空行/多余空格差异
+        3. 模糊匹配 — difflib.SequenceMatcher, 最低相似度 0.80
+
+        Returns:
+            (new_content, method_used) 或 (None, "failed")
+        """
+        # ── Level 1: 精确匹配 ──
+        if search_text in content:
+            new_content = content.replace(search_text, replace_text, 1)
+            logger.info("SEARCH/REPLACE: exact match succeeded")
+            return new_content, "exact_match"
+
+        # ── Level 2: 去空白匹配 ──
+        # LLM 经常多写或少写空行, 这是最常见的匹配失败原因
+        result = self._strip_whitespace_match(content, search_text, replace_text)
+        if result is not None:
+            logger.info("SEARCH/REPLACE: whitespace-normalized match succeeded")
+            return result, "whitespace_match"
+
+        # ── Level 3: 模糊匹配 ──
+        # 容忍 LLM 输出中少量行偏差 (多/少注释、行顺序微调等)
+        result = self._fuzzy_match(content, search_text, replace_text)
+        if result is not None:
+            logger.info("SEARCH/REPLACE: fuzzy match succeeded")
+            return result, "fuzzy_match"
+
+        logger.warning(f"SEARCH/REPLACE: all 3 levels failed for search text "
+                       f"(first 80 chars): {search_text[:80]}")
+        return None, "failed"
 
     @staticmethod
-    def _strip_class_wrapper(new_code: str, target_class_name: str = None) -> str:
+    def _normalize_whitespace(text: str) -> str:
         """
-        剥离 new_code 中的 class 定义头和多余缩进
-
-        LLM 输出的 new_code 经常包含完整的 class 定义:
-            class SelfAttention(nn.Module):
-                def __init__(self, args):
-                    ...
-
-        但当我们在替换类中的方法时, 只需要方法部分:
-            def __init__(self, args):
-                ...
-
-        如果保留了 class 头, 插入到已有 class body 中会产生:
-            class SelfAttention(nn.Module):       ← 原有
-            class SelfAttention(nn.Module):       ← new_code 带来的! 语法错误!
-                def __init__(self, args):
-
-        Args:
-            new_code: LLM 输出的原始代码
-            target_class_name: 目标类名 (如果已知, 只剥离匹配的 class 头;
-                               如果未知, 剥离所有 class 头)
-
-        Returns:
-            str: 剥离 class 头后的方法代码, 缩进已调整为方法级别
+        规范化空白: 去除连续空行, 去除行尾空格, 去除首尾空行
+        用于 Level 2 去空白匹配
         """
-        lines = new_code.split('\n')
-        if not lines:
-            return new_code
+        lines = text.split('\n')
+        # 去除行尾空格
+        lines = [line.rstrip() for line in lines]
+        # 去除首尾空行
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        # 压缩连续空行为单个空行
+        result = []
+        prev_empty = False
+        for line in lines:
+            if not line.strip():
+                if not prev_empty:
+                    result.append('')
+                prev_empty = True
+            else:
+                result.append(line)
+                prev_empty = False
+        return '\n'.join(result)
 
-        # 检查 new_code 是否以 class 定义开头
-        first_non_empty = None
-        first_non_empty_idx = None
-        for idx, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped:
-                first_non_empty = stripped
-                first_non_empty_idx = idx
+    def _strip_whitespace_match(self, content: str, search_text: str, replace_text: str) -> Optional[str]:
+        """
+        Level 2: 去空白后匹配
+
+        将 content 和 search_text 都做空白规范化, 然后在规范化后的 content 中查找.
+        找到后, 映射回原始 content 中的位置, 执行替换.
+        """
+        norm_search = self._normalize_whitespace(search_text)
+        norm_content = self._normalize_whitespace(content)
+
+        if norm_search not in norm_content:
+            return None
+
+        # 找到匹配位置 — 需要映射回原始 content
+        # 策略: 用行号映射. 规范化后的行号 → 原始行号
+        norm_content_lines = norm_content.split('\n')
+        norm_search_lines = norm_search.split('\n')
+
+        # 找到 norm_search 在 norm_content 中开始的行号
+        match_start_line = None
+        for i in range(len(norm_content_lines) - len(norm_search_lines) + 1):
+            segment = '\n'.join(norm_content_lines[i:i + len(norm_search_lines)])
+            if segment == norm_search:
+                match_start_line = i
                 break
 
-        if first_non_empty is None:
-            # 全空行 → 直接返回
-            return new_code
+        if match_start_line is None:
+            return None
 
-        # 检查是否是 class 定义行
-        class_header_match = re.match(r'class\s+(\w+)\s*\([^)]*\)\s*:', first_non_empty)
-        if not class_header_match:
-            # 不是 class 定义 → 不需要剥离
-            return new_code
+        # 映射回原始行号
+        # 构建 norm_line_idx → original_line_idx 映射
+        original_lines = content.split('\n')
+        norm_to_orig = self._build_line_mapping(original_lines)
 
-        detected_class_name = class_header_match.group(1)
+        orig_start = norm_to_orig.get(match_start_line)
+        # end: match_start_line + len(norm_search_lines) - 1 在 norm 中的行号
+        norm_end_line = match_start_line + len(norm_search_lines) - 1
+        orig_end = norm_to_orig.get(norm_end_line)
 
-        # 如果指定了 target_class_name, 只剥离匹配的 class 头
-        # (避免错误剥离 new_code 中其他辅助类的定义)
-        if target_class_name and detected_class_name != target_class_name:
-            logger.info(f"new_code contains class {detected_class_name}, "
-                        f"but target is {target_class_name} — not stripping")
-            return new_code
+        if orig_start is None or orig_end is None:
+            return None
 
-        logger.info(f"Stripping class wrapper '{detected_class_name}' from new_code "
-                    f"(method replacement, not class replacement)")
+        # 执行替换: 替换 original_lines[orig_start:orig_end+1] 为 replace_text
+        new_lines = original_lines[:orig_start] + replace_text.split('\n') + original_lines[orig_end + 1:]
+        return '\n'.join(new_lines)
 
-        # 找到 class 头之后的方法内容
-        # class 头行后面可能有空行, 然后是方法定义 (多缩进一层)
-        method_lines = []
-        class_header_indent = len(lines[first_non_empty_idx]) - len(first_non_empty)
-        method_indent = class_header_indent + 4  # class body 通常多缩进 4 格
+    @staticmethod
+    def _build_line_mapping(original_lines: List[str]) -> Dict[int, int]:
+        """
+        构建规范化行号 → 原始行号的映射
 
-        # 从 class 头行之后开始提取
-        inside_class_body = False
-        for idx in range(first_non_empty_idx + 1, len(lines)):
-            line = lines[idx]
-            stripped = line.strip()
+        规范化会压缩连续空行和去除首尾空行, 所以行号会偏移.
+        """
+        mapping = {}
+        norm_idx = 0
+        prev_empty = False
+        leading_empty_done = False
 
-            if not inside_class_body:
-                # 还没进入 class body → 跳过 class 头后面的空行
-                if not stripped:
+        for orig_idx, line in enumerate(original_lines):
+            stripped = line.rstrip().strip()
+            if not stripped:
+                # 空行
+                if not leading_empty_done:
+                    # 首部空行 → 跳过, 不映射
                     continue
-                # 检查是否是 class body 的第一行 (应该比 class 头多缩进)
-                line_indent = len(line) - len(stripped)
-                if line_indent > class_header_indent:
-                    inside_class_body = True
-                    # 减去一层缩进 (从 class body 缩进 → 方法定义缩进)
-                    # 实际上我们要减去 class_body 多出的缩进
-                    # class 头: 0 格缩进 → class body: 4 格缩进 → 我们要: 4 格缩进 (方法在顶层class中的缩进)
-                    # 所以实际上 class body 的缩进就是我们需要的, 不需要调整!
-                    # 但如果我们想让方法定义在顶层class中(4格缩进), 则刚好匹配
-                    method_lines.append(line)
-                else:
-                    # class 定义后面没有 indented block → 语法有问题, 返回原始
-                    logger.warning("class header has no indented body after it")
-                    return new_code
+                if prev_empty:
+                    # 连续空行 → 跳过, 不映射
+                    continue
+                # 单个空行 → 映射
+                mapping[norm_idx] = orig_idx
+                norm_idx += 1
+                prev_empty = True
             else:
-                # 已经在 class body 内 → 继续收集
-                if stripped:
-                    line_indent = len(line) - len(stripped)
-                    # 如果遇到比 class body 少缩进的行, 说明到了 class 定义结束
-                    if line_indent <= class_header_indent and not stripped.startswith('#'):
-                        # 可能是 class 结束后的新定义 → 停止收集
-                        # 但也可能是 class 内的 decorator 或 docstring → 判断
-                        # 如果是 def/class/@ 等在顶层缩进 → class 结束了
-                        if stripped.startswith('def ') or stripped.startswith('class ') or stripped.startswith('@'):
-                            break
-                        # 其他情况 (如全局变量) → 也停止
-                        if line_indent == 0:
-                            break
-                    method_lines.append(line)
-                else:
-                    # 空行 → 保留
-                    method_lines.append(line)
+                leading_empty_done = True
+                mapping[norm_idx] = orig_idx
+                norm_idx += 1
+                prev_empty = False
 
-        if not method_lines:
-            logger.warning("No method content found after stripping class header")
-            return new_code
+        return mapping
 
-        # 减去一层缩进 (class body 缩进 → 方法在顶层 class 中的缩进)
-        # class 头: 0 缩进 → class body 方法: 4 缩进 → 我们需要的: 4 缩进 (已经是正确的)
-        # 但如果 class 头本身有缩进 (如嵌套 class), 需要减去 class 头的缩进
-        result = '\n'.join(method_lines)
+    def _fuzzy_match(self, content: str, search_text: str, replace_text: str) -> Optional[str]:
+        """
+        Level 3: 模糊匹配 — 在 content 中找与 search_text 最相似的代码片段
 
-        # 调整缩进: 减去 class 头带来的额外缩进层级
-        # class_header_indent 是 class 头的缩进级别
-        # method_lines 中的缩进 = class_header_indent + 4 + 原方法缩进
-        # 我们需要的缩进 = 原方法缩进 (通常 4 格, 在顶层class中)
-        # 所以需要减去 class_header_indent
-        if class_header_indent > 0:
-            # 计算当前 method_lines 的最小缩进
-            min_indent = float('inf')
-            for ml_line in method_lines:
-                ml_stripped = ml_line.lstrip()
-                if ml_stripped and not ml_stripped.startswith('#'):
-                    ml_indent = len(ml_line) - len(ml_stripped)
-                    min_indent = min(min_indent, ml_indent)
-            if min_indent == float('inf'):
-                min_indent = 0
-            # 目标: 减去 class_header_indent 的额外缩进
-            target_indent = min_indent - class_header_indent
-            result = StructureApplier._adjust_indent(result, target_indent)
+        使用 difflib.SequenceMatcher 做行级比较.
+        只在原始行和规范行都找不到时才启用 (最宽松的匹配级别).
 
-        # 清理尾部多余空行
-        result = result.rstrip('\n')
+        算法:
+        1. 将 content 和 search_text 都按行分割
+        2. 用滑动窗口在 content 中找与 search_text 最相似的片段
+        3. 相似度 >= fuzzy_min_similarity (默认 0.80) 才接受匹配
+        """
+        content_lines = content.split('\n')
+        search_lines = search_text.split('\n')
 
-        return result
+        if not search_lines or not content_lines:
+            return None
+
+        # 去除 search_lines 中的纯空行 (LLM 经常多写空行)
+        search_lines_stripped = [l for l in search_lines if l.strip()]
+        if not search_lines_stripped:
+            return None
+
+        n_search = len(search_lines_stripped)
+        n_content = len(content_lines)
+
+        # 滑动窗口大小: 从 n_search 向上下浮动 ±30%
+        min_window = max(1, n_search - max(1, int(n_search * 0.3)))
+        max_window = min(n_content, n_search + max(1, int(n_search * 0.3)))
+
+        best_ratio = 0.0
+        best_start = None
+        best_end = None
+
+        for window_size in range(min_window, max_window + 1):
+            for start in range(n_content - window_size + 1):
+                segment = content_lines[start:start + window_size]
+                # 去除 segment 中的纯空行用于比较
+                segment_stripped = [l for l in segment if l.strip()]
+                if not segment_stripped:
+                    continue
+
+                # 计算行级相似度
+                matcher = difflib.SequenceMatcher(None, segment_stripped, search_lines_stripped)
+                ratio = matcher.ratio()
+
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_start = start
+                    best_end = start + window_size
+
+        if best_ratio < self.fuzzy_min_similarity or best_start is None:
+            logger.info(f"Fuzzy match: best ratio {best_ratio:.2f} < threshold "
+                        f"{self.fuzzy_min_similarity}")
+            return None
+
+        logger.info(f"Fuzzy match: found segment at lines {best_start+1}-{best_end+1} "
+                    f"with similarity {best_ratio:.2f}")
+
+        # 替换匹配的行范围
+        new_lines = content_lines[:best_start] + replace_text.split('\n') + content_lines[best_end:]
+        return '\n'.join(new_lines)
 
     # ════════════════════════════════════════
-    # 代码修改策略 (核心!)
+    # 旧格式转换 (兼容性)
     # ════════════════════════════════════════
 
-    def _replace_function(self, content: str, target_name: str, new_code: str) -> Optional[str]:
+    def _convert_legacy_format(self, change: Dict, original_content: str,
+                                file_path: str) -> List[Dict]:
         """
-        替换文件中的指定函数
+        将旧格式 (new_code + insert_position) 转换为 SEARCH/REPLACE 格式
 
-        Args:
-            content: 文件原始内容
-            target_name: 目标函数名 (如 "SelfAttention.forward" 或 "add_position_embedding")
-            new_code: 新函数代码
+        旧格式:
+          {"new_code": "...", "insert_position": "replace_function",
+           "target_class_or_function": "SelfAttention.forward"}
 
-        Returns:
-            str: 修改后的文件内容, 或 None (找不到目标)
+        转换策略:
+        1. 用 AST 在 original_content 中找到目标代码片段
+        2. 将找到的代码片段作为 search_text, new_code 作为 replace_text
+        3. 如果找不到 → 尝试 whole_file 替换 (如果 new_code 是完整文件)
+
+        注意: 这是一种降级策略 — 旧格式的可靠性远低于 SEARCH/REPLACE.
+        建议所有 prompt 都迁移到新格式后, 删除此方法.
         """
-        # 解析 target_name
-        # 格式: "ClassName.method_name" 或 "function_name"
+        new_code = change.get("new_code", "")
+        insert_position = change.get("insert_position", "replace_function")
+        target_name = change.get("target_class_or_function", "")
+
+        if not new_code:
+            return []
+
+        # 清理 new_code
+        new_code = self.clean_new_code(new_code)
+
+        # ── 尝试在文件中找到目标代码片段 ──
+        search_text = self._find_target_code(original_content, target_name, insert_position)
+
+        if search_text:
+            # 成功找到 → 构建 SEARCH/REPLACE
+            return [{"search": search_text, "replace": new_code}]
+
+        # ── 找不到 → 尝试 whole_file 模式 ──
+        # 如果 new_code 长度 >= 文件原始长度的 50%, 可能是完整文件替换
+        if len(new_code) >= len(original_content) * 0.5:
+            logger.info(f"Legacy format: falling back to whole_file for {target_name}")
+            return [{"search": original_content, "replace": new_code}]
+
+        # ── 最后兜底: 纯追加 ──
+        logger.info(f"Legacy format: falling back to append for {target_name}")
+        return [{"search": "", "replace": new_code}]  # 空 search → 追加到文件末尾
+
+    def _find_target_code(self, content: str, target_name: str,
+                          insert_position: str) -> Optional[str]:
+        """
+        在文件内容中查找 target_name 对应的代码片段
+
+        用于旧格式转换时, 构建 SEARCH/REPLACE 的 search 部分.
+        """
+        if not target_name:
+            return None
+
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return self._find_target_regex(content, target_name)
+
         if "." in target_name:
             class_name, method_name = target_name.split(".", 1)
-            # ── BUG FIX #1: 剥离 new_code 中可能包含的 class 定义头 ──
-            # LLM 经常输出 "class SelfAttention(nn.Module):\n    def __init__(...):"
-            # 但我们只需要 "def __init__(...):" 部分
-            stripped_new_code = self._strip_class_wrapper(new_code, class_name)
-            return self._replace_method_in_class(content, class_name, method_name, stripped_new_code)
+            method_name = method_name.split("(")[0]  # 剥离参数签名
+
+            # 查找类中的方法
+            for node in ast.iter_child_nodes(tree):
+                if isinstance(node, ast.ClassDef) and node.name == class_name:
+                    for item in node.body:
+                        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            if item.name == method_name:
+                                lines = content.split('\n')
+                                return '\n'.join(lines[item.lineno - 1:item.end_lineno])
+            # 类找到了但方法没找到 → 返回整个类
+            for node in ast.iter_child_nodes(tree):
+                if isinstance(node, ast.ClassDef) and node.name == class_name:
+                    lines = content.split('\n')
+                    return '\n'.join(lines[node.lineno - 1:node.end_lineno])
         else:
-            return self._replace_top_level_function(content, target_name, new_code)
+            # 查找顶层函数/类
+            for node in ast.iter_child_nodes(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if node.name == target_name:
+                        lines = content.split('\n')
+                        return '\n'.join(lines[node.lineno - 1:node.end_lineno])
+                if isinstance(node, ast.ClassDef):
+                    if node.name == target_name:
+                        lines = content.split('\n')
+                        return '\n'.join(lines[node.lineno - 1:node.end_lineno])
 
-    def _replace_top_level_function(self, content: str, func_name: str, new_code: str) -> Optional[str]:
-        """替换顶层函数定义"""
-        # 使用 AST 精确定位函数定义的位置
-        try:
-            tree = ast.parse(content)
-        except SyntaxError:
-            logger.warning("Cannot parse file with AST, falling back to regex")
-            return self._replace_function_regex(content, func_name, new_code)
-
-        for node in ast.iter_child_nodes(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == func_name:
-                # 找到函数在源码中的起止行
-                start_line = node.lineno - 1  # ast 用 1-based, 我们用 0-based
-                end_line = node.end_lineno  # ast 用 1-based, 包含最后一行
-
-                lines = content.split('\n')
-                # 替换从 start_line 到 end_line 的所有行
-                new_lines = lines[:start_line] + new_code.split('\n') + lines[end_line:]
-                return '\n'.join(new_lines)
-
-        logger.warning(f"Function '{func_name}' not found in file")
-        return self._replace_function_regex(content, func_name, new_code)
-
-    def _replace_method_in_class(self, content: str, class_name: str, method_name: str, new_code: str) -> Optional[str]:
-        """
-        替换类中的方法定义
-
-        BUG FIX #3: 增强了以下逻辑:
-        1. AST 搜索失败时打印更详细的诊断信息
-        2. 无论 AST 还是 regex, 都先剥离 new_code 中可能包含的 class 定义头
-        3. 搜索时更宽松地匹配 method_name (忽略参数签名)
-        """
-        try:
-            tree = ast.parse(content)
-        except SyntaxError as e:
-            logger.warning(f"AST parse failed (SyntaxError at line {e.lineno}: {e.msg}), "
-                           f"falling back to regex for {class_name}.{method_name}")
-            return self._replace_method_regex(content, class_name, method_name, new_code)
-
-        # 搜索类定义
-        class_found = False
-        for node in ast.iter_child_nodes(tree):
-            if isinstance(node, ast.ClassDef) and node.name == class_name:
-                class_found = True
-                # 搜索方法定义
-                method_found = False
-                for item in node.body:
-                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        # BUG FIX #3: 只匹配方法名, 不匹配完整签名
-                        # target_class_or_function 可能是 "__init__"
-                        # 也可能被误写为 "__init__(self, args)" 等
-                        actual_method_name = method_name.split('(')[0]  # 剥离参数
-                        if item.name == actual_method_name:
-                            method_found = True
-                            start_line = item.lineno - 1
-                            end_line = item.end_lineno
-
-                            lines = content.split('\n')
-                            # 需要保持方法的缩进级别
-                            method_indent = self._get_indent_level(lines[start_line])
-                            # new_code 可能包含 class 头 → 先剥离
-                            stripped_new_code = self._strip_class_wrapper(new_code, class_name)
-                            # 新代码可能需要调整缩进
-                            indented_new_code = self._adjust_indent(stripped_new_code, method_indent)
-                            new_lines = lines[:start_line] + indented_new_code.split('\n') + lines[end_line:]
-                            return '\n'.join(new_lines)
-
-                if not method_found:
-                    # 类找到了但方法没找到 → 打印类中的方法列表帮助诊断
-                    available_methods = [item.name for item in node.body
-                                         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))]
-                    logger.warning(f"Method '{method_name}' not found in class '{class_name}'. "
-                                   f"Available methods: {available_methods}. "
-                                   f"Falling back to regex.")
-                    return self._replace_method_regex(content, class_name, method_name, new_code)
-
-        if not class_found:
-            # 类本身都没找到 → 打印文件中的类列表帮助诊断
-            available_classes = [node.name for node in ast.iter_child_nodes(tree)
-                                 if isinstance(node, ast.ClassDef)]
-            logger.warning(f"Class '{class_name}' not found in file. "
-                           f"Available classes: {available_classes}. "
-                           f"Falling back to regex.")
-            return self._replace_method_regex(content, class_name, method_name, new_code)
-
-        # 不应该到达这里, 但以防万一
-        return self._replace_method_regex(content, class_name, method_name, new_code)
-
-    def _replace_class(self, content: str, class_name: str, new_code: str) -> Optional[str]:
-        """替换整个类定义"""
-        try:
-            tree = ast.parse(content)
-        except SyntaxError:
-            return self._replace_class_regex(content, class_name, new_code)
-
-        for node in ast.iter_child_nodes(tree):
-            if isinstance(node, ast.ClassDef) and node.name == class_name:
-                start_line = node.lineno - 1
-                end_line = node.end_lineno
-
-                lines = content.split('\n')
-                new_lines = lines[:start_line] + new_code.split('\n') + lines[end_line:]
-                return '\n'.join(new_lines)
-
-        logger.warning(f"Class '{class_name}' not found in file")
-        return self._replace_class_regex(content, class_name, new_code)
-
-    def _insert_after_class(self, content: str, class_name: str, new_code: str) -> Optional[str]:
-        """在类定义之后插入新代码 (用于添加新类)"""
-        try:
-            tree = ast.parse(content)
-        except SyntaxError:
-            return self._insert_after_regex(content, f"class {class_name}", new_code)
-
-        for node in ast.iter_child_nodes(tree):
-            if isinstance(node, ast.ClassDef) and node.name == class_name:
-                end_line = node.end_lineno
-
-                lines = content.split('\n')
-                new_lines = lines[:end_line] + ["\n"] + new_code.split('\n') + lines[end_line:]
-                return '\n'.join(new_lines)
-
-        logger.warning(f"Class '{class_name}' not found in file")
-        return self._insert_after_regex(content, f"class {class_name}", new_code)
-
-    def _insert_before_function(self, content: str, func_name: str, new_code: str) -> Optional[str]:
-        """在函数定义之前插入新代码"""
-        try:
-            tree = ast.parse(content)
-        except SyntaxError:
-            return self._insert_before_regex(content, f"def {func_name}", new_code)
-
-        for node in ast.iter_child_nodes(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == func_name:
-                start_line = node.lineno - 1
-
-                lines = content.split('\n')
-                new_lines = lines[:start_line] + new_code.split('\n') + ["\n"] + lines[start_line:]
-                return '\n'.join(new_lines)
-
-        logger.warning(f"Function '{func_name}' not found in file")
-        return self._insert_before_regex(content, f"def {func_name}", new_code)
-
-    # ════════════════════════════════════════
-    # Regex 后备方案 (当 AST 解析失败时)
-    # ════════════════════════════════════════
-
-    def _replace_function_regex(self, content: str, func_name: str, new_code: str) -> Optional[str]:
-        """
-        用 regex 替换顶层函数 (后备方案)
-
-        BUG FIX #2: 使用基于缩进的方式定位函数范围,
-        而不是依赖有缺陷的 ((?:[ \t]+.*\n)*) 模式。
-        """
-        # 找到函数定义行
-        func_pattern = rf'^def\s+{func_name}\s*\('
-        func_match = re.search(func_pattern, content, re.MULTILINE)
-        if not func_match:
-            logger.warning(f"Function '{func_name}' not found via regex")
-            return None
-
-        lines = content.split('\n')
-        func_start_line_idx = content[:func_match.start()].count('\n')
-        func_indent = self._get_indent_level(lines[func_start_line_idx])
-
-        # 从函数定义的下一行开始, 找到函数结束
-        # 函数结束 = 遇到缩进 <= func_indent 的非空行 (或文件末尾)
-        func_end_line_idx = len(lines)
-        for idx in range(func_start_line_idx + 1, len(lines)):
-            stripped = lines[idx].strip()
-            if not stripped:
-                continue
-            line_indent = self._get_indent_level(lines[idx])
-            if line_indent <= func_indent:
-                func_end_line_idx = idx
-                break
-
-        # 替换函数
-        adjusted_new_code = self._adjust_indent(new_code, func_indent)
-        new_code_lines = adjusted_new_code.split('\n')
-        result_lines = lines[:func_start_line_idx] + new_code_lines + lines[func_end_line_idx:]
-        return '\n'.join(result_lines)
-
-    def _replace_method_regex(self, content: str, class_name: str, method_name: str, new_code: str) -> Optional[str]:
-        """
-        用 regex 替换类中的方法 (后备方案)
-
-        BUG FIX #2: 原 regex 模式 ((?:[ 	]+.*\n)*) 在空行处截断,
-        导致只能捕获到第一个空行之前的 class body, 后续方法丢失。
-
-        新方案: 先定位 class 定义行的位置, 再用 AST 兼容的方式确定
-        class 的完整范围, 然后在范围内查找并替换方法。
-        """
-        # ── Step 1: 找到 class 定义头 ──
-        class_header_pattern = rf'^class\s+{class_name}\s*\([^)]*\)\s*:'
-        class_header_match = re.search(class_header_pattern, content, re.MULTILINE)
-        if not class_header_match:
-            logger.warning(f"Class '{class_name}' not found via regex")
-            return None
-
-        # ── Step 2: 确定类的完整范围 ──
-        # class 定义行的缩进级别 (顶层类 = 0)
-        lines = content.split('\n')
-        class_header_line_idx = content[:class_header_match.start()].count('\n')
-        class_header_indent = self._get_indent_level(lines[class_header_line_idx])
-        class_body_indent = class_header_indent + 4  # class body 至少多缩进 4 格
-
-        # 从 class 头的下一行开始, 找到 class 结束的位置
-        # class 结束 = 遇到缩进 <= class_header_indent 的非空行 (或文件末尾)
-        class_end_line_idx = len(lines)  # 默认到文件末尾
-        for idx in range(class_header_line_idx + 1, len(lines)):
-            stripped = lines[idx].strip()
-            if not stripped:
-                continue  # 空行不影响
-            line_indent = self._get_indent_level(lines[idx])
-            # 如果行的缩进 <= class 头缩进, 说明 class 结束了
-            # (但要排除 decorator 行, 如 @staticmethod 等同级装饰器)
-            if line_indent <= class_header_indent:
-                # 这是 class 外面的内容 → class 在上一行结束
-                class_end_line_idx = idx
-                break
-
-        # ── Step 3: 在 class 范围内查找方法 ──
-        # 方法的缩进应该 >= class_body_indent
-        method_start_idx = None
-        method_end_idx = None
-
-        for idx in range(class_header_line_idx + 1, class_end_line_idx):
-            stripped = lines[idx].strip()
-            if not stripped:
-                continue
-            line_indent = self._get_indent_level(lines[idx])
-
-            # 方法定义行的缩进 == class_body_indent
-            if line_indent == class_body_indent and stripped.startswith(f'def {method_name}('):
-                method_start_idx = idx
-                break
-
-        if method_start_idx is None:
-            logger.warning(f"Method '{class_name}.{method_name}' not found in class body via regex")
-            return None
-
-        # 找到方法的结束位置: 下一个缩进 <= class_body_indent 的非空行, 或 class 结束
-        method_end_idx = class_end_line_idx  # 默认到 class 结束
-        for idx in range(method_start_idx + 1, class_end_line_idx):
-            stripped = lines[idx].strip()
-            if not stripped:
-                continue
-            line_indent = self._get_indent_level(lines[idx])
-            if line_indent <= class_body_indent:
-                # 这是下一个方法/class 结束 → 上一个方法在这行之前结束
-                # 需要回退, 把方法后面的空行也算在方法内
-                method_end_idx = idx
-                # 回退: 跳过方法定义末尾的空行 (空行属于方法间隔, 不是新方法的一部分)
-                # 但保留 1 个空行作为分隔
-                break
-
-        # ── Step 4: 替换方法 ──
-        # 新代码需要调整缩进到 class_body_indent
-        adjusted_new_code = self._adjust_indent(new_code, class_body_indent)
-        new_code_lines = adjusted_new_code.split('\n')
-
-        # 替换 lines[method_start_idx:method_end_idx] 为 new_code
-        result_lines = lines[:method_start_idx] + new_code_lines + lines[method_end_idx:]
-        return '\n'.join(result_lines)
-
-    def _replace_class_regex(self, content: str, class_name: str, new_code: str) -> Optional[str]:
-        """
-        用 regex 替换整个类 (后备方案)
-
-        BUG FIX #2: 使用基于缩进的方式确定 class 范围,
-        而不是依赖有缺陷的 ((?:[ \t]+.*\n)*) 模式。
-        """
-        # 找到 class 定义头
-        class_header_pattern = rf'^class\s+{class_name}\s*\([^)]*\)\s*:'
-        class_header_match = re.search(class_header_pattern, content, re.MULTILINE)
-        if not class_header_match:
-            logger.warning(f"Class '{class_name}' not found via regex")
-            return None
-
-        lines = content.split('\n')
-        class_header_line_idx = content[:class_header_match.start()].count('\n')
-        class_header_indent = self._get_indent_level(lines[class_header_line_idx])
-
-        # 从 class 头的下一行开始, 找到 class 结束
-        class_end_line_idx = len(lines)
-        for idx in range(class_header_line_idx + 1, len(lines)):
-            stripped = lines[idx].strip()
-            if not stripped:
-                continue
-            line_indent = self._get_indent_level(lines[idx])
-            if line_indent <= class_header_indent:
-                class_end_line_idx = idx
-                break
-
-        # 替换整个 class 定义
-        new_code_lines = new_code.split('\n')
-        result_lines = lines[:class_header_line_idx] + new_code_lines + lines[class_end_line_idx:]
-        return '\n'.join(result_lines)
-
-    def _insert_after_regex(self, content: str, marker: str, new_code: str) -> Optional[str]:
-        """用 regex 在标记后插入 (后备方案)"""
-        pattern = rf'({marker}[^:]*:\s*\n(?:[ \t]+.*\n)*)'
-        match = re.search(pattern, content, re.MULTILINE)
-        if match:
-            return content[:match.end()] + "\n" + new_code + content[match.end():]
-        # 如果找不到类/函数，追加到末尾
-        return content + "\n\n" + new_code
-
-    def _insert_before_regex(self, content: str, marker: str, new_code: str) -> Optional[str]:
-        """用 regex 在标记前插入 (后备方案)"""
-        match = re.search(marker, content)
-        if match:
-            pos = match.start()
-            # 找到标记所在行的起始位置
-            line_start = content.rfind('\n', 0, pos) + 1
-            return content[:line_start] + new_code + "\n" + content[line_start:]
-        return content + "\n\n" + new_code
-
-    # ════════════════════════════════════════
-    # 缩进处理
-    # ════════════════════════════════════════
+        # AST 查找失败 → regex 后备
+        return self._find_target_regex(content, target_name)
 
     @staticmethod
-    def _get_indent_level(line: str) -> int:
-        """获取行的缩进级别 (空格数)"""
-        return len(line) - len(line.lstrip())
+    def _find_target_regex(content: str, target_name: str) -> Optional[str]:
+        """
+        用 regex 在文件内容中查找目标定义的代码片段
 
-    @staticmethod
-    def _adjust_indent(code: str, target_indent: int) -> str:
-        """调整代码块的缩进级别"""
-        lines = code.split('\n')
-        # 检测代码当前的最小缩进 (排除空行)
-        min_indent = float('inf')
-        for line in lines:
-            stripped = line.lstrip()
-            if stripped and not stripped.startswith('#'):
-                indent = len(line) - len(stripped)
-                min_indent = min(min_indent, indent)
-
-        if min_indent == float('inf'):
-            min_indent = 0
-
-        # 计算需要调整的偏移量
-        delta = target_indent - min_indent
-
-        if delta == 0:
-            return code
-
-        adjusted_lines = []
-        for line in lines:
-            stripped = line.lstrip()
-            if not stripped:
-                adjusted_lines.append(line)  # 保留空行不变
-            else:
-                current_indent = len(line) - len(stripped)
-                new_indent = max(0, current_indent + delta)
-                adjusted_lines.append(' ' * new_indent + stripped)
-
-        return '\n'.join(adjusted_lines)
+        简化版 regex — 只处理顶层 def/class, 不处理嵌套.
+        """
+        if "." in target_name:
+            # "ClassName.method_name" → 查找类定义
+            class_name = target_name.split(".", 1)[0]
+            pattern = rf'^class\s+{class_name}\s*\([^)]*\)\s*:'
+            match = re.search(pattern, content, re.MULTILINE)
+            if not match:
+                return None
+            # 找到类定义头 → 用缩进确定范围
+            lines = content.split('\n')
+            start_idx = content[:match.start()].count('\n')
+            # 找到类的结束
+            class_indent = len(lines[start_idx]) - len(lines[start_idx].lstrip())
+            end_idx = len(lines)
+            for idx in range(start_idx + 1, len(lines)):
+                stripped = lines[idx].strip()
+                if not stripped:
+                    continue
+                line_indent = len(lines[idx]) - len(lines[idx].lstrip())
+                if line_indent <= class_indent:
+                    end_idx = idx
+                    break
+            return '\n'.join(lines[start_idx:end_idx])
+        else:
+            # 顶层函数
+            pattern = rf'^def\s+{target_name}\s*\('
+            match = re.search(pattern, content, re.MULTILINE)
+            if not match:
+                return None
+            lines = content.split('\n')
+            start_idx = content[:match.start()].count('\n')
+            func_indent = len(lines[start_idx]) - len(lines[start_idx].lstrip())
+            end_idx = len(lines)
+            for idx in range(start_idx + 1, len(lines)):
+                stripped = lines[idx].strip()
+                if not stripped:
+                    continue
+                line_indent = len(lines[idx]) - len(lines[idx].lstrip())
+                if line_indent <= func_indent:
+                    end_idx = idx
+                    break
+            return '\n'.join(lines[start_idx:end_idx])
 
     # ════════════════════════════════════════
-    # 校验
+    # Post-Edit 反馈 (受 SWE-Agent/OpenHands 启发)
+    # ════════════════════════════════════════
+
+    def _generate_post_edit_context(self, original_content: str, new_content: str,
+                                      file_path: str, context_lines: int = 5) -> Optional[str]:
+        """
+        生成 post-edit 反馈 — 展示修改区域前后 N 行的上下文
+
+        让 LLM 检查修改是否正确, 发现重复代码/缩进错误等问题.
+        这是 SWE-Agent 和 OpenHands 证明有效的关键机制.
+
+        Args:
+            original_content: 修改前的文件内容
+            new_content: 修改后的文件内容
+            file_path: 文件路径
+            context_lines: 上下文行数
+
+        Returns:
+            str: 包含行号的修改区域上下文, 或 None
+        """
+        # 用 diff 找到修改的行范围
+        orig_lines = original_content.split('\n')
+        new_lines = new_content.split('\n')
+
+        diff = difflib.SequenceMatcher(None, orig_lines, new_lines)
+        changes = diff.get_opcodes()
+
+        # 找到所有修改行的范围
+        modified_ranges = []
+        for tag, i1, i2, j1, j2 in changes:
+            if tag != 'equal':
+                modified_ranges.append((j1, j2))
+
+        if not modified_ranges:
+            return None
+
+        # 合合连续的修改范围, 加上上下文
+        min_line = max(0, modified_ranges[0][0] - context_lines)
+        max_line = min(len(new_lines), modified_ranges[-1][1] + context_lines)
+
+        # 展示带行号的上下文
+        window_lines = []
+        for idx in range(min_line, max_line):
+            marker = "►" if any(j1 <= idx < j2 for _, j1, j2 in modified_ranges) else " "
+            window_lines.append(f"{idx + 1:4d}{marker}| {new_lines[idx]}")
+
+        filename = os.path.basename(file_path)
+        context_str = f"=== Post-edit context for {filename} ===\n"
+        context_str += '\n'.join(window_lines)
+        context_str += f"\n=== End of context (total {len(new_lines)} lines) ==="
+
+        return context_str
+
+    # ════════════════════════════════════════
+    # 校验 — 语法 + 执行验证
     # ════════════════════════════════════════
 
     def _validate_all_modified_files(self, file_paths: List[str]) -> Dict:
         """
         校验所有修改后的文件
-        
-        检查:
+
+        三级验证:
         1. Python 语法 (ast.parse)
-        2. Import 完整性 (尝试 import)
-        3. 关键类/函数仍然存在 (SASRec, SelfAttention 等)
+        2. Import 完整性 (subprocess import check)
+        3. 关键符号存在性 (class/function 定义检查)
         """
         results = {}
         all_passed = True
@@ -847,7 +738,6 @@ class StructureApplier:
                 errors.append(f"{file_path}: not found")
                 continue
 
-            # 读取文件内容
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
 
@@ -859,7 +749,15 @@ class StructureApplier:
                 errors.append(f"{file_path}: syntax error — {syntax_result.get('error', '')}")
                 continue
 
-            # 检查 2: 关键符号存在性
+            # 检查 2: 执行验证 (import check)
+            exec_result = self._validate_by_execution(file_path)
+            if not exec_result["passed"]:
+                results[file_path] = exec_result
+                all_passed = False
+                errors.append(f"{file_path}: import error — {exec_result.get('error', '')}")
+                continue
+
+            # 检查 3: 关键符号存在性
             symbol_result = self._check_critical_symbols(content, file_path)
             if not symbol_result["passed"]:
                 results[file_path] = symbol_result
@@ -870,6 +768,7 @@ class StructureApplier:
             results[file_path] = {
                 "passed": True,
                 "syntax_check": syntax_result,
+                "exec_check": exec_result,
                 "symbol_check": symbol_result,
             }
 
@@ -887,7 +786,7 @@ class StructureApplier:
 
     @staticmethod
     def _check_syntax(content: str, file_path: str) -> Dict:
-        """Python 语法检查"""
+        """Python 语法检查 (ast.parse)"""
         try:
             ast.parse(content)
             return {"passed": True, "detail": "AST parse OK"}
@@ -898,23 +797,61 @@ class StructureApplier:
                 "line": e.lineno,
             }
 
+    def _validate_by_execution(self, file_path: str) -> Dict:
+        """
+        执行验证: 尝试 import 修改后的模块
+
+        在 subprocess 中运行 python -c "import module",
+        检查模块能否被成功加载 (不抛 ImportError/NameError 等).
+
+        这是比 ast.parse 更严格的验证 — 语法正确不代表代码能跑!
+        """
+        filename = os.path.basename(file_path)
+        module_name = filename.replace('.py', '')
+
+        # 构建项目根目录和 Recmodel 子目录作为 Python path
+        normalized_root = os.path.normpath(self.project_root)
+        recmodel_dir = os.path.join(normalized_root, "Recmodel")
+        python_path = f"{normalized_root}:{recmodel_dir}"
+
+        # 尝试 import
+        import_cmd = (
+            f"import sys; "
+            f"sys.path.insert(0, '{normalized_root}'); "
+            f"sys.path.insert(0, '{recmodel_dir}'); "
+            f"import {module_name}; "
+            f"print('OK')"
+        )
+
+        try:
+            result = subprocess.run(
+                ["python", "-c", import_cmd],
+                capture_output=True, text=True, timeout=10,
+                env={**os.environ, "PYTHONPATH": python_path},
+            )
+            if result.returncode == 0 and "OK" in result.stdout:
+                return {"passed": True, "detail": f"import {module_name} OK"}
+            else:
+                error_msg = result.stderr.strip() or result.stdout.strip()
+                # 只报告前 500 字符的错误
+                error_msg = error_msg[:500]
+                return {"passed": False, "error": f"import {module_name} failed: {error_msg}"}
+        except subprocess.TimeoutExpired:
+            return {"passed": False, "error": f"import {module_name} timed out (10s)"}
+        except Exception as e:
+            return {"passed": False, "error": f"import check exception: {e}"}
+
     def _check_critical_symbols(self, content: str, file_path: str) -> Dict:
         """检查关键类/函数是否仍然存在"""
-        # 根据文件类型检查不同的关键符号
         filename = os.path.basename(file_path)
-
         critical_symbols = {
             "models.py": ["class SASRec", "class SRModel", "def finetune", "def add_position_embedding"],
-            "modules.py": ["class SelfAttention", "class Intermediate", "class EncoderLayer", "class Encoder", "class LayerNorm"],
+            "modules.py": ["class SelfAttention", "class Intermediate", "class EncoderLayer",
+                           "class Encoder", "class LayerNorm"],
             "trainers.py": ["def _get_loss", "def acc_metric"],
         }
-
         required = critical_symbols.get(filename, [])
-        missing = []
-        for sym in required:
-            if sym not in content:
-                missing.append(sym)
-
+        missing = [sym for sym in required if sym not in content]
         if missing:
             return {"passed": False, "missing": missing}
         return {"passed": True, "found": required}
@@ -924,24 +861,12 @@ class StructureApplier:
     # ════════════════════════════════════════
 
     def _resolve_file_path(self, target_file: str) -> Optional[str]:
-        """
-        将逻辑文件名 (如 "models.py") 解析为实际文件路径
-
-        BUG FIX #7: 使用 os.path.normpath 规范化路径,
-        避免 project_root 结尾带 / 时产生双斜杠。
-
-        查找顺序:
-        1. project_root 直接下 (如 /path/Recmodel/models.py)
-        2. project_root/Recmodel 子目录
-        """
-        # ── BUG FIX #7: 规范化 project_root, 剥离尾部斜杠 ──
+        """将逻辑文件名解析为实际文件路径"""
         normalized_root = os.path.normpath(self.project_root)
-
         candidates = [
             os.path.join(normalized_root, target_file),
             os.path.join(normalized_root, "Recmodel", target_file),
         ]
-
         if self.adapter:
             source_map = self.adapter.SOURCE_FILE_MAP
             if target_file in source_map:
@@ -950,49 +875,35 @@ class StructureApplier:
                     os.path.join(normalized_root, rel_path),
                     os.path.join(normalized_root, "Recmodel", rel_path),
                 ])
-
         for path in candidates:
             if os.path.exists(path):
-                return os.path.normpath(path)  # ── BUG FIX #7: 规范化返回路径 ──
-
+                return os.path.normpath(path)
         logger.warning(f"Cannot resolve file path for {target_file}, tried: {candidates}")
         return None
 
     # ════════════════════════════════════════
-    # 本地快照系统 (替代 Git — 无需联网!)
+    # 本地快照系统 (替代 Git)
     # ════════════════════════════════════════
 
     def _create_local_snapshot(self) -> Dict:
-        """
-        创建本地文件快照 — 替代 Git snapshot
-        
-        将所有被跟踪的源码文件复制到快照目录:
-        evolve_logs/rollback_snapshots/snap_XXX/models.py
-        
-        快照后计算各文件的 hash，用于回滚校验。
-        """
-        import time
+        """创建本地文件快照"""
         snapshot_id = f"snap_{int(time.time())}"
         snapshot_subdir = self._snapshot_dir / snapshot_id
         snapshot_subdir.mkdir(parents=True, exist_ok=True)
-        
+
         saved_files = []
         hashes = {}
-        
+
         for file_key in self._source_files:
             src_path = self._resolve_file_path(file_key)
             if src_path and os.path.exists(src_path):
                 dst_path = snapshot_subdir / file_key
                 shutil.copy2(src_path, dst_path)
                 saved_files.append(file_key)
-                # 记录 hash
                 with open(src_path, 'r', encoding='utf-8') as f:
                     content = f.read()
                 hashes[file_key] = hashlib.md5(content.encode('utf-8')).hexdigest()[:12]
-                logger.info(f"Snapshot: {file_key} saved to {dst_path}")
-            else:
-                logger.warning(f"Source file not found for snapshot: {file_key}")
-        
+
         # 保存快照元数据
         meta = {
             "snapshot_id": snapshot_id,
@@ -1000,62 +911,41 @@ class StructureApplier:
             "saved_files": saved_files,
             "file_hashes": hashes,
         }
-        meta_path = snapshot_subdir / "_meta.json"
-        with open(meta_path, 'w', encoding='utf-8') as f:
+        with open(snapshot_subdir / "_meta.json", 'w', encoding='utf-8') as f:
             json.dump(meta, f, indent=2)
-        
+
         self._pre_snapshot_hashes = hashes
-        
         logger.info(f"Local snapshot created: {snapshot_id}, {len(saved_files)} files")
         return {"ok": True, "snapshot_id": snapshot_id, "saved_files": saved_files}
 
     def _local_rollback(self, snapshot_id: str) -> Dict:
-        """
-        从本地快照恢复源码文件 — 替代 Git rollback
-        
-        将快照目录中的文件复制回项目目录，覆盖当前版本。
-        回滚后校验文件 hash 是否与快照前一致。
-        """
+        """从本地快照恢复源码文件"""
         snapshot_subdir = self._snapshot_dir / snapshot_id
         if not snapshot_subdir.exists():
-            logger.error(f"Snapshot not found: {snapshot_id}")
             return {"ok": False, "error": f"Snapshot {snapshot_id} not found"}
-        
-        # 读取元数据
-        meta_path = snapshot_subdir / "_meta.json"
-        if not meta_path.exists():
-            logger.error(f"Snapshot metadata not found: {snapshot_id}")
-            return {"ok": False, "error": "Snapshot metadata missing"}
-        
-        with open(meta_path, 'r', encoding='utf-8') as f:
+
+        with open(snapshot_subdir / "_meta.json", 'r', encoding='utf-8') as f:
             meta = json.load(f)
-        
+
         restored_files = []
         verification_ok = True
-        
+
         for file_key in meta.get("saved_files", []):
             snapshot_path = snapshot_subdir / file_key
             if not snapshot_path.exists():
-                logger.warning(f"Snapshot file missing: {file_key}")
                 continue
-            
             target_path = self._resolve_file_path(file_key)
             if target_path:
                 shutil.copy2(snapshot_path, target_path)
                 restored_files.append(file_key)
-                
                 # 校验 hash
                 expected_hash = meta.get("file_hashes", {}).get(file_key)
                 if expected_hash:
                     with open(target_path, 'r', encoding='utf-8') as f:
-                        current_content = f.read()
-                    current_hash = hashlib.md5(current_content.encode('utf-8')).hexdigest()[:12]
+                        current_hash = hashlib.md5(f.read().encode('utf-8')).hexdigest()[:12]
                     if current_hash != expected_hash:
-                        logger.warning(f"Hash mismatch for {file_key}: expected {expected_hash}, got {current_hash}")
                         verification_ok = False
-                    else:
-                        logger.info(f"Rollback verified: {file_key} hash matches")
-        
+
         logger.info(f"Local rollback completed: {len(restored_files)} files restored")
         return {
             "ok": True,
@@ -1065,7 +955,7 @@ class StructureApplier:
         }
 
     def rollback_last_changes(self) -> Dict:
-        """回滚最近一次的结构修改 (使用本地快照)"""
+        """回滚最近一次的结构修改"""
         if self._current_snapshot_id:
             result = self._local_rollback(self._current_snapshot_id)
             self._current_snapshot_id = None
@@ -1082,7 +972,6 @@ class StructureApplier:
         """获取已应用的修改摘要"""
         if not self._applied_changes:
             return "No structural changes applied yet"
-
         parts = []
         for entry in self._applied_changes:
             change = entry.get("change", {})
@@ -1090,33 +979,25 @@ class StructureApplier:
             target = change.get("target_class_or_function", "?")
             file = change.get("target_file", "?")
             parts.append(f"  [{file}] {target}: {desc}")
-
         return "\n".join(parts)
 
     @staticmethod
     def clean_new_code(raw_code: str) -> str:
         """
-        清理 LLM 输出的 new_code
-        
-        常见问题:
-        - LLM 可能输出 ```python ... ``` 包裹的代码
-        - 可能包含解释性的注释在代码前后
-        - 可能有不正确的缩进
+        清理 LLM 输出的代码 — 移除 markdown 包裹和解释性文字
+
+        注意: 此方法仅用于旧格式兼容. 新格式 (SEARCH/REPLACE) 不需要此处理.
         """
-        # 移除 markdown 代码块标记
         code = raw_code
-        # 移除开头的 ```python 或 ```
+        # 移除 markdown 代码块标记
         code = re.sub(r'^```(?:python)?\s*\n?', '', code)
-        # 移除结尾的 ```
         code = re.sub(r'\n?```\s*$', '', code)
 
-        # 移除 LLM 可能添加的解释性前缀/后缀
-        # 如 "以下是修改后的代码:" 或 "修改说明: ..."
+        # 移除解释性前缀
         lines = code.split('\n')
         clean_lines = []
         code_started = False
         for line in lines:
-            # 检测是否是解释性文字而非代码
             stripped = line.strip()
             if not code_started:
                 if stripped.startswith('def ') or stripped.startswith('class ') or \
@@ -1126,9 +1007,7 @@ class StructureApplier:
                    stripped == '':
                     code_started = True
                 else:
-                    continue  # 跳过解释性文字
-
+                    continue
             if code_started:
                 clean_lines.append(line)
-
         return '\n'.join(clean_lines)

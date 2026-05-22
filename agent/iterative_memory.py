@@ -56,11 +56,15 @@ class IterativeMemory:
         Args:
             project_root: 项目根目录 (包含 models.py, modules.py 等)
             log_dir: 日志/快照保存目录
-            source_files: 需要跟踪的源码文件列表 (默认 ["models.py", "modules.py", "trainers.py"])
+            source_files: 需要跟踪的源码文件列表 (默认覆盖 Recmodel 目录下所有 .py 文件)
         """
         self.project_root = project_root
         self.log_dir = Path(log_dir)
-        self.source_files = source_files or ["models.py", "modules.py", "trainers.py"]
+        self.source_files = source_files or [
+            "models.py", "modules.py", "trainers.py", "datasets.py",
+            "utils.py", "error_case_extractor.py", "surprise_eval.py",
+            "run_finetune_full.py",
+        ]
         
         # 快照目录: 保存每轮迭代时的源码文件副本
         self.snapshot_dir = self.log_dir / "source_snapshots"

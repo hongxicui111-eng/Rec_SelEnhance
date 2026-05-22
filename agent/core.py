@@ -587,7 +587,7 @@ class RecSelfEvolveAgent:
             
             # ── 构建当前源码上下文 ──
             source_code_ctx = self.adapter.build_source_code_context(
-                include_files=["models.py", "modules.py", "trainers.py"],
+                include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
                 max_total_chars=7000,
             )
             
@@ -991,7 +991,7 @@ class RecSelfEvolveAgent:
         """
         # ── 构建源码上下文 ──
         source_code_ctx = self.adapter.build_source_code_context(
-            include_files=["models.py", "modules.py", "trainers.py"],
+            include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
             max_total_chars=7000,
             iterative_memory=self.iter_memory,
         )
@@ -1211,7 +1211,7 @@ class RecSelfEvolveAgent:
         print(f"  🏗️ 策略切换: 用 replace_class 替代 replace_function")
         
         source_code_ctx = self.adapter.build_source_code_context(
-            include_files=["models.py", "modules.py", "trainers.py"],
+            include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
             max_total_chars=7000,
             iterative_memory=self.iter_memory,
         )
@@ -1235,12 +1235,12 @@ class RecSelfEvolveAgent:
         if rollback_warning:
             prompt += rollback_warning
         
-        # 明确告知 LLM: 用 replace_class, 输出完整的类定义
+        # 明确告知 LLM: 使用 SEARCH/REPLACE 格式, 输出完整的类定义
         prompt += (
-            "\n\n### ⚠ 重要修改: 请使用 replace_class 策略!"
-            "\n之前的 replace_function 策略连续失败, 因为代码定位困难。"
-            "\n这次请**输出完整的类定义** (包含类头和所有方法), 使用 insert_position='replace_class'。"
-            "\n不要只输出单个方法, 要输出整个类的完整代码。"
+            "\n\n### ⚠ 重要修改: 请使用 SEARCH/REPLACE 格式, 输出完整类定义!"
+            "\n之前的修改策略连续失败, 因为代码定位困难。"
+            "\n这次请**使用 SEARCH/REPLACE 格式**, search 部分写出原始的完整类定义代码, "
+            "\nreplace 部分写出修改后的完整类定义代码。"
             "\n确保类定义中的所有方法都完整、语法正确、无省略号。"
         )
         
@@ -1327,7 +1327,7 @@ class RecSelfEvolveAgent:
         print(f"  📝 策略切换: 整文件重写")
         
         source_code_ctx = self.adapter.build_source_code_context(
-            include_files=["models.py", "modules.py", "trainers.py"],
+            include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
             max_total_chars=7000,
             iterative_memory=self.iter_memory,
         )
@@ -1338,18 +1338,16 @@ class RecSelfEvolveAgent:
         
         # 从 traceback 中确定出错的是哪个文件
         error_files = tb_details.get("files", [])
-        target_file = "modules.py"  # 默认
+        # 默认取 SOURCE_FILE_MAP 中的第一个文件
+        source_keys = list(self.adapter.SOURCE_FILE_MAP.keys())
+        target_file = source_keys[0] if source_keys else "modules.py"
         if error_files:
             for ef in error_files:
-                if "modules" in ef:
-                    target_file = "modules.py"
-                    break
-                elif "models" in ef:
-                    target_file = "models.py"
-                    break
-                elif "trainers" in ef:
-                    target_file = "trainers.py"
-                    break
+                # 遍历所有可修改的源码文件，匹配 traceback 中出现的文件名
+                for src_key in source_keys:
+                    if src_key.replace(".py", "") in ef:
+                        target_file = src_key
+                        break
         
         # 读取当前文件内容
         file_path = self.struct_applier._resolve_file_path(target_file)
@@ -1748,7 +1746,7 @@ class RecSelfEvolveAgent:
             print(f"  🧠 LLM analyzing wrong cases (with source code context)...")
             # 获取模型源码摘要供案例分析使用
             source_summary = self.adapter.build_source_code_context(
-                include_files=["models.py", "modules.py"],
+                include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
                 max_total_chars=5000,
             )
             case_analysis = self.case_analyzer.analyze_wrong_cases(
@@ -1892,7 +1890,7 @@ class RecSelfEvolveAgent:
         # ── 构建模型源码上下文 (使用 IterativeMemory 的智能截断!) ──
         # 不再使用旧的截断方式，而是让 IterativeMemory 优先展示修改区域
         source_code_ctx = self.adapter.build_source_code_context(
-            include_files=["models.py", "modules.py"],
+            include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
             max_total_chars=6500,
             iterative_memory=self.iter_memory,  # 传入 IterativeMemory → 智能截断!
         )
@@ -2045,7 +2043,7 @@ class RecSelfEvolveAgent:
         journal_summary = self._clip_text_by_chars(journal_summary, max_chars=4500)
         # 使用与 _phase_analyze_and_propose 一致的源码上下文构建方式
         source_code_ctx = self.adapter.build_source_code_context(
-            include_files=["models.py", "modules.py"],
+            include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
             max_total_chars=6500,
             iterative_memory=self.iter_memory,
         )
@@ -2364,13 +2362,11 @@ class RecSelfEvolveAgent:
         """
         从 LLM 输出中提取 SEARCH/REPLACE diff 块并转换为 structural_changes
         
-        每个 SEARCH/REPLACE 块转换为:
+        每个 SEARCH/REPLACE 块转换为新格式:
         {
             "target_file": "...",
-            "target_class_or_function": "...",
             "description": "...",
-            "new_code": "...",
-            "insert_position": "replace_function",
+            "edits": [{"search": "...", "replace": "..."}],
             "expected_effect": "...",
             "confidence": "中",
         }
@@ -2382,7 +2378,8 @@ class RecSelfEvolveAgent:
         if not matches:
             return None
         
-        structural_changes = []
+        # 按目标文件分组 edits
+        file_edits = {}  # target_file -> list of (search, replace, description)
         
         for search_code, replace_code in matches:
             search_code = search_code.strip()
@@ -2397,19 +2394,29 @@ class RecSelfEvolveAgent:
             if idea_match:
                 block_idea = idea_match.group(1).strip()
             
-            # 尝试确定目标文件和函数
-            target_file, target_func = self._identify_target_from_code(search_code)
+            # 尝试确定目标文件
+            target_file, _ = self._identify_target_from_code(search_code)
             
             # 提取实际新代码 (去掉 Self_EvolveRec 标记行)
-            clean_new_code = self._strip_evolve_markers(replace_code)
+            clean_replace = self._strip_evolve_markers(replace_code)
+            clean_search = self._strip_evolve_markers(search_code)
             
+            if target_file not in file_edits:
+                file_edits[target_file] = []
+            file_edits[target_file].append({
+                "search": clean_search,
+                "replace": clean_replace,
+                "description": f"[Self_EvolveRec] {block_idea}",
+            })
+        
+        # 构建新格式的 structural_changes
+        structural_changes = []
+        for target_file, edits_list in file_edits.items():
             change = {
                 "target_file": target_file,
-                "target_class_or_function": target_func,
-                "description": f"[Self_EvolveRec] {block_idea}",
-                "new_code": clean_new_code,
-                "insert_position": "replace_function",  # 默认
-                "expected_effect": f"Implement: {block_idea}",
+                "description": edits_list[0]["description"],
+                "edits": [{"search": e["search"], "replace": e["replace"]} for e in edits_list],
+                "expected_effect": f"Implement: {research_idea}",
                 "confidence": "中",
             }
             structural_changes.append(change)
@@ -2620,7 +2627,7 @@ class RecSelfEvolveAgent:
         return valid_changes
 
     def _validate_structural_changes(self, structural_changes: list) -> list:
-        """验证结构修改列表 — 开放模式: 允许任意文件和类型"""
+        """验证结构修改列表 — 支持 edits (SEARCH/REPLACE) 和 new_code (旧格式) 两种输入"""
         valid_changes = []
         for change in structural_changes:
             # target_file: 允许任何项目中存在的 .py 文件
@@ -2637,32 +2644,48 @@ class RecSelfEvolveAgent:
                     logger.warning(f"target_file {target_file} not found in project, skipping")
                     continue
             
-            # 必须有 new_code
+            # ── 新格式: edits (SEARCH/REPLACE) ──
+            edits = change.get("edits", [])
+            if edits:
+                # 验证每个 edit 都有 search 和 replace
+                valid_edits = []
+                for edit in edits:
+                    search = edit.get("search", "")
+                    replace = edit.get("replace", "")
+                    # search 可以为空 (纯追加), 但 replace 必须有内容
+                    if not replace:
+                        logger.warning(f"Edit missing replace text, skipping")
+                        continue
+                    # 清理 markdown 包裹
+                    if search:
+                        search = StructureApplier.clean_new_code(search)
+                    replace = StructureApplier.clean_new_code(replace)
+                    valid_edits.append({"search": search, "replace": replace})
+                
+                if valid_edits:
+                    change["edits"] = valid_edits
+                    change["action_type"] = change.get("action_type", "modify")
+                    valid_changes.append(change)
+                else:
+                    logger.warning(f"All edits invalid for {target_file}, skipping")
+                continue
+            
+            # ── 旧格式兼容: new_code + insert_position ──
             new_code = change.get("new_code", "")
             if not new_code:
-                logger.warning(f"Structural change missing new_code: {change.get('description', '?')}")
+                logger.warning(f"Structural change missing both edits and new_code: {change.get('description', '?')}")
                 continue
             
             # 清理 new_code (移除 markdown 标记等)
             new_code = StructureApplier.clean_new_code(new_code)
             change["new_code"] = new_code
             
-            # action_type: 不强制要求，如果缺失则根据内容自动推断或用 "modify"
+            # action_type: 不强制要求，自动推断
             if not change.get("action_type"):
-                # 简单推断: 有 class 定义 → add_module，否则 → modify
                 if "class " in new_code and "def " not in change.get("target_class_or_function", ""):
                     change["action_type"] = "add_module"
                 else:
                     change["action_type"] = "modify"
-            
-            # insert_position: 不强制要求，如果缺失则智能推断
-            if not change.get("insert_position"):
-                if change.get("target_class_or_function") and "." in change.get("target_class_or_function", ""):
-                    change["insert_position"] = "replace_function"
-                elif "class " in new_code:
-                    change["insert_position"] = "append_to_file"
-                else:
-                    change["insert_position"] = "replace_function"
             
             valid_changes.append(change)
         
@@ -2684,9 +2707,10 @@ class RecSelfEvolveAgent:
         for s in suggestions:
             if s.get("action_type") == "structure_change":
                 # 案例分析的结构修改建议通常是描述性的，需要让 LLM 进一步细化
+                source_keys = list(self.adapter.SOURCE_FILE_MAP.keys())
                 structural.append({
                     "action_type": s.get("action_type", "add_module"),
-                    "target_file": "modules.py",  # 默认
+                    "target_file": source_keys[0] if source_keys else "modules.py",
                     "target_class_or_function": "",
                     "description": s.get("description", ""),
                     "new_code": "",  # 空的 — 需要后续让 LLM 生成具体代码
@@ -2851,14 +2875,14 @@ class RecSelfEvolveAgent:
         
         print(f"\n  🔁 自纠错闭环启动: 最多 {max_r} 轮修正")
         print(f"     错误类型: {train_error.get('status', 'UNKNOWN')}")
-        print(f"     错误摘要: {train_error.get('error', '')[:100]}")
+        print(f"     错误摘要: {train_error.get('error', '')}")
         
         for round_idx in range(1, max_r + 1):
             print(f"\n  🔁 自纠错第 {round_idx}/{max_r} 轮")
             
             # ── 1. 构建当前源码上下文 ──
             source_code_ctx = self.adapter.build_source_code_context(
-                include_files=["models.py", "modules.py", "trainers.py"],
+                include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
                 max_total_chars=6500,
                 iterative_memory=self.iter_memory,
             )
@@ -3053,7 +3077,7 @@ class RecSelfEvolveAgent:
             else:
                 # 修正后仍然失败 → 更新 error 信息用于下一轮自纠错
                 train_error = revised_train  # 用新的错误信息继续自纠错
-                print(f"     ✗ 修正后仍然失败: {revised_train.get('error', '')[:100]}")
+                print(f"     ✗ 修正后仍然失败: {revised_train.get('error', '')}")
                 
                 # 如果有结构修改导致失败，回滚
                 if revised_structural_changes and revised_struct_result and \
@@ -3132,7 +3156,7 @@ class RecSelfEvolveAgent:
             
             # ── 1. 构建当前源码上下文 ──
             source_code_ctx = self.adapter.build_source_code_context(
-                include_files=["models.py", "modules.py", "trainers.py"],
+                include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
                 max_total_chars=6500,
                 iterative_memory=self.iter_memory,
             )
