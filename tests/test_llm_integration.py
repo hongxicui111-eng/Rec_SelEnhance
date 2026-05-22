@@ -436,15 +436,11 @@ class TestLevel3_PromptTemplateAndParsing(unittest.TestCase):
         metrics_info = json.dumps({"NDCG@10": 0.35, "Recall@10": 0.45}, ensure_ascii=False)
 
         prompt = self.MLE_ANALYSIS_PROMPT.format(
-            metrics=metrics_info,
-            project_context="序列推荐系统 SASRec，核心文件: models.py, modules.py",
-            source_code="class SelfAttentionLayer(nn.Module): ... (简化)",
-            journal_summary="第0轮训练完成，初始指标 NDCG@10=0.35",
-            structural_history="无历史修改",
-            surprise_info="",
-            case_analysis_info="",
-            rollback_warning="",
-            strategy_instruction="balanced",
+            training_log=metrics_info,
+            experiment_journal="第0轮训练完成，初始指标 NDCG@10=0.35",
+            current_metrics=metrics_info,
+            source_code_context="class SelfAttentionLayer(nn.Module): ... (简化)",
+            current_hidden_size=64,
         )
 
         response = self.client.chat(
@@ -519,12 +515,10 @@ class TestLevel3_PromptTemplateAndParsing(unittest.TestCase):
         """测试 RESEARCHER_INSTRUCTIONS → LLM → 研究计划输出"""
 
         prompt = self.RESEARCHER_INSTRUCTIONS.format(
-            query="How to improve SASRec model for sequential recommendation?",
-            problem_name="SASRec optimization",
-            problem_description="NDCG@10 is only 0.35, need improvement",
-            parent_metrics=json.dumps({"NDCG@10": 0.35}, ensure_ascii=False),
-            inspirations="无历史成功案例",
-            search_results="无搜索结果（本测试不使用搜索引擎）",
+            research_direction="How to improve SASRec model for sequential recommendation?",
+            current_metrics=json.dumps({"NDCG@10": 0.35}, ensure_ascii=False),
+            experiment_journal="无历史成功案例",
+            source_code_context="SASRec model source code (simplified for test)",
         )
 
         response = self.client.chat(

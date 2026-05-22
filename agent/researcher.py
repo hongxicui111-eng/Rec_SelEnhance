@@ -215,7 +215,7 @@ class ResearcherAgent:
             search_prompt += search_results_str
             
             try:
-                search_response = await self.llm_client.chat(search_prompt)
+                search_response = await self.llm_client.async_chat(search_prompt, temperature=0.5, max_tokens=1500)
                 # 解析搜索分析结果以提取更多关键词
                 search_analysis = self._parse_researcher_response(search_response)
                 if search_analysis and search_analysis.get("synthesis"):
@@ -234,21 +234,29 @@ class ResearcherAgent:
         
     async def _do_search(self, query: str) -> List[SearchResult]:
         """执行搜索（使用搜索工具）"""
-        # 这里使用 search_web 工具
-        from tools import search_web
+        # 搜索工具可能不可用, 优雅降级
+        try:
+            from agent.tools import search_web
+        except ImportError:
+            logger.warning("agent.tools.search_web not available, skipping web search")
+            return []
         
         try:
-            results = await search_web(query=query, gl="en", hl="en")
-            search_results = []
+            # search_web 可能是同步函数, 使用 asyncio.to_thread 包装
+            import asyncio
+            if asyncio.iscoroutinefunction(search_web):
+                results = await search_web(query=query, gl="en", hl="en")
+            else:
+                results = await asyncio.to_thread(search_web, query=query, gl="en", hl="en")
             
-            for item in results.get("results", [])[:5]:  # 取前5个
+            search_results = []
+            for item in results.get("results", [])[:5]:
                 search_results.append(SearchResult(
                     title=item.get("title", ""),
                     url=item.get("url", ""),
                     snippet=item.get("snippet", ""),
                     source="web"
                 ))
-                
             return search_results
         except Exception as e:
             logger.warning(f"Search error: {e}")
@@ -299,9 +307,7 @@ class ResearcherAgent:
         if search_str:
             prompt += f"\n\n{search_str}"
         
-        response = await self.llm_client.chat(prompt)
-        
-        # 解析响应 — RESEARCHER_INSTRUCTIONS 使用 JSON 输出格式
+        response = await self.llm_client.async_chat(prompt, temperature=self.temperature, max_tokens=2000)
         try:
             result = self._parse_researcher_response(response)
             if result and result.get("proposed_solutions"):
@@ -370,7 +376,7 @@ class ResearcherAgent:
 ]
 ```"""
         
-        response = await self.llm_client.chat(fallback_prompt)
+        response = await self.llm_client.async_chat(fallback_prompt, temperature=self.temperature, max_tokens=2000)
         
         try:
             plans = self._parse_plans(response)
@@ -492,9 +498,7 @@ class ResearcherAgent:
 }}
 ```"""
         
-        response = await self.llm_client.chat(prompt)
-        
-        # 解析响应
+        response = await self.llm_client.async_chat(prompt, temperature=self.temperature, max_tokens=2000)
         try:
             import re
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
@@ -592,9 +596,7 @@ class ResearcherAgent:
         # 添加之前的报告内容
         prompt += f"\n\n## 之前的研究报告\n{report.markdown_report}"
         
-        response = await self.llm_client.chat(prompt)
-        
-        # 解析反思结果
+        response = await self.llm_client.async_chat(prompt, temperature=self.temperature, max_tokens=2000)
         try:
             reflection_result = self._parse_researcher_response(response)
             if reflection_result:
@@ -652,7 +654,7 @@ class ResearcherAgent:
 ]
 ```"""
         
-        response = await self.llm_client.chat(fallback_prompt)
+        response = await self.llm_client.async_chat(fallback_prompt, temperature=self.temperature, max_tokens=2000)
         
         try:
             plans = self._parse_plans(response)
@@ -688,7 +690,7 @@ class ResearcherAgent:
 }}
 ```"""
         
-        response = await self.llm_client.chat(prompt)
+        response = await self.llm_client.async_chat(prompt, temperature=self.temperature, max_tokens=2000)
         
         try:
             import re

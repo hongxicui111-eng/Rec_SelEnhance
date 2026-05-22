@@ -200,9 +200,7 @@ class CoderAgent:
             source_code_context=source_code_context or f"推荐系统模型: {self.problem_name}\n问题描述: {self.problem_description}",
         )
         
-        response = await self.llm_client.chat(prompt)
-        
-        # 解析响应 — 优先解析 SEARCH/REPLACE 格式
+        response = await self.llm_client.async_chat(prompt, temperature=self.temperature, max_tokens=2000)
         try:
             result = self._parse_code_response_with_diff(response, research_idea)
             if result and result.success:
@@ -409,7 +407,7 @@ class CoderAgent:
         if new_idea:
             debugger_prompt += f"\n\n## 研究想法\n标题: {new_idea.title}\n描述: {new_idea.description}"
         
-        debugger_response = await self.llm_client.chat(debugger_prompt)
+        debugger_response = await self.llm_client.async_chat(debugger_prompt, temperature=max(0.1, self.temperature - 0.2), max_tokens=2000)
         
         # 解析 DEBUGGER_INSTRUCTIONS 输出 — 支持 SEARCH/REPLACE 和 JSON 格式
         # 尝试解析 SEARCH/REPLACE 格式
@@ -462,7 +460,7 @@ class CoderAgent:
 - 确保维度对齐正确
 """
         
-        fallback_response = await self.llm_client.chat(fallback_prompt)
+        fallback_response = await self.llm_client.async_chat(fallback_prompt, temperature=max(0.1, self.temperature - 0.2), max_tokens=2000)
         
         try:
             result = self._parse_code_response(fallback_response)

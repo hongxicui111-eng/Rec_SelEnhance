@@ -200,18 +200,24 @@ class LLMClient:
                     # 输出到日志文件 (完整内容, 不截断)
                     logger.info(f"LLM raw response ({len(content)} chars):\n{content}")
                 
-                if content and len(content) > 10:
+                if content and len(content.strip()) > 0:
                     logger.info(f"LLM response OK ({len(content)} chars)")
                     return content
                 else:
                     # 即使内容太短也输出, 让用户看到 LLM 返回了什么
                     print(f"\n{'━'*60}")
-                    print(f"  [LLM Response — TOO SHORT] model={self.model}, {len(content) if content else 0} chars")
+                    print(f"  [LLM Response — EMPTY/TOO SHORT] model={self.model}, {len(content) if content else 0} chars")
                     print(f"{'━'*60}")
                     print(content if content else "(empty)")
                     print(f"{'━'*60}\n")
-                    logger.warning(f"LLM response too short: {content}")
-                    continue
+                    logger.warning(f"LLM response empty or too short: '{content}'")
+                    # 对空回复重试, 但短回复(有内容)直接返回
+                    if not content or len(content.strip()) == 0:
+                        continue
+                    else:
+                        # 短但非空回复 — 直接返回, 让调用方决定是否有效
+                        logger.info(f"LLM response short but non-empty ({len(content)} chars), returning it")
+                        return content
 
             except ImportError:
                 logger.error("openai package not installed. Run: pip install openai")
@@ -282,6 +288,32 @@ class LLMClient:
         print(f"{'✗'*30}\n")
         logger.error(f"LLM failed after {self.max_retries} attempts. Last error: {last_error}")
         return None
+
+    async def async_chat(self, prompt_or_messages, temperature: float = 0.7,
+                         max_tokens: int = 4096) -> Optional[str]:
+        """
+        异步包装版本 — 支持传入字符串 prompt 或 messages 列表
+        
+        Args:
+            prompt_or_messages: 字符串 prompt (会自动转为 messages 列表) 或 messages 列表
+            temperature: 采样温度
+            max_tokens: 最大输出 token 数
+            
+        Returns:
+            模型回复文本, 或 None (所有重试均失败)
+        """
+        import asyncio
+        
+        # 如果传入字符串, 自动转为 messages 列表
+        if isinstance(prompt_or_messages, str):
+            messages = [{"role": "user", "content": prompt_or_messages}]
+        else:
+            messages = prompt_or_messages
+        
+        return await asyncio.to_thread(
+            self.chat, messages=messages,
+            temperature=temperature, max_tokens=max_tokens,
+        )
 
     def check_health(self) -> bool:
         """检查 LLM 服务是否可用"""
