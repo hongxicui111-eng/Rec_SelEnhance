@@ -81,7 +81,8 @@ LLM 可以提出以下类型的结构修改 (不仅仅是调参!):
     # 2. LLM 可以修改的参数空间 + 结构修改空间
     # ════════════════════════════════════════
 
-    # --- 可修改的源码文件路径映射 ---
+    # --- 可修改的源码文件: 不预设范围，LLM 可以修改项目中任何 .py 文件 ---
+    # SOURCE_FILE_MAP 仅用于常见文件的快捷映射，LLM 也可以指定项目中的任意 .py 文件
     SOURCE_FILE_MAP = {
         "models.py": "models.py",
         "modules.py": "modules.py",
@@ -89,110 +90,78 @@ LLM 可以提出以下类型的结构修改 (不仅仅是调参!):
         "datasets.py": "datasets.py",
     }
 
-    # --- LLM 可以提出的结构修改类型 ---
+    # --- 结构修改类型: 不预设固定类型，LLM 可以自由描述任何修改 ---
+    # STRUCTURAL_ACTIONS 仅作为参考分类，LLM 可以使用任意 action_type 或不填
     STRUCTURAL_ACTIONS = {
+        "modify": {
+            "desc": "修改已有的类/函数",
+            "note": "可以是注意力、FFN、位置编码、嵌入、forward、训练逻辑等任何修改",
+        },
         "add_module": {
-            "desc": "添加新的模块/类到 modules.py",
-            "example": "添加 TimeAwareAttention 类，使用时间衰减因子调制注意力权重",
-            "target_file": "modules.py",
-            "risk": "中 — 新模块可能导致参数不匹配或 OOM",
+            "desc": "添加新的模块/类",
+            "note": "可以是任何新组件",
         },
-        "modify_attention": {
-            "desc": "修改 SelfAttention 的注意力计算方式",
-            "example": "添加相对位置偏置 (relative position bias) 到注意力分数",
-            "target_file": "modules.py",
-            "risk": "中 — 可能影响序列建模能力",
-        },
-        "modify_ffn": {
-            "desc": "修改 Intermediate/FFN 的结构",
-            "example": "将 FFN 扩展比例从 4x 改为 2x，或添加 GLU 门控",
-            "target_file": "modules.py",
-            "risk": "低 — FFN 结构变化通常比较安全",
-        },
-        "modify_position_encoding": {
-            "desc": "修改位置编码策略",
-            "example": "从固定位置嵌入改为时间衰减位置编码，或添加相对位置编码",
-            "target_file": "models.py",
-            "risk": "中 — 位置编码是序列建模的核心",
-        },
-        "modify_embedding": {
-            "desc": "修改嵌入层策略",
-            "example": "添加类别嵌入辅助信息，或修改嵌入初始化方式",
-            "target_file": "models.py",
-            "risk": "低-中 — 嵌入层变化通常温和",
-        },
-        "modify_forward_pass": {
-            "desc": "修改模型的 forward/finetune 方法",
-            "example": "添加残差连接、门控融合、或修改输出层",
-            "target_file": "models.py",
-            "risk": "中-高 — forward 变化可能影响所有下游",
-        },
-        "modify_training_logic": {
-            "desc": "修改训练器中的训练逻辑",
-            "example": "修改负采样策略、添加多样性损失、修改梯度裁剪",
-            "target_file": "trainers.py",
-            "risk": "中 — 训练逻辑变化影响收敛",
-        },
-        "add_loss_component": {
+        "add_loss": {
             "desc": "添加新的损失组件",
-            "example": "添加多样性正则化损失或对比学习损失",
-            "target_file": "trainers.py",
-            "risk": "中-低 — 额外损失通常可调权重控制",
+            "note": "可以是任何额外的损失项",
         },
-        "modify_encoder_stack": {
-            "desc": "修改 Encoder 层堆叠方式",
-            "example": "添加跨层连接 (cross-layer connection) 或层间信息融合",
-            "target_file": "modules.py",
-            "risk": "中 — 改变编码器堆叠方式影响整体表征",
+        "bug_fix": {
+            "desc": "修复代码 bug",
+            "note": "修复运行错误",
+        },
+        "other": {
+            "desc": "其他任何类型的修改",
+            "note": "LLM 可以自由定义",
         },
     }
 
+    # --- 可调参数: 扩大范围，给 LLM 更多探索空间 ---
+    # 不再强制范围限制，range 仅作为宽松参考; LLM 可以提出超出范围的值，系统会做温和提醒而非拒绝
     TUNABLE_PARAMS = {
         # === 超参数 ===
-        "lr": {"type": "float", "range": [1e-5, 1e-2], "default": 0.001,
-               "desc": "学习率"},
-        "batch_size": {"type": "int", "range": [64, 4096], "default": 1024,
-                       "desc": "批量大小"},
-        "hidden_size": {"type": "int", "range": [32, 512], "default": 64,
-                        "desc": "隐藏层维度"},
-        "hidden_dropout_prob": {"type": "float", "range": [0.0, 0.9], "default": 0.5,
+        "lr": {"type": "float", "range": [1e-6, 1e-1], "default": 0.001, "soft_limit": True,
+               "desc": "学习率 (宽松范围，LLM 可自由选择)"},
+        "batch_size": {"type": "int", "range": [16, 8192], "default": 1024, "soft_limit": True,
+                       "desc": "批量大小 (宽松范围)"},
+        "hidden_size": {"type": "int", "range": [16, 1024], "default": 64, "soft_limit": True,
+                        "desc": "隐藏层维度 (宽松范围，注意与模型结构对齐)"},
+        "hidden_dropout_prob": {"type": "float", "range": [0.0, 0.99], "default": 0.5, "soft_limit": True,
                                 "desc": "Dropout 概率"},
-        "attention_probs_dropout_prob": {"type": "float", "range": [0.0, 0.9], "default": 0.5,
+        "attention_probs_dropout_prob": {"type": "float", "range": [0.0, 0.99], "default": 0.5, "soft_limit": True,
                                          "desc": "Attention Dropout"},
-        "weight_decay": {"type": "float", "range": [0.0, 0.1], "default": 0.0,
-                         "desc": "权重衰减"},
-        "max_seq_length": {"type": "int", "range": [20, 200], "default": 50,
-                           "desc": "最大序列长度"},
+        "weight_decay": {"type": "float", "range": [0.0, 0.5], "default": 0.0, "soft_limit": True,
+                         "desc": "权重衰减 (宽松范围)"},
+        "max_seq_length": {"type": "int", "range": [10, 500], "default": 50, "soft_limit": True,
+                           "desc": "最大序列长度 (宽松范围)"},
 
         # === 架构 ===
-        "num_hidden_layers": {"type": "int", "range": [1, 8], "default": 2,
-                              "desc": "Transformer 层数"},
-        "num_attention_heads": {"type": "int", "range": [1, 16], "default": 2,
-                                "desc": "Attention 头数"},
-        "hidden_act": {"type": "str", "choices": ["gelu", "relu", "swish"],
-                       "default": "gelu", "desc": "激活函数"},
-
+        "num_hidden_layers": {"type": "int", "range": [1, 16], "default": 2, "soft_limit": True,
+                              "desc": "Transformer 层数 (宽松范围)"},
+        "num_attention_heads": {"type": "int", "range": [1, 32], "default": 2, "soft_limit": True,
+                                "desc": "Attention 头数 (宽松范围)"},
+        "hidden_act": {"type": "str", "choices": None, "default": "gelu", "soft_limit": True,
+                       "desc": "激活函数 (可以是任何合法的激活函数名)"},
 
         # === 损失与采样 ===
-        "loss_type": {"type": "str", "choices": ["BCE", "BPR"],
-                      "default": "BCE", "desc": "损失函数类型"},
-        "neg_sampler": {"type": "str", "choices": ["Uniform", "DNS"],
-                        "default": "Uniform", "desc": "负采样器"},
-        "N": {"type": "int", "range": [50, 1000], "default": 200,
-              "desc": "负采样候选数"},
-        "M": {"type": "int", "range": [1, 200], "default": 10,
-              "desc": "DNS pool 大小 (仅 DNS)"},
-        "CL_type": {"type": "str", "choices": ["Radical", "Gentle"],
-                    "default": "Radical", "desc": "对比学习类型"},
-        "start_epoch": {"type": "int", "range": [0, 200], "default": 30,
-                        "desc": "开始困难负采样的轮次"},
-        "K": {"type": "float", "range": [0.01, 0.5], "default": 0.05,
-              "desc": "Gentle CL 参数 (仅 Gentle)"},
+        "loss_type": {"type": "str", "choices": None, "default": "BCE", "soft_limit": True,
+                      "desc": "损失函数类型 (LLM 可以自由命名)"},
+        "neg_sampler": {"type": "str", "choices": None, "default": "Uniform", "soft_limit": True,
+                        "desc": "负采样器 (LLM 可以自由命名)"},
+        "N": {"type": "int", "range": [10, 5000], "default": 200, "soft_limit": True,
+              "desc": "负采样候选数 (宽松范围)"},
+        "M": {"type": "int", "range": [1, 500], "default": 10, "soft_limit": True,
+              "desc": "DNS pool 大小 (宽松范围)"},
+        "CL_type": {"type": "str", "choices": None, "default": "Radical", "soft_limit": True,
+                    "desc": "对比学习类型 (LLM 可以自由命名)"},
+        "start_epoch": {"type": "int", "range": [0, 500], "default": 30, "soft_limit": True,
+                        "desc": "开始困难负采样的轮次 (宽松范围)"},
+        "K": {"type": "float", "range": [0.001, 1.0], "default": 0.05, "soft_limit": True,
+              "desc": "对比学习参数 (宽松范围)"},
 
         # === 训练 ===
-        "epochs": {"type": "int", "range": [50, 1000], "default": 500,
-                   "desc": "最大训练轮次"},
-        "seed": {"type": "int", "range": [0, 10000], "default": 42,
+        "epochs": {"type": "int", "range": [10, 2000], "default": 500, "soft_limit": True,
+                   "desc": "最大训练轮次 (宽松范围)"},
+        "seed": {"type": "int", "range": [0, 99999], "default": 42, "soft_limit": True,
                  "desc": "随机种子"},
     }
 

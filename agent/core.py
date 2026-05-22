@@ -1941,38 +1941,13 @@ class RecSelfEvolveAgent:
         if strategy_instruction:
             prompt += f"\n\n## 当前探索策略\n{strategy_instruction}"
 
-        # 根据诊断结果添加针对性提示
-        if self._last_surprise_report:
-            diagnosis = self._last_surprise_report.get("evaluation_report_summary", {}).get("diagnosis", {})
-            if diagnosis.get("surprise_capture") in ("VERY_POOR", "POOR"):
-                prompt += (
-                    "\n\n### ⚠ 关键优化方向: 提升惊喜交互捕获能力\n"
-                    "当前模型对\"惊喜\"交互的捕获能力很差，仅靠调参无法解决。\n"
-                    "请提出**结构修改**方案，例如:\n"
-                    "1. 修改 SelfAttention 添加探索性注意力权重 (不完全依赖历史相似性)\n"
-                    "2. 添加多样性正则化损失 (鼓励推荐不同类别的物品)\n"
-                    "3. 修改位置编码添加时间衰减 (让模型能捕捉兴趣突变)\n"
-                    "4. 添加多兴趣建模模块 (同时捕捉用户的多个兴趣方向)\n"
-                    "5. 修改负采样策略代码 (更好地区分\"不同但好\"和\"不同但差\")\n"
-                )
-            elif diagnosis.get("overfitting") == "SEVERE":
-                prompt += (
-                    "\n\n### ⚠ 关键问题: 过拟合严重\n"
-                    "训练子集指标远高于测试集。\n"
-                    "请提出**结构修改**方案，例如:\n"
-                    "1. 在 SelfAttention 中添加 dropout 或 stochastic depth\n"
-                    "2. 添加权重共享或嵌入正则化\n"
-                    "3. 修改 FFN 扩展比例降低模型容量\n"
-                    "4. 添加 Layer-wise learning rate decay\n"
-                )
-
         # 调用 LLM
         response = self.llm.chat(
             messages=[
                 {"role": "system", "content": (
-                    "你是一位严谨的推荐系统算法专家，擅长从错误案例中推理模型瓶颈。"
-                    "你不仅能调参数，更重要的是能提出模型结构的修改方案并给出具体的代码改动。"
-                    "你的修改方案必须是可执行的完整 Python 代码，不能有省略号或占位符。"
+                    "你是一位推荐系统算法研究员，擅长从实验现象中观察、推理并提出改进方案。"
+                    "你可以自由选择改进方式 — 调参、改代码、或两者结合 — 只要有充分的实验依据。"
+                    "如果你提出代码修改，必须是可执行的完整 Python 代码，不能有省略号或占位符。"
                 )},
                 {"role": "user", "content": prompt},
             ],
@@ -2046,11 +2021,15 @@ class RecSelfEvolveAgent:
             except Exception:
                 return None
 
-        # 提取各部分
+        # 提取各部分 — 兼容新旧字段名
+        # 新prompt使用: observation/reasoning/rationale, 旧prompt使用: analysis/explanation
         param_changes = data.get("param_changes", {})
         structural_changes = data.get("structural_changes", [])
-        explanation = data.get("explanation", "")
-        analysis = data.get("analysis", "")
+        # 兼容: 新版 "rationale" 或旧版 "explanation"
+        explanation = data.get("rationale", "") or data.get("explanation", "")
+        # 兼容: 新版 "observation"+"reasoning" 或旧版 "analysis"
+        analysis = data.get("observation", "") + "\n" + data.get("reasoning", "") if data.get("observation") else data.get("analysis", "")
+
 
         # 验证参数变更
         if param_changes:
@@ -2072,52 +2051,61 @@ class RecSelfEvolveAgent:
         }
 
     def _validate_param_changes(self, param_changes: dict) -> dict:
-        """验证参数变更的合法性"""
+        """验证参数变更 — soft_limit 模式: 超出范围仅警告不拒绝"""
         valid_changes = {}
         for key, value in param_changes.items():
             if key in self.adapter.TUNABLE_PARAMS:
                 param_info = self.adapter.TUNABLE_PARAMS[key]
+                soft_limit = param_info.get("soft_limit", False)
                 try:
                     if param_info["type"] == "float":
                         value = float(value)
                     elif param_info["type"] == "int":
                         value = int(value)
-                    if "range" in param_info:
+                    if "range" in param_info and param_info["range"] is not None:
                         lo, hi = param_info["range"]
                         if lo <= value <= hi:
                             valid_changes[key] = value
-                        else:
-                            logger.warning(f"{key}={value} out of range [{lo},{hi}]")
-                    elif "choices" in param_info:
-                        if value in param_info["choices"]:
+                        elif soft_limit:
+                            # soft_limit: 仍然接受，只给温和提示
+                            logger.info(f"{key}={value} outside suggested range [{lo},{hi}], but accepted (soft limit)")
                             valid_changes[key] = value
                         else:
-                            logger.warning(f"{key}={value} not in {param_info['choices']}")
+                            logger.warning(f"{key}={value} out of range [{lo},{hi}], rejected")
+                    elif "choices" in param_info and param_info["choices"] is not None:
+                        if value in param_info["choices"]:
+                            valid_changes[key] = value
+                        elif soft_limit:
+                            # soft_limit: 接受任意值，LLM 可以自由命名
+                            logger.info(f"{key}={value} not in suggested choices {param_info['choices']}, but accepted (soft limit)")
+                            valid_changes[key] = value
+                        else:
+                            logger.warning(f"{key}={value} not in {param_info['choices']}, rejected")
                     else:
                         valid_changes[key] = value
                 except (ValueError, TypeError):
                     logger.warning(f"Cannot convert {key}={value} to {param_info['type']}")
             else:
-                # 不在可调参列表但可能合法
-                if key not in ("param_changes", "analysis", "explanation", 
-                               "structural_changes", "new_args_needed"):
-                    valid_changes[key] = value
+                # 不在可调参列表 — LLM 可能提出新参数，接受
+                valid_changes[key] = value
         return valid_changes
 
     def _validate_structural_changes(self, structural_changes: list) -> list:
-        """验证结构修改列表中每项的合法性"""
+        """验证结构修改列表 — 开放模式: 允许任意文件和类型"""
         valid_changes = []
         for change in structural_changes:
-            # 必须有 target_file
+            # target_file: 允许任何项目中存在的 .py 文件
             target_file = change.get("target_file", "")
-            if not target_file or target_file not in self.adapter.SOURCE_FILE_MAP:
-                # 尝试常见文件名
-                if target_file.endswith(".py") and os.path.exists(
-                    os.path.join(self.config.project_root, target_file)
-                ):
-                    pass  # 文件存在，允许
-                else:
-                    logger.warning(f"Invalid target_file: {target_file}")
+            if not target_file:
+                logger.warning(f"Structural change missing target_file: {change.get('description', '?')}")
+                continue
+            
+            # 如果在 SOURCE_FILE_MAP 中，直接允许
+            # 否则检查文件是否存在于项目目录中
+            if target_file not in self.adapter.SOURCE_FILE_MAP:
+                file_path = os.path.join(self.config.project_root, target_file)
+                if not os.path.exists(file_path):
+                    logger.warning(f"target_file {target_file} not found in project, skipping")
                     continue
             
             # 必须有 new_code
@@ -2130,39 +2118,19 @@ class RecSelfEvolveAgent:
             new_code = StructureApplier.clean_new_code(new_code)
             change["new_code"] = new_code
             
-            # 语法检查 new_code (至少要有 def 或 class)
-            if "def " not in new_code and "class " not in new_code:
-                # 可能只是代码片段，也允许
-                pass
-            
-            # 必须有 action_type
+            # action_type: 不强制要求，如果缺失则根据内容自动推断或用 "modify"
             if not change.get("action_type"):
-                # 根据描述自动推断
-                desc = change.get("description", "").lower()
-                if "attention" in desc:
-                    change["action_type"] = "modify_attention"
-                elif "position" in desc or "位置" in desc:
-                    change["action_type"] = "modify_position_encoding"
-                elif "ffn" in desc or "前馈" in desc:
-                    change["action_type"] = "modify_ffn"
-                elif "embedding" in desc or "嵌入" in desc:
-                    change["action_type"] = "modify_embedding"
-                elif "forward" in desc or "前向" in desc:
-                    change["action_type"] = "modify_forward_pass"
-                elif "loss" in desc or "损失" in desc:
-                    change["action_type"] = "add_loss_component"
-                elif "training" in desc or "训练" in desc:
-                    change["action_type"] = "modify_training_logic"
-                else:
+                # 简单推断: 有 class 定义 → add_module，否则 → modify
+                if "class " in new_code and "def " not in change.get("target_class_or_function", ""):
                     change["action_type"] = "add_module"
+                else:
+                    change["action_type"] = "modify"
             
-            # 必须有 insert_position
+            # insert_position: 不强制要求，如果缺失则智能推断
             if not change.get("insert_position"):
-                # 默认: 替换函数
                 if change.get("target_class_or_function") and "." in change.get("target_class_or_function", ""):
                     change["insert_position"] = "replace_function"
                 elif "class " in new_code:
-                    # 新类定义，追加到文件
                     change["insert_position"] = "append_to_file"
                 else:
                     change["insert_position"] = "replace_function"
@@ -2877,11 +2845,11 @@ class RecSelfEvolveAgent:
 
     def _get_strategy_instruction(self) -> str:
         instructions = {
-            "balanced": "平衡探索与利用: 50% 局部调优 + 50% 结构性改进",
-            "aggressive": "偏向探索: 优先尝试结构性创新, 如新模块、新损失函数",
-            "conservative": "偏向利用: 在已有基础上精细调参, 确保稳定性",
-            "explorative": "探索驱动: 参考相关论文的最新方法进行尝试",
-            "focused": "聚焦问题驱动: 针对当前指标短板深入优化",
+            "balanced": "当前策略: 自由探索 — 你可以观察现象后自由决定改进方向",
+            "aggressive": "当前策略: 大胆探索 — 不受约束地尝试你认为最有潜力的方案",
+            "conservative": "当前策略: 稳健优化 — 在已验证的基础上谨慎改进",
+            "explorative": "当前策略: 探索驱动 — 从实验现象出发发现新的优化思路",
+            "focused": "当前策略: 问题驱动 — 仔细观察实验数据中的短板并针对性地改进",
         }
         return instructions.get(self.current_strategy, "")
 
