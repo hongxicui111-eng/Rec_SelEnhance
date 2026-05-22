@@ -110,16 +110,17 @@ class EvolutionQualityGuard:
         if avg_recent < avg_before * self.degrade_threshold:
             return {
                 "type": "degradation",
+                "reason": f"指标退化: 近3轮均值 {avg_recent:.4f} < 前3轮均值 {avg_before:.4f} × {self.degrade_threshold} (下降 {(1 - avg_recent / avg_before) * 100:.1f}%)",
                 "before_avg": avg_before,
                 "recent_avg": avg_recent,
                 "drop_pct": (1 - avg_recent / avg_before) * 100,
             }
 
-        # 连续下降趋势: 最近 3 轮严格递减
         if len(recent_values) >= 3:
             if recent_values[0] > recent_values[1] > recent_values[2]:
                 return {
                     "type": "monotonic_decrease",
+                    "reason": f"连续3轮严格递减: {recent_values[0]:.4f} → {recent_values[1]:.4f} → {recent_values[2]:.4f}",
                     "values": recent_values,
                 }
 
@@ -148,6 +149,7 @@ class EvolutionQualityGuard:
         if all(abs(delta) < self.plateau_threshold for delta in improvements):
             return {
                 "type": "plateau",
+                "reason": f"近{self.window_size}轮提升均 < {self.plateau_threshold} (停滞), 最大提升: {max(improvements) if improvements else 0:.4f}",
                 "window": self.window_size,
                 "max_improvement": max(improvements) if improvements else 0,
             }

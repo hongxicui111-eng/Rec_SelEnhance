@@ -70,3 +70,15 @@ class AgentConfig:
     num_wrong_case_samples: int = 500  # 提取的错误案例数量
     num_train_subset: int = 500  # 训练子集评估的用户数量
     surprise_threshold: float = 0.5  # 惊喜度阈值 (≥ 此值为"惊喜"交互)
+
+    # ---- 多角色工作流配置 ----
+    enable_multi_role_workflow: bool = False  # 是否启用 Planner→Researcher→Coder→Debugger 多角色工作流
+    planner_model: str = ""       # Planner 使用的模型 (空则使用 llm_model)
+    researcher_model: str = ""    # Researcher 使用的模型
+    coder_model: str = ""         # Coder 使用的模型
+    debugger_model: str = ""      # Debugger 使用的模型
+    planner_temperature: float = 0.7   # Planner 温度
+    researcher_temperature: float = 0.7  # Researcher 温度
+    coder_temperature: float = 0.4      # Coder 温度
+    debugger_temperature: float = 0.2   # Debugger 温度
+    max_reflection_rounds: int = 3      # 最大反思轮次

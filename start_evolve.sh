@@ -5,15 +5,19 @@
 # ============================================================
 
 # ---- 基础配置 ----
-PROJECT_ROOT="/Users/cuihongxi/Documents/Rec_SelEnhance"
+PROJECT_ROOT="/home/cuihongxi/Rec_SelEnhance"
 DATA_NAME="Beauty"
 BACKBONE="SASRec"
 GPU="0"
 
 # ---- LLM 配置 (根据你的环境修改) ----
-LLM_URL="http://localhost:8000/v1"
+# LLM_URL="http://localhost:8000/v1"
+# LLM_KEY="EMPTY"
+# LLM_MODEL="DeepSeek-R1"
+
+LLM_URL="http://10.82.123.22:8000/v1"
 LLM_KEY="EMPTY"
-LLM_MODEL="DeepSeek-R1"
+LLM_MODEL="/share/cuihongxi/Qwen-235B-A22B-Instruct-2507"
 
 # ---- 训练参数 ----
 LR="0.001"
@@ -24,7 +28,7 @@ LOSS_TYPE="BCE"
 CL_TYPE="Radical"
 N="200"
 M="10"
-EPOCHS="500"
+EPOCHS="200"
 
 # ---- 进化控制 ----
 ITERATIONS="20"
@@ -32,8 +36,9 @@ STRATEGY="balanced"
 TEMPERATURE="0.7"
 TIMEOUT="7200"
 
+Workspace="Recmodel_Relax"
 # ---- 日志配置 ----
-LOG_DIR="./logs"
+LOG_DIR="/home/cuihongxi/Rec_SelEnhance/agent_run_context_relax"
 LOG_FILE="${LOG_DIR}/evolve_$(date +%Y%m%d_%H%M%S).log"
 
 # 创建日志目录
@@ -56,7 +61,7 @@ echo "=========================================="
 cd ${PROJECT_ROOT}
 
 python run_evolve.py \
-    --project "${PROJECT_ROOT}" \
+    --project "${PROJECT_ROOT}/${Workspace}" \
     --data "${DATA_NAME}" \
     --backbone "${BACKBONE}" \
     --gpu "${GPU}" \

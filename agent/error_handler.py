@@ -119,7 +119,8 @@ class ProposalParser:
                 }
 
         # 格式 2: 统一 diff 格式 (--- a/... +++ b/...)
-        unified_pattern = r'(?:^|\n)(--- [^\n]+\n\+\+\+ [^\n]+\n(?:@@[^\n]*\n(?:[+- ].*\n?)*))'
+        # 注意: [+\- ] 中 - 必须转义或放在末尾，否则 re 会当作字符范围解析
+        unified_pattern = r'(?:^|\n)(--- [^\n]+\n\+\+\+ [^\n]+\n(?:@@[^\n]*\n(?:[+\- ].*\n?)*))'
         unified_match = re.search(unified_pattern, text, re.MULTILINE)
         if unified_match:
             return {

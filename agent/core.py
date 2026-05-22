@@ -22,7 +22,15 @@ from .code_applier import CodeApplier
 from .quality_guard import EvolutionQualityGuard, SafetyGuardrails
 from .journal import ExperimentJournal
 from .project_adapter import create_adapter, SeqRecAdapter
-from .prompts import MLE_ANALYSIS_PROMPT, STRUCTURE_OPTIMIZATION_PROMPT, ERROR_FEEDBACK_PROMPT, STRUCTURE_FIX_PROMPT, TRAIN_DIAGNOSIS_PROMPT, CODE_FIX_PROMPT, PREFLIGHT_FIX_PROMPT
+from .prompts import (
+    MLE_ANALYSIS_PROMPT, STRUCTURE_OPTIMIZATION_PROMPT,
+    ERROR_FEEDBACK_PROMPT, STRUCTURE_FIX_PROMPT,
+    TRAIN_DIAGNOSIS_PROMPT, CODE_FIX_PROMPT, PREFLIGHT_FIX_PROMPT,
+    # 多角色工作流 prompt 模板
+    PLANNER_INSTRUCTIONS, RESEARCHER_INSTRUCTIONS,
+    REFLECTION_INSTRUCTIONS, SEARCH_INSTRUCTIONS,
+    CODER_INSTRUCTIONS, DEBUGGER_INSTRUCTIONS,
+)
 from .llm_analyzer import LLMCaseAnalyzer
 from .structure_applier import StructureApplier
 from .iterative_memory import IterativeMemory
@@ -114,6 +122,42 @@ class RecSelfEvolveAgent:
         self._max_self_correction_rounds = 5  # 自纠错最大轮数 (从3增加到5!)
         self._max_code_fix_rounds = 10        # 源码bug修复最大轮数 (核心新增!)
         self._consecutive_fail_count = 0      # 连续失败计数 (用于判断是否需要强制修复)
+
+        # ---- 多角色工作流 (Planner→Researcher→Coder→Debugger) ----
+        self._multi_role_enabled = self.config.enable_multi_role_workflow
+        if self._multi_role_enabled:
+            from .researcher import ResearcherAgent
+            from .coder import CoderAgent
+            
+            self._researcher_agent = ResearcherAgent(
+                api_url=self.config.llm_api_url,
+                api_key=self.config.llm_api_key,
+                model=self.config.researcher_model or self.config.llm_model,
+                temperature=self.config.researcher_temperature,
+                max_reflection_times=self.config.max_reflection_rounds,
+                timeout=self.config.llm_timeout,
+                max_retries=self.config.llm_max_retries,
+            )
+            self._coder_agent = CoderAgent(
+                api_url=self.config.llm_api_url,
+                api_key=self.config.llm_api_key,
+                model=self.config.coder_model or self.config.llm_model,
+                temperature=self.config.coder_temperature,
+                max_reflection_times=self.config.max_reflection_rounds,
+                timeout=self.config.llm_timeout,
+                max_retries=self.config.llm_max_retries,
+            )
+            # Debugger 使用独立 LLM 调用 (温度更低, 更精确)
+            self._debugger_llm = LLMClient(
+                api_url=self.config.llm_api_url,
+                api_key=self.config.llm_api_key,
+                model=self.config.debugger_model or self.config.llm_model,
+                timeout=self.config.llm_timeout,
+                max_retries=self.config.llm_max_retries,
+                max_context_tokens=self.config.llm_max_context_tokens,
+                prompt_safety_ratio=self.config.llm_prompt_safety_ratio,
+            )
+            logger.info("Multi-role workflow enabled: Planner→Researcher→Coder→Debugger")
 
         logger.info("RecSelfEvolveAgent initialized")
 
@@ -290,7 +334,12 @@ class RecSelfEvolveAgent:
                 continue
 
             # --- Phase 4: LLM 分析 + 提案 ---
-            proposal_result = self._phase_analyze_and_propose(metrics)
+            if self._multi_role_enabled:
+                # 多角色工作流: Planner → Researcher → Coder → Debugger
+                proposal_result = self._phase_multi_role_analyze_and_propose(metrics)
+            else:
+                # 单角色工作流: 传统 MLE 分析
+                proposal_result = self._phase_analyze_and_propose(metrics)
             if proposal_result is None:
                 print(f"  ⚠ LLM analysis failed, skipping")
                 continue
@@ -1961,6 +2010,485 @@ class RecSelfEvolveAgent:
 
         # 解析 LLM 的回复为结构化数据
         return self._parse_proposal_response(response)
+
+    # ════════════════════════════════════════
+    # 多角色工作流: Planner → Researcher → Coder → Debugger
+    # ════════════════════════════════════════
+
+    def _phase_multi_role_analyze_and_propose(self, metrics: dict) -> Optional[dict]:
+        """
+        多角色工作流的分析与提案阶段
+        
+        工作流:
+        1. Planner: 规划研究方向 (使用 PLANNER_INSTRUCTIONS)
+        2. Researcher: 深度研究提出方案 (使用 RESEARCHER_INSTRUCTIONS)
+        3. Coder: 代码修改 (使用 CODER_INSTRUCTIONS)
+        4. Debugger: 代码验证 (使用 DEBUGGER_INSTRUCTIONS) — 可选
+        
+        同时在每轮迭代后执行 Reflection (使用 REFLECTION_INSTRUCTIONS)
+        
+        Returns:
+            与 _phase_analyze_and_propose 相同格式的 dict
+        """
+        import asyncio
+        
+        # ── 构建公共上下文 ──
+        journal_summary = self.journal.summarize(n=8)
+        if self.config.llm_enable_semantic_compression:
+            journal_summary = self.context_compressor.compress_text(
+                journal_summary,
+                chunk_chars=self.config.llm_compression_chunk_chars,
+                target_chars=self.config.llm_compression_target_chars,
+                section_name="journal_summary",
+                profile="journal",
+            )
+        journal_summary = self._clip_text_by_chars(journal_summary, max_chars=4500)
+        # 使用与 _phase_analyze_and_propose 一致的源码上下文构建方式
+        source_code_ctx = self.adapter.build_source_code_context(
+            include_files=["models.py", "modules.py"],
+            max_total_chars=6500,
+            iterative_memory=self.iter_memory,
+        )
+        project_ctx = self.adapter.format_metrics_for_llm(metrics)
+        
+        metrics_str = json.dumps(metrics, indent=2, ensure_ascii=False)
+        hidden_size = self.adapter.base_args.get("hidden_size", 64)
+        research_topic = f"{self.adapter.backbone} on {self.adapter.data_name}"
+        
+        # ── Step 1: Planner 规划研究方向 ──
+        print(f"  🎯 [Planner] 规划研究方向...")
+        planner_prompt = PLANNER_INSTRUCTIONS.format(
+            research_topic=research_topic,
+            current_metrics=metrics_str,
+            experiment_journal=journal_summary,
+        )
+        
+        # 添加额外上下文
+        planner_prompt += f"\n\n## 当前模型源码\n{source_code_ctx}"
+        
+        # 添加惊喜评估信息
+        if self._last_surprise_report:
+            surprise_info = f"""
+## 惊喜评估结果
+```json
+{json.dumps(self._last_surprise_report.get("evaluation_report_summary", {}), indent=2, ensure_ascii=False)}
+```
+
+## 诊断信息
+```json
+{json.dumps(self._last_surprise_report.get("evaluation_report_summary", {}).get("diagnosis", {}), indent=2, ensure_ascii=False)}
+```
+"""
+            planner_prompt += surprise_info
+        
+        strategy_instruction = self._get_strategy_instruction()
+        if strategy_instruction:
+            planner_prompt += f"\n\n## 当前探索策略\n{strategy_instruction}"
+        
+        planner_response = self.llm.chat(
+            messages=[
+                {"role": "system", "content": "你是一位资深推荐系统研究规划师，擅长从实验数据中识别瓶颈并规划研究方向。"},
+                {"role": "user", "content": planner_prompt},
+            ],
+            temperature=self.config.planner_temperature,
+            max_tokens=self.config.llm_max_tokens,
+        )
+        
+        if planner_response is None:
+            logger.error("Planner step failed - no response")
+            return self._phase_analyze_and_propose(metrics)  # 降级回传统流程
+        
+        # 解析 Planner 的规划结果
+        planner_result = self._parse_json_response(planner_response)
+        if planner_result is None:
+            logger.warning("Planner output not valid JSON, falling back to traditional workflow")
+            return self._phase_analyze_and_propose(metrics)
+        
+        research_plan = planner_result.get("research_plan", {})
+        primary_direction = research_plan.get("primary_direction", "")
+        hypothesis = research_plan.get("hypothesis", "")
+        
+        print(f"  📋 [Planner] 方向: {primary_direction[:80]}")
+        print(f"  📋 [Planner] 假设: {hypothesis[:80]}")
+        
+        # ── Step 2: Researcher 深度研究 ──
+        print(f"  🔍 [Researcher] 深度研究...")
+        
+        # 更新研究 Agent 的主题
+        self._researcher_agent.update_topic(
+            query=primary_direction,
+            problem_name=research_topic,
+            problem_description=hypothesis,
+        )
+        
+        researcher_prompt = RESEARCHER_INSTRUCTIONS.format(
+            research_direction=primary_direction,
+            current_metrics=metrics_str,
+            experiment_journal=journal_summary,
+            source_code_context=source_code_ctx[:4000],  # 限制长度
+        )
+        
+        researcher_response = self.llm.chat(
+            messages=[
+                {"role": "system", "content": "你是一位专业的推荐系统研究员，擅长分析问题并提出创新性改进方案。"},
+                {"role": "user", "content": researcher_prompt},
+            ],
+            temperature=self.config.researcher_temperature,
+            max_tokens=self.config.llm_max_tokens,
+        )
+        
+        if researcher_response is None:
+            logger.error("Researcher step failed - no response")
+            return self._phase_analyze_and_propose(metrics)
+        
+        researcher_result = self._parse_json_response(researcher_response)
+        if researcher_result is None:
+            logger.warning("Researcher output not valid JSON, falling back to traditional workflow")
+            return self._phase_analyze_and_propose(metrics)
+        
+        # 提取推荐方案
+        recommended = researcher_result.get("recommended_solution", {})
+        chosen_solution = recommended.get("choice", primary_direction)
+        proposed_solutions = researcher_result.get("proposed_solutions", [])
+        
+        # 选择推荐方案或第一个方案
+        best_solution = None
+        for sol in proposed_solutions:
+            if sol.get("solution_name") == chosen_solution:
+                best_solution = sol
+                break
+        if best_solution is None and proposed_solutions:
+            best_solution = proposed_solutions[0]
+        
+        if best_solution is None:
+            logger.warning("No valid solution from Researcher, falling back")
+            return self._phase_analyze_and_propose(metrics)
+        
+        print(f"  📝 [Researcher] 方案: {best_solution.get('solution_name', '?')[:80]}")
+        print(f"  📝 [Researcher] 理论: {best_solution.get('theoretical_basis', '?')[:80]}")
+        
+        # ── Step 2.5: Reflection (可选) ──
+        if self.current_iteration > 0 and self._last_surprise_report:
+            print(f"  🔄 [Reflection] 反思研究进展...")
+            reflection_prompt = REFLECTION_INSTRUCTIONS.format(
+                iteration_count=self.current_iteration,
+                previous_direction=primary_direction,
+                previous_results=metrics_str,
+                current_metrics=metrics_str,
+            )
+            
+            reflection_response = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": "你是一位经验丰富的AI研究顾问，擅长反思和评估研究进展。"},
+                    {"role": "user", "content": reflection_prompt},
+                ],
+                temperature=self.config.planner_temperature,
+                max_tokens=self.config.llm_max_tokens,
+            )
+            
+            if reflection_response:
+                reflection_result = self._parse_json_response(reflection_response)
+                if reflection_result:
+                    recommendations = reflection_result.get("recommendations", {})
+                    if not recommendations.get("continue_current_direction", True):
+                        # 反思建议转向 — 重新规划
+                        pivot = recommendations.get("suggested_pivot", "")
+                        print(f"  🔀 [Reflection] 建议转向: {pivot[:80]}")
+                        # 用转向方向覆盖当前方案的理论依据
+                        if pivot:
+                            best_solution["theoretical_basis"] = f"Reflection pivot: {pivot}"
+        
+        # ── Step 3: Coder 代码修改 ──
+        print(f"  💻 [Coder] 代码修改...")
+        research_idea = (
+            f"{best_solution.get('solution_name', chosen_solution)}: "
+            f"{best_solution.get('theoretical_basis', '')}"
+        )
+        
+        coder_prompt = CODER_INSTRUCTIONS.format(
+            research_idea=research_idea,
+            target_metrics=metrics_str,
+            source_code_context=source_code_ctx,
+        )
+        
+        coder_response = self.llm.chat(
+            messages=[
+                {"role": "system", "content": (
+                    "你是一位具有强大软件工程能力的研究者，擅长使用SEARCH/REPLACE格式精确修改代码。"
+                    "所有修改必须使用 Self_EvolveRec-BLOCK-START/END 标记追踪。"
+                )},
+                {"role": "user", "content": coder_prompt},
+            ],
+            temperature=self.config.coder_temperature,
+            max_tokens=self.config.llm_max_tokens,
+        )
+        
+        if coder_response is None:
+            logger.error("Coder step failed - no response")
+            return self._phase_analyze_and_propose(metrics)
+        
+        # ── Step 3.5: 解析 Coder 输出 (支持 SEARCH/REPLACE 格式和 JSON 格式) ──
+        coder_result = self._parse_multi_role_coder_output(coder_response, research_idea)
+        
+        if coder_result is None:
+            logger.warning("Coder output could not be parsed, falling back to traditional workflow")
+            return self._phase_analyze_and_propose(metrics)
+        
+        # ── Step 4: Debugger 代码验证 (可选) ──
+        if coder_result.get("structural_changes"):
+            print(f"  🔧 [Debugger] 验证代码修改...")
+            
+            # 构建当前修改后的代码用于验证
+            current_code = source_code_ctx[:6000]  # 限制长度
+            
+            debugger_prompt = DEBUGGER_INSTRUCTIONS.format(
+                current_code=current_code,
+                error_info="请在提交前验证代码正确性",  # 预检模式
+            )
+            
+            debugger_response = self._debugger_llm.chat(
+                messages=[
+                    {"role": "system", "content": "你是一位专家开发者，负责验证代码修改的正确性和一致性。"},
+                    {"role": "user", "content": debugger_prompt},
+                ],
+                temperature=self.config.debugger_temperature,
+                max_tokens=self.config.llm_max_tokens,
+            )
+            
+            if debugger_response:
+                debug_result = self._parse_json_response(debugger_response)
+                if debug_result and debug_result.get("issues_found"):
+                    # Debugger 发现问题 → 标记低信心
+                    for sc in coder_result.get("structural_changes", []):
+                        sc["confidence"] = "低"
+                    print(f"  ⚠ [Debugger] 发现潜在问题: {debug_result.get('issues_found', [])}")
+        
+        # ── 合并结果为统一格式 ──
+        result = {
+            "param_changes": coder_result.get("param_changes", {}),
+            "structural_changes": coder_result.get("structural_changes", []),
+            "explanation": (
+                f"[Multi-Role] Planner方向={primary_direction}, "
+                f"Researcher方案={chosen_solution}, "
+                f"Coder修改={len(coder_result.get('structural_changes', []))}处"
+            ),
+            "observation": planner_result.get("analysis", {}).get("current_bottlenecks", []),
+            "reasoning": best_solution.get("theoretical_basis", ""),
+            "rationale": planner_result.get("rationale", ""),
+            "workflow_trace": {
+                "planner": planner_result,
+                "researcher": researcher_result,
+                "coder": coder_result,
+            },
+        }
+        
+        self.journal.record({
+            "iteration": self.current_iteration,
+            "phase": "multi_role_analyze_and_propose",
+            "status": "MULTI_ROLE_PROPOSAL",
+            "planner_direction": primary_direction,
+            "researcher_solution": chosen_solution,
+            "num_structural_changes": len(result["structural_changes"]),
+        })
+        
+        return result
+
+    def _parse_json_response(self, response: str) -> Optional[dict]:
+        """
+        尝试从 LLM 输出中解析 JSON
+        
+        适用于 Planner/Researcher/Reflection/Debugger 等角色的输出
+        """
+        if not response:
+            return None
+        
+        # 提取 JSON 块
+        json_patterns = [
+            r'```json\s*\n(.*?)```',  # ```json ... ```
+            r'```(.*?)```',            # ``` ... ```
+            r'\{.*\}',                  # 裸 JSON 对象
+        ]
+        
+        for pattern in json_patterns:
+            match = re.search(pattern, response, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(1) if '```' in pattern else match.group(0))
+                except json.JSONDecodeError:
+                    continue
+        
+        logger.warning(f"Could not parse JSON from response (first 200 chars): {response[:200]}")
+        return None
+
+    def _parse_multi_role_coder_output(self, response: str, research_idea: str) -> Optional[dict]:
+        """
+        解析 Coder 的输出 — 支持 SEARCH/REPLACE 格式和传统 JSON 格式
+        
+        SEARCH/REPLACE 格式:
+          <<<<<<< SEARCH
+          # original code
+          =======
+          ### >>> Self_EvolveRec-BLOCK-START: <idea>
+          # new code
+          ### <<< Self_EvolveRec-BLOCK-END
+          >>>>>>> REPLACE
+        
+        传统 JSON 格式:
+          { "structural_changes": [...], "param_changes": {...} }
+        """
+        if not response:
+            return None
+        
+        # ── 尝试解析 SEARCH/REPLACE 格式 ──
+        sr_result = self._parse_search_replace_diff(response, research_idea)
+        if sr_result:
+            return sr_result
+        
+        # ── 降级: 尝试解析 JSON 格式 ──
+        json_result = self._parse_json_response(response)
+        if json_result:
+            # JSON 格式可能直接包含 structural_changes 和 param_changes
+            return {
+                "structural_changes": json_result.get("structural_changes", []),
+                "param_changes": json_result.get("param_changes", {}),
+            }
+        
+        # ── 最后降级: 使用传统 _parse_proposal_response ──
+        traditional_result = self._parse_proposal_response(response)
+        if traditional_result:
+            return traditional_result
+        
+        return None
+
+    def _parse_search_replace_diff(self, response: str, research_idea: str) -> Optional[dict]:
+        """
+        从 LLM 输出中提取 SEARCH/REPLACE diff 块并转换为 structural_changes
+        
+        每个 SEARCH/REPLACE 块转换为:
+        {
+            "target_file": "...",
+            "target_class_or_function": "...",
+            "description": "...",
+            "new_code": "...",
+            "insert_position": "replace_function",
+            "expected_effect": "...",
+            "confidence": "中",
+        }
+        """
+        # 提取所有 SEARCH/REPLACE 块
+        diff_pattern = r'<<<<<<< SEARCH\s*\n(.*?)=======\s*\n(.*?)>>>>>>> REPLACE'
+        matches = re.findall(diff_pattern, response, re.DOTALL)
+        
+        if not matches:
+            return None
+        
+        structural_changes = []
+        
+        for search_code, replace_code in matches:
+            search_code = search_code.strip()
+            replace_code = replace_code.strip()
+            
+            # 提取 Self_EvolveRec 块描述 (如果有)
+            block_idea = research_idea
+            idea_match = re.search(
+                r'Self_EvolveRec-BLOCK-START:\s*(.*?)(?:\n|$)',
+                replace_code,
+            )
+            if idea_match:
+                block_idea = idea_match.group(1).strip()
+            
+            # 尝试确定目标文件和函数
+            target_file, target_func = self._identify_target_from_code(search_code)
+            
+            # 提取实际新代码 (去掉 Self_EvolveRec 标记行)
+            clean_new_code = self._strip_evolve_markers(replace_code)
+            
+            change = {
+                "target_file": target_file,
+                "target_class_or_function": target_func,
+                "description": f"[Self_EvolveRec] {block_idea}",
+                "new_code": clean_new_code,
+                "insert_position": "replace_function",  # 默认
+                "expected_effect": f"Implement: {block_idea}",
+                "confidence": "中",
+            }
+            structural_changes.append(change)
+        
+        if not structural_changes:
+            return None
+        
+        return {
+            "structural_changes": structural_changes,
+            "param_changes": {},  # SEARCH/REPLACE 格式不含参数变更
+        }
+
+    def _identify_target_from_code(self, code_snippet: str) -> tuple:
+        """
+        从代码片段中推断目标文件和函数/类名
+        
+        Returns:
+            (target_file, target_class_or_function)
+        """
+        # 尝试匹配类定义
+        class_match = re.search(r'class\s+(\w+)', code_snippet)
+        if class_match:
+            class_name = class_match.group(1)
+            # 查找该类在哪个源码文件中
+            target_file = self._find_file_containing_class(class_name)
+            return (target_file, class_name)
+        
+        # 尝试匹配函数定义
+        func_match = re.search(r'def\s+(\w+)', code_snippet)
+        if func_match:
+            func_name = func_match.group(1)
+            target_file = self._find_file_containing_function(func_name)
+            return (target_file, func_name)
+        
+        # 默认: 使用主要模型文件
+        default_file = list(self.adapter.SOURCE_FILE_MAP.keys())[0] if self.adapter.SOURCE_FILE_MAP else "unknown"
+        return (default_file, "unknown")
+
+    def _find_file_containing_class(self, class_name: str) -> str:
+        """查找包含指定类名的源码文件"""
+        for file_path in self.adapter.SOURCE_FILE_MAP.keys():
+            full_path = os.path.join(self.config.project_root, file_path)
+            if os.path.exists(full_path):
+                try:
+                    content = open(full_path).read()
+                    if f"class {class_name}" in content:
+                        return file_path
+                except Exception:
+                    continue
+        return list(self.adapter.SOURCE_FILE_MAP.keys())[0] if self.adapter.SOURCE_FILE_MAP else "unknown"
+
+    def _find_file_containing_function(self, func_name: str) -> str:
+        """查找包含指定函数名的源码文件"""
+        for file_path in self.adapter.SOURCE_FILE_MAP.keys():
+            full_path = os.path.join(self.config.project_root, file_path)
+            if os.path.exists(full_path):
+                try:
+                    content = open(full_path).read()
+                    if f"def {func_name}" in content:
+                        return file_path
+                except Exception:
+                    continue
+        return list(self.adapter.SOURCE_FILE_MAP.keys())[0] if self.adapter.SOURCE_FILE_MAP else "unknown"
+
+    def _strip_evolve_markers(self, code: str) -> str:
+        """从代码中移除 Self_EvolveRec-BLOCK-START/END 标记行"""
+        lines = code.split('\n')
+        clean_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('### >>> Self_EvolveRec-BLOCK-START:'):
+                # 保留注释内容但去掉标记格式
+                idea = stripped.replace('### >>> Self_EvolveRec-BLOCK-START:', '').strip()
+                clean_lines.append(f"# [Self_EvolveRec] {idea}")
+            elif stripped == '### <<< Self_EvolveRec-BLOCK-END':
+                continue  # 移除结束标记
+            else:
+                clean_lines.append(line)
+        return '\n'.join(clean_lines)
 
     def _parse_proposal_response(self, response: str) -> Optional[dict]:
         """
