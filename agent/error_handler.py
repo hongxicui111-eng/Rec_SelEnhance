@@ -295,7 +295,13 @@ class LLMFixer:
             raw_output=raw_output,
             error_reason=error_reason,
         )
+        print(f"\n  🔁 [LLMFixer] Asking LLM to fix format (reason: {error_reason})")
         result = self.llm.chat([
             {"role": "user", "content": prompt}
         ], temperature=0.1, max_tokens=4096)
+        if result is None:
+            print(f"  ✗ [LLMFixer] LLM format fix call failed, returning original output")
+            logger.warning("LLMFixer: LLM format fix call failed")
+        else:
+            print(f"  ✓ [LLMFixer] LLM format fix succeeded ({len(result)} chars)")
         return result or raw_output

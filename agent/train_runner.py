@@ -79,6 +79,34 @@ class FaultTolerantTrainRunner:
             )
             logger.info(f"Running:\n{cmd}")
 
+            # ── 训练命令前置校验（fail-fast）──
+            cmd_check = self.adapter.validate_train_command(cmd)
+            if not cmd_check.get("ok", False):
+                issue_text = " | ".join(cmd_check.get("issues", []))
+                warn_text = " | ".join(cmd_check.get("warnings", []))
+                if warn_text:
+                    logger.warning(f"Train command warnings: {warn_text}")
+                logger.error(f"Train command validation failed: {issue_text}")
+                return {
+                    "status": "FAILED",
+                    "error": f"Train command validation failed: {issue_text}",
+                    "error_category": "CONFIG_ERROR",
+                    "fixable": True,
+                    "traceback_details": {},
+                    "log": "",
+                    "applied_overrides": working_overrides,
+                    "action": "fix_and_retry",
+                    "returncode": None,
+                    "diagnostics": {
+                        "command": cmd,
+                        "issues": cmd_check.get("issues", []),
+                        "warnings": cmd_check.get("warnings", []),
+                    },
+                }
+
+            if cmd_check.get("warnings"):
+                logger.warning(f"Train command warnings: {' | '.join(cmd_check.get('warnings', []))}")
+
             try:
                 # ── 使用 Popen 实时流式输出, 不再静默! ──
                 # 这样用户能看到每个 epoch 的进度和指标
@@ -272,7 +300,7 @@ class FaultTolerantTrainRunner:
                     fixable = True
                 else:
                     error_category = self._classify_error(error_msg, traceback_details)
-                    fixable = self._is_fixable(error_category, traceback_details)
+                    fixable = self._is_fixable(error_category, traceback_details, returncode)
                 
                 return {
                     "status": "FAILED",
@@ -575,14 +603,20 @@ class FaultTolerantTrainRunner:
         # ── 无法分类 → SYSTEM_ERROR ──
         return "SYSTEM_ERROR"
 
-    def _is_fixable(self, error_category: str, traceback_details: dict) -> bool:
+    def _is_fixable(self, error_category: str, traceback_details: dict, returncode: Optional[int] = None) -> bool:
         """
         判断错误是否可以通过自纠错修复:
         - CODE_ERROR: fixable=True → LLM 可以修改源码修复
         - CONFIG_ERROR: fixable=True → LLM 可以调整参数修复
         - DATA_ERROR: fixable=True → LLM 可以修正路径/配置修复
         - SYSTEM_ERROR: fixable=False → 需要人工干预
+
+        额外规则（开源 Agent 常见实践）:
+        - returncode 为 134/137/139（abort/kill/segfault）倾向系统层异常，默认不可修复
         """
+        if returncode in (134, 137, 139):
+            return False
+
         if error_category == "SYSTEM_ERROR":
             return False
         # CODE_ERROR, CONFIG_ERROR, DATA_ERROR 都可以通过 LLM 自纠错修复

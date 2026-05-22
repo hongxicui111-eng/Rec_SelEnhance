@@ -468,6 +468,8 @@ class LLMCaseAnalyzer:
             if start >= 0 and end > start:
                 json_str = response[start:end + 1]
             else:
+                print(f"\n  ⚠ [LLM_ANALYZER PARSE] Cannot extract JSON from LLM response")
+                print(f"     Response : {response}")
                 logger.warning(f"Cannot extract JSON from LLM response")
                 # 保存原始回复供参考
                 return {
@@ -480,6 +482,8 @@ class LLMCaseAnalyzer:
             parsed["parse_success"] = True
             return parsed
         except json.JSONDecodeError as e:
+            print(f"\n  ⚠ [LLM_ANALYZER PARSE] JSON decode failed: {e}")
+            print(f"     Extracted JSON string first 200 chars: {json_str[:200]}")
             logger.warning(f"JSON parse error: {e}")
             # 尝试宽松解析
             try:

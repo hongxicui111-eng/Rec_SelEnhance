@@ -134,6 +134,22 @@ class StructureApplier:
                 })
                 logger.warning(f"Change failed: {result.get('error', 'unknown')}")
 
+        # 如果一个修改都没成功，直接判定 ALL_FAILED，避免“0 个成功却显示成功/部分成功”
+        if not applied and failed:
+            logger.warning("No structural changes were successfully applied")
+            return {
+                "status": "ALL_FAILED",
+                "applied_changes": [],
+                "failed_changes": failed,
+                "validation_results": {
+                    "all_passed": False,
+                    "results": {},
+                    "errors": ["No structural changes were applied"],
+                    "summary": "No files modified",
+                },
+                "files_modified": [],
+            }
+
         # Step 3: 校验所有修改后的文件
         validation = self._validate_all_modified_files(list(files_modified))
 
@@ -156,7 +172,9 @@ class StructureApplier:
             }
 
         # Step 4: 成功 → 保留修改
-        logger.info(f"All {len(applied)} structural changes applied and validated successfully")
+        logger.info(
+            f"Structural changes finished: applied={len(applied)}, failed={len(failed)}, files_modified={len(files_modified)}"
+        )
         self._applied_changes.extend(applied)
 
         return {
@@ -174,7 +192,10 @@ class StructureApplier:
     def _apply_single_change(self, change: Dict) -> Dict:
         """
         应用单个结构修改
-        
+
+        BUG FIX #5: 增强诊断信息, 写入前先做快速语法检查,
+        不再盲目打印 "Successfully applied"。
+
         根据 insert_position 决定如何修改文件:
         - "replace_function": 替换目标函数的完整定义
         - "replace_class": 替换目标类的完整定义
@@ -203,37 +224,215 @@ class StructureApplier:
             return {"status": "FAILED", "error": f"Cannot read file {file_path}: {e}"}
 
         # 根据插入方式应用修改
+        # ── BUG FIX #5: 记录使用了哪种替换策略 ──
+        diagnostics = {
+            "target_file": target_file,
+            "target_name": target_name,
+            "insert_position": insert_position,
+            "replacement_method": "unknown",
+        }
+
         if insert_position == "replace_function":
             new_content = self._replace_function(original_content, target_name, new_code)
+            diagnostics["replacement_method"] = "replace_function"
         elif insert_position == "replace_class":
             new_content = self._replace_class(original_content, target_name, new_code)
+            diagnostics["replacement_method"] = "replace_class"
         elif insert_position.startswith("after_class_"):
             ref_class = insert_position.replace("after_class_", "")
             new_content = self._insert_after_class(original_content, ref_class, new_code)
+            diagnostics["replacement_method"] = "insert_after_class"
         elif insert_position.startswith("before_function_"):
             ref_func = insert_position.replace("before_function_", "")
             new_content = self._insert_before_function(original_content, ref_func, new_code)
+            diagnostics["replacement_method"] = "insert_before_function"
         elif insert_position == "append_to_file":
             new_content = original_content + "\n\n\n" + new_code
+            diagnostics["replacement_method"] = "append_to_file"
         else:
             # 默认: 替换函数
             new_content = self._replace_function(original_content, target_name, new_code)
+            diagnostics["replacement_method"] = "replace_function_default"
 
         if new_content is None:
+            diagnostics["failure_reason"] = f"Cannot apply {insert_position} for {target_name}"
             return {
                 "status": "FAILED",
                 "error": f"Cannot apply {insert_position} for {target_name} in {target_file}",
+                "diagnostics": diagnostics,
+            }
+
+        # ── BUG FIX #5: 写入前先做快速语法检查 ──
+        quick_syntax = self._check_syntax(new_content, file_path)
+        if not quick_syntax["passed"]:
+            logger.warning(f"Quick syntax check FAILED before writing: {quick_syntax.get('error', '')}")
+            logger.warning("Skipping write to avoid corrupting the file")
+            diagnostics["failure_reason"] = f"Quick syntax check failed: {quick_syntax.get('error', '')}"
+            diagnostics["quick_syntax_error"] = quick_syntax
+            return {
+                "status": "FAILED",
+                "error": f"Generated code has syntax error: {quick_syntax.get('error', '')}",
+                "diagnostics": diagnostics,
             }
 
         # 写入修改后的文件
         try:
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(new_content)
-            logger.info(f"Successfully applied change to {file_path}")
+            logger.info(f"Applied change to {file_path} (method={diagnostics['replacement_method']})")
         except Exception as e:
             return {"status": "FAILED", "error": f"Cannot write file {file_path}: {e}"}
 
-        return {"status": "APPLIED", "file_path": file_path}
+        return {"status": "APPLIED", "file_path": file_path, "diagnostics": diagnostics}
+
+    # ════════════════════════════════════════
+    # new_code 预处理 — 剥离 LLM 输出中的 class 包装
+    # ════════════════════════════════════════
+
+    @staticmethod
+    def _strip_class_wrapper(new_code: str, target_class_name: str = None) -> str:
+        """
+        剥离 new_code 中的 class 定义头和多余缩进
+
+        LLM 输出的 new_code 经常包含完整的 class 定义:
+            class SelfAttention(nn.Module):
+                def __init__(self, args):
+                    ...
+
+        但当我们在替换类中的方法时, 只需要方法部分:
+            def __init__(self, args):
+                ...
+
+        如果保留了 class 头, 插入到已有 class body 中会产生:
+            class SelfAttention(nn.Module):       ← 原有
+            class SelfAttention(nn.Module):       ← new_code 带来的! 语法错误!
+                def __init__(self, args):
+
+        Args:
+            new_code: LLM 输出的原始代码
+            target_class_name: 目标类名 (如果已知, 只剥离匹配的 class 头;
+                               如果未知, 剥离所有 class 头)
+
+        Returns:
+            str: 剥离 class 头后的方法代码, 缩进已调整为方法级别
+        """
+        lines = new_code.split('\n')
+        if not lines:
+            return new_code
+
+        # 检查 new_code 是否以 class 定义开头
+        first_non_empty = None
+        first_non_empty_idx = None
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped:
+                first_non_empty = stripped
+                first_non_empty_idx = idx
+                break
+
+        if first_non_empty is None:
+            # 全空行 → 直接返回
+            return new_code
+
+        # 检查是否是 class 定义行
+        class_header_match = re.match(r'class\s+(\w+)\s*\([^)]*\)\s*:', first_non_empty)
+        if not class_header_match:
+            # 不是 class 定义 → 不需要剥离
+            return new_code
+
+        detected_class_name = class_header_match.group(1)
+
+        # 如果指定了 target_class_name, 只剥离匹配的 class 头
+        # (避免错误剥离 new_code 中其他辅助类的定义)
+        if target_class_name and detected_class_name != target_class_name:
+            logger.info(f"new_code contains class {detected_class_name}, "
+                        f"but target is {target_class_name} — not stripping")
+            return new_code
+
+        logger.info(f"Stripping class wrapper '{detected_class_name}' from new_code "
+                    f"(method replacement, not class replacement)")
+
+        # 找到 class 头之后的方法内容
+        # class 头行后面可能有空行, 然后是方法定义 (多缩进一层)
+        method_lines = []
+        class_header_indent = len(lines[first_non_empty_idx]) - len(first_non_empty)
+        method_indent = class_header_indent + 4  # class body 通常多缩进 4 格
+
+        # 从 class 头行之后开始提取
+        inside_class_body = False
+        for idx in range(first_non_empty_idx + 1, len(lines)):
+            line = lines[idx]
+            stripped = line.strip()
+
+            if not inside_class_body:
+                # 还没进入 class body → 跳过 class 头后面的空行
+                if not stripped:
+                    continue
+                # 检查是否是 class body 的第一行 (应该比 class 头多缩进)
+                line_indent = len(line) - len(stripped)
+                if line_indent > class_header_indent:
+                    inside_class_body = True
+                    # 减去一层缩进 (从 class body 缩进 → 方法定义缩进)
+                    # 实际上我们要减去 class_body 多出的缩进
+                    # class 头: 0 格缩进 → class body: 4 格缩进 → 我们要: 4 格缩进 (方法在顶层class中的缩进)
+                    # 所以实际上 class body 的缩进就是我们需要的, 不需要调整!
+                    # 但如果我们想让方法定义在顶层class中(4格缩进), 则刚好匹配
+                    method_lines.append(line)
+                else:
+                    # class 定义后面没有 indented block → 语法有问题, 返回原始
+                    logger.warning("class header has no indented body after it")
+                    return new_code
+            else:
+                # 已经在 class body 内 → 继续收集
+                if stripped:
+                    line_indent = len(line) - len(stripped)
+                    # 如果遇到比 class body 少缩进的行, 说明到了 class 定义结束
+                    if line_indent <= class_header_indent and not stripped.startswith('#'):
+                        # 可能是 class 结束后的新定义 → 停止收集
+                        # 但也可能是 class 内的 decorator 或 docstring → 判断
+                        # 如果是 def/class/@ 等在顶层缩进 → class 结束了
+                        if stripped.startswith('def ') or stripped.startswith('class ') or stripped.startswith('@'):
+                            break
+                        # 其他情况 (如全局变量) → 也停止
+                        if line_indent == 0:
+                            break
+                    method_lines.append(line)
+                else:
+                    # 空行 → 保留
+                    method_lines.append(line)
+
+        if not method_lines:
+            logger.warning("No method content found after stripping class header")
+            return new_code
+
+        # 减去一层缩进 (class body 缩进 → 方法在顶层 class 中的缩进)
+        # class 头: 0 缩进 → class body 方法: 4 缩进 → 我们需要的: 4 缩进 (已经是正确的)
+        # 但如果 class 头本身有缩进 (如嵌套 class), 需要减去 class 头的缩进
+        result = '\n'.join(method_lines)
+
+        # 调整缩进: 减去 class 头带来的额外缩进层级
+        # class_header_indent 是 class 头的缩进级别
+        # method_lines 中的缩进 = class_header_indent + 4 + 原方法缩进
+        # 我们需要的缩进 = 原方法缩进 (通常 4 格, 在顶层class中)
+        # 所以需要减去 class_header_indent
+        if class_header_indent > 0:
+            # 计算当前 method_lines 的最小缩进
+            min_indent = float('inf')
+            for ml_line in method_lines:
+                ml_stripped = ml_line.lstrip()
+                if ml_stripped and not ml_stripped.startswith('#'):
+                    ml_indent = len(ml_line) - len(ml_stripped)
+                    min_indent = min(min_indent, ml_indent)
+            if min_indent == float('inf'):
+                min_indent = 0
+            # 目标: 减去 class_header_indent 的额外缩进
+            target_indent = min_indent - class_header_indent
+            result = StructureApplier._adjust_indent(result, target_indent)
+
+        # 清理尾部多余空行
+        result = result.rstrip('\n')
+
+        return result
 
     # ════════════════════════════════════════
     # 代码修改策略 (核心!)
@@ -242,12 +441,12 @@ class StructureApplier:
     def _replace_function(self, content: str, target_name: str, new_code: str) -> Optional[str]:
         """
         替换文件中的指定函数
-        
+
         Args:
             content: 文件原始内容
             target_name: 目标函数名 (如 "SelfAttention.forward" 或 "add_position_embedding")
             new_code: 新函数代码
-        
+
         Returns:
             str: 修改后的文件内容, 或 None (找不到目标)
         """
@@ -255,7 +454,11 @@ class StructureApplier:
         # 格式: "ClassName.method_name" 或 "function_name"
         if "." in target_name:
             class_name, method_name = target_name.split(".", 1)
-            return self._replace_method_in_class(content, class_name, method_name, new_code)
+            # ── BUG FIX #1: 剥离 new_code 中可能包含的 class 定义头 ──
+            # LLM 经常输出 "class SelfAttention(nn.Module):\n    def __init__(...):"
+            # 但我们只需要 "def __init__(...):" 部分
+            stripped_new_code = self._strip_class_wrapper(new_code, class_name)
+            return self._replace_method_in_class(content, class_name, method_name, stripped_new_code)
         else:
             return self._replace_top_level_function(content, target_name, new_code)
 
@@ -283,28 +486,68 @@ class StructureApplier:
         return self._replace_function_regex(content, func_name, new_code)
 
     def _replace_method_in_class(self, content: str, class_name: str, method_name: str, new_code: str) -> Optional[str]:
-        """替换类中的方法定义"""
+        """
+        替换类中的方法定义
+
+        BUG FIX #3: 增强了以下逻辑:
+        1. AST 搜索失败时打印更详细的诊断信息
+        2. 无论 AST 还是 regex, 都先剥离 new_code 中可能包含的 class 定义头
+        3. 搜索时更宽松地匹配 method_name (忽略参数签名)
+        """
         try:
             tree = ast.parse(content)
-        except SyntaxError:
+        except SyntaxError as e:
+            logger.warning(f"AST parse failed (SyntaxError at line {e.lineno}: {e.msg}), "
+                           f"falling back to regex for {class_name}.{method_name}")
             return self._replace_method_regex(content, class_name, method_name, new_code)
 
+        # 搜索类定义
+        class_found = False
         for node in ast.iter_child_nodes(tree):
             if isinstance(node, ast.ClassDef) and node.name == class_name:
+                class_found = True
+                # 搜索方法定义
+                method_found = False
                 for item in node.body:
-                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == method_name:
-                        start_line = item.lineno - 1
-                        end_line = item.end_lineno
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        # BUG FIX #3: 只匹配方法名, 不匹配完整签名
+                        # target_class_or_function 可能是 "__init__"
+                        # 也可能被误写为 "__init__(self, args)" 等
+                        actual_method_name = method_name.split('(')[0]  # 剥离参数
+                        if item.name == actual_method_name:
+                            method_found = True
+                            start_line = item.lineno - 1
+                            end_line = item.end_lineno
 
-                        lines = content.split('\n')
-                        # 需要保持方法的缩进级别
-                        method_indent = self._get_indent_level(lines[start_line])
-                        # 新代码可能需要调整缩进
-                        indented_new_code = self._adjust_indent(new_code, method_indent)
-                        new_lines = lines[:start_line] + indented_new_code.split('\n') + lines[end_line:]
-                        return '\n'.join(new_lines)
+                            lines = content.split('\n')
+                            # 需要保持方法的缩进级别
+                            method_indent = self._get_indent_level(lines[start_line])
+                            # new_code 可能包含 class 头 → 先剥离
+                            stripped_new_code = self._strip_class_wrapper(new_code, class_name)
+                            # 新代码可能需要调整缩进
+                            indented_new_code = self._adjust_indent(stripped_new_code, method_indent)
+                            new_lines = lines[:start_line] + indented_new_code.split('\n') + lines[end_line:]
+                            return '\n'.join(new_lines)
 
-        logger.warning(f"Method '{class_name}.{method_name}' not found in file")
+                if not method_found:
+                    # 类找到了但方法没找到 → 打印类中的方法列表帮助诊断
+                    available_methods = [item.name for item in node.body
+                                         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))]
+                    logger.warning(f"Method '{method_name}' not found in class '{class_name}'. "
+                                   f"Available methods: {available_methods}. "
+                                   f"Falling back to regex.")
+                    return self._replace_method_regex(content, class_name, method_name, new_code)
+
+        if not class_found:
+            # 类本身都没找到 → 打印文件中的类列表帮助诊断
+            available_classes = [node.name for node in ast.iter_child_nodes(tree)
+                                 if isinstance(node, ast.ClassDef)]
+            logger.warning(f"Class '{class_name}' not found in file. "
+                           f"Available classes: {available_classes}. "
+                           f"Falling back to regex.")
+            return self._replace_method_regex(content, class_name, method_name, new_code)
+
+        # 不应该到达这里, 但以防万一
         return self._replace_method_regex(content, class_name, method_name, new_code)
 
     def _replace_class(self, content: str, class_name: str, new_code: str) -> Optional[str]:
@@ -367,37 +610,157 @@ class StructureApplier:
     # ════════════════════════════════════════
 
     def _replace_function_regex(self, content: str, func_name: str, new_code: str) -> Optional[str]:
-        """用 regex 替换函数 (后备方案)"""
-        # 匹配 def func_name(...) 直到下一个同级 def 或 class
-        pattern = rf'(^\s*def {func_name}\([^)]*\)[^:]*:\s*\n(?:[ \t]+.*\n)*)'
-        match = re.search(pattern, content, re.MULTILINE)
-        if match:
-            return content[:match.start()] + new_code + content[match.end():]
-        return None
+        """
+        用 regex 替换顶层函数 (后备方案)
 
-    def _replace_method_regex(self, content: str, class_name: str, method_name: str, new_code: str) -> Optional[str]:
-        """用 regex 替换类中的方法 (后备方案)"""
-        # 先找到类定义的范围
-        class_pattern = rf'(class {class_name}[^:]*:\s*\n)((?:[ \t]+.*\n)*)'
-        class_match = re.search(class_pattern, content, re.MULTILINE)
-        if not class_match:
+        BUG FIX #2: 使用基于缩进的方式定位函数范围,
+        而不是依赖有缺陷的 ((?:[ \t]+.*\n)*) 模式。
+        """
+        # 找到函数定义行
+        func_pattern = rf'^def\s+{func_name}\s*\('
+        func_match = re.search(func_pattern, content, re.MULTILINE)
+        if not func_match:
+            logger.warning(f"Function '{func_name}' not found via regex")
             return None
 
-        class_body = class_match.group(2)
-        method_pattern = rf'(^\s+def {method_name}\([^)]*\)[^:]*:\s*\n(?:[ \t]+.*\n)*)'
-        method_match = re.search(method_pattern, class_body, re.MULTILINE)
-        if method_match:
-            new_class_body = class_body[:method_match.start()] + new_code + class_body[method_match.end():]
-            return content[:class_match.start()] + class_match.group(1) + new_class_body + content[class_match.end():]
-        return None
+        lines = content.split('\n')
+        func_start_line_idx = content[:func_match.start()].count('\n')
+        func_indent = self._get_indent_level(lines[func_start_line_idx])
+
+        # 从函数定义的下一行开始, 找到函数结束
+        # 函数结束 = 遇到缩进 <= func_indent 的非空行 (或文件末尾)
+        func_end_line_idx = len(lines)
+        for idx in range(func_start_line_idx + 1, len(lines)):
+            stripped = lines[idx].strip()
+            if not stripped:
+                continue
+            line_indent = self._get_indent_level(lines[idx])
+            if line_indent <= func_indent:
+                func_end_line_idx = idx
+                break
+
+        # 替换函数
+        adjusted_new_code = self._adjust_indent(new_code, func_indent)
+        new_code_lines = adjusted_new_code.split('\n')
+        result_lines = lines[:func_start_line_idx] + new_code_lines + lines[func_end_line_idx:]
+        return '\n'.join(result_lines)
+
+    def _replace_method_regex(self, content: str, class_name: str, method_name: str, new_code: str) -> Optional[str]:
+        """
+        用 regex 替换类中的方法 (后备方案)
+
+        BUG FIX #2: 原 regex 模式 ((?:[ 	]+.*\n)*) 在空行处截断,
+        导致只能捕获到第一个空行之前的 class body, 后续方法丢失。
+
+        新方案: 先定位 class 定义行的位置, 再用 AST 兼容的方式确定
+        class 的完整范围, 然后在范围内查找并替换方法。
+        """
+        # ── Step 1: 找到 class 定义头 ──
+        class_header_pattern = rf'^class\s+{class_name}\s*\([^)]*\)\s*:'
+        class_header_match = re.search(class_header_pattern, content, re.MULTILINE)
+        if not class_header_match:
+            logger.warning(f"Class '{class_name}' not found via regex")
+            return None
+
+        # ── Step 2: 确定类的完整范围 ──
+        # class 定义行的缩进级别 (顶层类 = 0)
+        lines = content.split('\n')
+        class_header_line_idx = content[:class_header_match.start()].count('\n')
+        class_header_indent = self._get_indent_level(lines[class_header_line_idx])
+        class_body_indent = class_header_indent + 4  # class body 至少多缩进 4 格
+
+        # 从 class 头的下一行开始, 找到 class 结束的位置
+        # class 结束 = 遇到缩进 <= class_header_indent 的非空行 (或文件末尾)
+        class_end_line_idx = len(lines)  # 默认到文件末尾
+        for idx in range(class_header_line_idx + 1, len(lines)):
+            stripped = lines[idx].strip()
+            if not stripped:
+                continue  # 空行不影响
+            line_indent = self._get_indent_level(lines[idx])
+            # 如果行的缩进 <= class 头缩进, 说明 class 结束了
+            # (但要排除 decorator 行, 如 @staticmethod 等同级装饰器)
+            if line_indent <= class_header_indent:
+                # 这是 class 外面的内容 → class 在上一行结束
+                class_end_line_idx = idx
+                break
+
+        # ── Step 3: 在 class 范围内查找方法 ──
+        # 方法的缩进应该 >= class_body_indent
+        method_start_idx = None
+        method_end_idx = None
+
+        for idx in range(class_header_line_idx + 1, class_end_line_idx):
+            stripped = lines[idx].strip()
+            if not stripped:
+                continue
+            line_indent = self._get_indent_level(lines[idx])
+
+            # 方法定义行的缩进 == class_body_indent
+            if line_indent == class_body_indent and stripped.startswith(f'def {method_name}('):
+                method_start_idx = idx
+                break
+
+        if method_start_idx is None:
+            logger.warning(f"Method '{class_name}.{method_name}' not found in class body via regex")
+            return None
+
+        # 找到方法的结束位置: 下一个缩进 <= class_body_indent 的非空行, 或 class 结束
+        method_end_idx = class_end_line_idx  # 默认到 class 结束
+        for idx in range(method_start_idx + 1, class_end_line_idx):
+            stripped = lines[idx].strip()
+            if not stripped:
+                continue
+            line_indent = self._get_indent_level(lines[idx])
+            if line_indent <= class_body_indent:
+                # 这是下一个方法/class 结束 → 上一个方法在这行之前结束
+                # 需要回退, 把方法后面的空行也算在方法内
+                method_end_idx = idx
+                # 回退: 跳过方法定义末尾的空行 (空行属于方法间隔, 不是新方法的一部分)
+                # 但保留 1 个空行作为分隔
+                break
+
+        # ── Step 4: 替换方法 ──
+        # 新代码需要调整缩进到 class_body_indent
+        adjusted_new_code = self._adjust_indent(new_code, class_body_indent)
+        new_code_lines = adjusted_new_code.split('\n')
+
+        # 替换 lines[method_start_idx:method_end_idx] 为 new_code
+        result_lines = lines[:method_start_idx] + new_code_lines + lines[method_end_idx:]
+        return '\n'.join(result_lines)
 
     def _replace_class_regex(self, content: str, class_name: str, new_code: str) -> Optional[str]:
-        """用 regex 替换整个类 (后备方案)"""
-        pattern = rf'(class {class_name}[^:]*:\s*\n(?:[ \t]+.*\n)*)'
-        match = re.search(pattern, content, re.MULTILINE)
-        if match:
-            return content[:match.start()] + new_code + content[match.end():]
-        return None
+        """
+        用 regex 替换整个类 (后备方案)
+
+        BUG FIX #2: 使用基于缩进的方式确定 class 范围,
+        而不是依赖有缺陷的 ((?:[ \t]+.*\n)*) 模式。
+        """
+        # 找到 class 定义头
+        class_header_pattern = rf'^class\s+{class_name}\s*\([^)]*\)\s*:'
+        class_header_match = re.search(class_header_pattern, content, re.MULTILINE)
+        if not class_header_match:
+            logger.warning(f"Class '{class_name}' not found via regex")
+            return None
+
+        lines = content.split('\n')
+        class_header_line_idx = content[:class_header_match.start()].count('\n')
+        class_header_indent = self._get_indent_level(lines[class_header_line_idx])
+
+        # 从 class 头的下一行开始, 找到 class 结束
+        class_end_line_idx = len(lines)
+        for idx in range(class_header_line_idx + 1, len(lines)):
+            stripped = lines[idx].strip()
+            if not stripped:
+                continue
+            line_indent = self._get_indent_level(lines[idx])
+            if line_indent <= class_header_indent:
+                class_end_line_idx = idx
+                break
+
+        # 替换整个 class 定义
+        new_code_lines = new_code.split('\n')
+        result_lines = lines[:class_header_line_idx] + new_code_lines + lines[class_end_line_idx:]
+        return '\n'.join(result_lines)
 
     def _insert_after_regex(self, content: str, marker: str, new_code: str) -> Optional[str]:
         """用 regex 在标记后插入 (后备方案)"""
@@ -563,14 +926,20 @@ class StructureApplier:
     def _resolve_file_path(self, target_file: str) -> Optional[str]:
         """
         将逻辑文件名 (如 "models.py") 解析为实际文件路径
-        
+
+        BUG FIX #7: 使用 os.path.normpath 规范化路径,
+        避免 project_root 结尾带 / 时产生双斜杠。
+
         查找顺序:
         1. project_root 直接下 (如 /path/Recmodel/models.py)
         2. project_root/Recmodel 子目录
         """
+        # ── BUG FIX #7: 规范化 project_root, 剥离尾部斜杠 ──
+        normalized_root = os.path.normpath(self.project_root)
+
         candidates = [
-            os.path.join(self.project_root, target_file),
-            os.path.join(self.project_root, "Recmodel", target_file),
+            os.path.join(normalized_root, target_file),
+            os.path.join(normalized_root, "Recmodel", target_file),
         ]
 
         if self.adapter:
@@ -578,13 +947,13 @@ class StructureApplier:
             if target_file in source_map:
                 rel_path = source_map[target_file]
                 candidates.extend([
-                    os.path.join(self.project_root, rel_path),
-                    os.path.join(self.project_root, "Recmodel", rel_path),
+                    os.path.join(normalized_root, rel_path),
+                    os.path.join(normalized_root, "Recmodel", rel_path),
                 ])
 
         for path in candidates:
             if os.path.exists(path):
-                return path
+                return os.path.normpath(path)  # ── BUG FIX #7: 规范化返回路径 ──
 
         logger.warning(f"Cannot resolve file path for {target_file}, tried: {candidates}")
         return None

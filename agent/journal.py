@@ -42,7 +42,7 @@ class ExperimentJournal:
             entry["timestamp"] = datetime.now().isoformat()
         self.records.append(entry)
         self._save(entry)
-        logger.info(f"Journal record [{entry['iteration']}]: {entry['status']}")
+        logger.info(f"Journal record [{entry.get('iteration', '?')}]: {entry.get('status', 'UNKNOWN')}")
 
     def _save(self, entry: dict):
         """追加写入 JSONL"""

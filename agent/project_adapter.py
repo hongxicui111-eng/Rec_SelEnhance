@@ -11,8 +11,9 @@ ProjectAdapter — 推荐项目适配器
 import re
 import json
 import os
+import shlex
 import logging
-from typing import Optional
+from typing import Optional, List
 
 logger = logging.getLogger("rec_self_evolve.adapter")
 
@@ -185,7 +186,7 @@ LLM 可以提出以下类型的结构修改 (不仅仅是调参!):
                     "default": "Radical", "desc": "对比学习类型"},
         "start_epoch": {"type": "int", "range": [0, 200], "default": 30,
                         "desc": "开始困难负采样的轮次"},
-        "K": {"type": "int", "range": [0.01, 0.5], "default": 0.05,
+        "K": {"type": "float", "range": [0.01, 0.5], "default": 0.05,
               "desc": "Gentle CL 参数 (仅 Gentle)"},
 
         # === 训练 ===
@@ -290,9 +291,67 @@ LLM 可以提出以下类型的结构修改 (不仅仅是调参!):
 
         return " \\\n    ".join(cmd_parts)
 
-    # ════════════════════════════════════════
-    # 5. 从日志解析指标
-    # ════════════════════════════════════════
+    def validate_train_command(self, cmd: str) -> dict:
+        """
+        对即将执行的训练命令做前置校验（开源 Agent 常用 guard）。
+
+        Returns:
+            {
+                "ok": bool,
+                "issues": [str],
+                "warnings": [str],
+            }
+        """
+        issues: List[str] = []
+        warnings: List[str] = []
+
+        cmd = (cmd or "").strip()
+        if not cmd:
+            return {"ok": False, "issues": ["Empty command"], "warnings": []}
+
+        # 必须包含 cd && python3 -u script
+        if "cd " not in cmd:
+            issues.append("Missing 'cd <project_root>' prefix")
+        if "&&" not in cmd:
+            issues.append("Missing '&&' after cd, command chaining is unsafe")
+        if "python3 -u" not in cmd:
+            warnings.append("Command does not contain 'python3 -u' (buffered output may hide logs)")
+
+        # 目录存在性
+        project_path = os.path.normpath(self.project_root)
+        if not os.path.exists(project_path):
+            issues.append(f"Project root not found: {project_path}")
+
+        # 脚本存在性（优先 project_root，其次 Recmodel）
+        script_candidates = [
+            os.path.join(project_path, self.script_name),
+            os.path.join(project_path, "Recmodel", self.script_name),
+        ]
+        if not any(os.path.exists(p) for p in script_candidates):
+            issues.append(
+                f"Training script not found: {self.script_name} (checked: {script_candidates})"
+            )
+
+        # 参数结构快速校验（检查是否有明显坏 token）
+        # 例如 --k v（中间被拆）不是本项目推荐格式，建议 --k=v
+        try:
+            tokens = shlex.split(cmd)
+            for i, tk in enumerate(tokens):
+                if tk.startswith("--") and "=" not in tk:
+                    # 允许 bool flag（无值）但这里的训练参数基本都应为 --k=v
+                    if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                        warnings.append(
+                            f"Prefer '--key=value' style, found split arg: {tk} {tokens[i+1]}"
+                        )
+        except Exception:
+            warnings.append("Unable to parse command with shlex; shell escaping may be risky")
+
+        return {
+            "ok": len(issues) == 0,
+            "issues": issues,
+            "warnings": warnings,
+        }
+
 
     def parse_metrics_from_log(self, log_text: str) -> dict:
         """

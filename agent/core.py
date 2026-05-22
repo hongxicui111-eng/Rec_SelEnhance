@@ -265,6 +265,7 @@ class RecSelfEvolveAgent:
                 self.journal.record({
                     "iteration": i,
                     "phase": "surprise_analysis",
+                    "status": "SURPRISE_ANALYSIS",
                     "surprise_report": surprise_and_analysis.get("evaluation_report_summary"),
                     "case_analysis_summary": surprise_and_analysis.get("case_analysis_summary"),
                 })
@@ -348,9 +349,20 @@ class RecSelfEvolveAgent:
                         "error": struct_result.get("rollback_reason", "") if struct_result else "",
                     })
                 elif struct_result["status"] == "SUCCESS" or struct_result["status"] == "PARTIAL_SUCCESS":
-                    print(f"  ✓ Structural changes applied: {struct_result['status']}")
-                    print(f"    Files modified: {struct_result.get('files_modified', [])}")
-                    self._last_structural_changes = struct_result.get("applied_changes", [])
+                    # 防御性兜底：状态显示成功但没有任何实际应用，按失败处理
+                    applied_count = len(struct_result.get("applied_changes", []))
+                    if applied_count == 0:
+                        print(f"  ✗ Structural changes reported {struct_result['status']} but applied_changes=0; treat as failed")
+                        structural_changes = []
+                        struct_result = {
+                            **struct_result,
+                            "status": "ALL_FAILED",
+                            "error": "No structural changes were actually applied",
+                        }
+                    else:
+                        print(f"  ✓ Structural changes applied: {struct_result['status']}")
+                        print(f"    Files modified: {struct_result.get('files_modified', [])}")
+                        self._last_structural_changes = struct_result.get("applied_changes", [])
                 elif struct_result["status"] == "ALL_FAILED":
                     print(f"  ✗ All structural changes failed")
                     structural_changes = []
@@ -708,16 +720,68 @@ class RecSelfEvolveAgent:
             return train_result
         
         # ── 自纠错内循环 ──
+        # ── BUG FIX #6: 添加策略适应机制 ──
+        # 当连续多轮使用同一种修复方式都失败时, 自动切换策略:
+        # - 连续 3 轮 code_fix_failed → 切换到 replace_class 策略
+        # - 连续 5 轮同一种方式失败 → 尝试整文件重写
+        consecutive_fix_failures = 0  # 连续修复失败计数
+        last_fix_action = None        # 上次的修复 action
+
         for round_idx in range(1, max_rounds + 1):
             print(f"\n  ── 自纠错第 {round_idx}/{max_rounds} 轮 ──")
-            
+
+            # ── BUG FIX #6: 策略适应 — 连续失败时切换修复方式 ──
+            if consecutive_fix_failures >= 3 and error_category == "CODE_ERROR":
+                print(f"  🔄 策略适应: 连续 {consecutive_fix_failures} 轮 code_fix_failed → 尝试 replace_class 策略")
+                fix_result = self._fix_code_error_with_class_replacement(
+                    iteration=iteration,
+                    train_error=train_result,
+                    phase_name=phase_name,
+                    round_idx=round_idx,
+                    param_overrides=param_overrides,
+                )
+                if fix_result["action"] in ("code_fixed_and_retrained", "code_fixed_but_retrain_failed"):
+                    consecutive_fix_failures = 0  # 成功 → 清零
+                    if fix_result["action"] == "code_fixed_and_retrained":
+                        print(f"  ✓✓ 策略切换成功! 用 replace_class 方式修复!")
+                        fix_result["fix_attempts"] = round_idx
+                        return fix_result
+                    train_result = fix_result
+                    error_category = fix_result.get("error_category", error_category)
+                    continue
+                else:
+                    consecutive_fix_failures += 1
+                    print(f"  ✗ replace_class 策略也失败")
+                    # 继续下一轮, 但会尝试更激进的策略
+
+            if consecutive_fix_failures >= 5 and error_category == "CODE_ERROR":
+                print(f"  🔄 策略适应: 连续 {consecutive_fix_failures} 轮都失败 → 尝试整文件重写策略")
+                fix_result = self._fix_code_error_whole_file(
+                    iteration=iteration,
+                    train_error=train_result,
+                    phase_name=phase_name,
+                    round_idx=round_idx,
+                    param_overrides=param_overrides,
+                )
+                if fix_result["action"] in ("code_fixed_and_retrained", "code_fixed_but_retrain_failed"):
+                    consecutive_fix_failures = 0
+                    if fix_result["action"] == "code_fixed_and_retrained":
+                        print(f"  ✓✓ 整文件重写策略成功!")
+                        fix_result["fix_attempts"] = round_idx
+                        return fix_result
+                    train_result = fix_result
+                    error_category = fix_result.get("error_category", error_category)
+                    continue
+                else:
+                    consecutive_fix_failures += 1
+
             # ── 根据错误类型选择修复策略 ──
             if error_category == "CODE_ERROR":
                 # ════════════════════════════════════
                 # CODE_ERROR: 源码有 bug → 让 LLM 修复源码!
                 # ════════════════════════════════════
                 print(f"  🔧 修复策略: 修改源码中的代码 bug")
-                
+
                 fix_result = self._fix_code_error(
                     iteration=iteration,
                     train_error=train_result,
@@ -725,13 +789,23 @@ class RecSelfEvolveAgent:
                     round_idx=round_idx,
                     param_overrides=param_overrides,
                 )
-                
+
+                # ── BUG FIX #6: 跟踪连续失败 ──
+                if fix_result["action"] == "code_fix_failed":
+                    if last_fix_action == "code_fix_failed":
+                        consecutive_fix_failures += 1
+                    else:
+                        consecutive_fix_failures = 1
+                elif fix_result["action"] in ("code_fixed_and_retrained", "code_fixed_but_retrain_failed"):
+                    consecutive_fix_failures = 0
+                last_fix_action = fix_result["action"]
+
                 if fix_result["action"] == "code_fixed_and_retrained":
                     # 源码修复成功 + 重新训练成功!
                     print(f"  ✓✓ 自纠错成功! 代码bug修复 + 重训通过!")
                     fix_result["fix_attempts"] = round_idx
                     return fix_result
-                
+
                 elif fix_result["action"] == "code_fixed_but_retrain_failed":
                     # 源码修复成功, 但重新训练仍然失败 → 用新错误信息继续自纠错
                     print(f"  ✓ 代码bug已修复, 但重训仍失败")
@@ -739,24 +813,24 @@ class RecSelfEvolveAgent:
                     train_result = fix_result
                     error_category = fix_result.get("error_category", error_category)
                     continue
-                
+
                 elif fix_result["action"] == "code_fix_failed":
                     # LLM 修复源码失败 → 回滚, 继续自纠错
-                    print(f"  ✗ 代码bug修复失败")
+                    print(f"  ✗ 代码bug修复失败 (连续失败 {consecutive_fix_failures} 次)")
                     continue
-                
+
                 elif fix_result["action"] == "skip":
                     # 无法修复 → 退出自纠错
                     print(f"  ⏭ 无法修复此错误")
                     train_result["fix_attempts"] = round_idx
                     return train_result
-            
+
             elif error_category == "CONFIG_ERROR":
                 # ════════════════════════════════════
                 # CONFIG_ERROR: 参数配置有问题 → 让 LLM 调参!
                 # ════════════════════════════════════
                 print(f"  🔧 修复策略: 调整训练参数配置")
-                
+
                 fix_result = self._fix_config_error(
                     iteration=iteration,
                     train_error=train_result,
@@ -764,50 +838,50 @@ class RecSelfEvolveAgent:
                     param_overrides=param_overrides,
                     round_idx=round_idx,
                 )
-                
+
                 if fix_result["action"] == "config_fixed_and_retrained":
                     print(f"  ✓✓ 自纠错成功! 参数调整 + 重训通过!")
                     fix_result["fix_attempts"] = round_idx
                     return fix_result
-                
+
                 elif fix_result["action"] == "config_fixed_but_retrain_failed":
                     print(f"  ✓ 参数已调整, 但重训仍失败")
                     train_result = fix_result
                     error_category = fix_result.get("error_category", error_category)
                     continue
-                
+
                 elif fix_result["action"] == "config_fix_failed":
                     print(f"  ✗ 参数调整失败")
                     continue
-            
+
             elif error_category == "DATA_ERROR":
                 # ════════════════════════════════════
                 # DATA_ERROR: 数据路径有问题 → 让 LLM 修正路径!
                 # ════════════════════════════════════
                 print(f"  🔧 修复策略: 修正数据路径/配置")
-                
+
                 fix_result = self._fix_data_error(
                     iteration=iteration,
                     train_error=train_result,
                     phase_name=phase_name,
                     round_idx=round_idx,
                 )
-                
+
                 if fix_result["action"] == "data_fixed_and_retrained":
                     print(f"  ✓✓ 自纠错成功! 数据路径修复 + 重训通过!")
                     fix_result["fix_attempts"] = round_idx
                     return fix_result
-                
+
                 elif fix_result["action"] == "data_fixed_but_retrain_failed":
                     print(f"  ✓ 数据路径已修复, 但重训仍失败")
                     train_result = fix_result
                     error_category = fix_result.get("error_category", error_category)
                     continue
-                
+
                 else:
                     print(f"  ✗ 数据路径修复失败")
                     continue
-            
+
             else:
                 # UNKNOWN / SYSTEM_ERROR → 无法自动修复
                 print(f"  ⏭ 错误类型无法自动修复: {error_category}")
@@ -936,33 +1010,60 @@ class RecSelfEvolveAgent:
         param_fixes = fix_proposal.get("param_changes", {})
         fix_explanation = fix_proposal.get("explanation", "")
         
-        print(f"     💡 修复诊断: {fix_explanation[:150]}")
+        print(f"     💡 修复诊断: {fix_explanation}")
         if structural_fixes:
             print(f"     🏗️ 源码修复: {len(structural_fixes)} 处修改")
             for sc in structural_fixes:
                 print(f"       → [{sc.get('target_file', '?')}] "
                       f"{sc.get('target_class_or_function', '?')}: "
-                      f"{sc.get('description', '?')[:60]}...")
+                      f"{sc.get('description', '?')}")
         if param_fixes:
-            print(f"     🔧 参数修复: {json.dumps(param_fixes, ensure_ascii=False)[:200]}")
+            print(f"     🔧 参数修复: {json.dumps(param_fixes, ensure_ascii=False)}")
         
         if not structural_fixes and not param_fixes:
             print(f"     ⚠ LLM 没有给出任何修复方案")
             return {"action": "code_fix_failed", "error": "No fixes proposed"}
         
         # ── 应用源码修复 ──
+        # ── BUG FIX #4: 收集结构应用器的内部诊断信息 ──
+        apply_diagnostics = []  # 收集每个 change 的诊断信息
         if structural_fixes:
             apply_result = self.struct_applier.apply_structural_changes(structural_fixes)
-            
+           
+            # ── 收集诊断信息 ──
+            for applied_entry in apply_result.get("applied_changes", []):
+                diag = applied_entry.get("result", {}).get("diagnostics", {})
+                if diag:
+                    apply_diagnostics.append(diag)
+            for failed_entry in apply_result.get("failed_changes", []):
+                diag = failed_entry.get("error", "")
+                apply_diagnostics.append({"failure": diag})
+
             if apply_result["status"] == "ROLLBACK":
-                print(f"     ↩ 代码修复被回滚: {apply_result.get('rollback_reason', '')[:100]}")
-                # 记录到 IterativeMemory
+                rollback_reason = apply_result.get("rollback_reason", "")
+                validation_errors = apply_result.get("validation_results", {}).get("errors", [])
+                
+                # ── BUG FIX #4: 回滚原因中包含结构应用器的内部诊断 ──
+                detailed_reason = f"Code fix round {round_idx} rolled back: {rollback_reason}"
+                if apply_diagnostics:
+                    diag_summary = " | ".join([
+                        f"{d.get('target_name', '?')}: method={d.get('replacement_method', '?')}, "
+                        f"reason={d.get('failure_reason', d.get('failure', '?'))}"
+                        for d in apply_diagnostics[:3]
+                    ])
+                    detailed_reason += f" | Diagnostics: {diag_summary}"
+                if validation_errors:
+                    detailed_reason += f" | Validation errors: {'; '.join(validation_errors)}"
+                
+                print(f"     ↩ 代码修复被回滚: {rollback_reason}")
+                # 记录到 IterativeMemory — 包含详细诊断!
                 self.iter_memory.record_rollback(
                     iteration=iteration,
-                    reason=f"Code fix round {round_idx} rolled back: {apply_result.get('rollback_reason', '')[:200]}",
+                    reason=detailed_reason,
                 )
-                return {"action": "code_fix_failed", 
-                        "error": apply_result.get("rollback_reason", "validation failed")}
+                return {"action": "code_fix_failed",
+                        "error": apply_result.get("rollback_reason", "validation failed"),
+                        "apply_diagnostics": apply_diagnostics}
             
             elif apply_result["status"] in ("SUCCESS", "PARTIAL_SUCCESS"):
                 print(f"     ✓ 源码修复已应用!")
@@ -1008,7 +1109,7 @@ class RecSelfEvolveAgent:
                 "status": f"CODE_FIX_SUCCESS_{phase_name}",
                 "self_correction_round": round_idx,
                 "fix_explanation": fix_explanation,
-                "structural_fixes_summary": json.dumps(structural_fixes, ensure_ascii=False)[:300],
+                "structural_fixes_summary": json.dumps(structural_fixes, ensure_ascii=False),
                 "retrain_metrics": retrain_result.get("metrics", {}),
             })
             
@@ -1016,7 +1117,7 @@ class RecSelfEvolveAgent:
         
         else:
             # 修复后训练仍然失败 → 用新错误信息继续自纠错
-            print(f"     ✗ 修复后重训仍失败: {retrain_result.get('error', '')[:100]}")
+            print(f"     ✗ 修复后重训仍失败: {retrain_result.get('error', '')}")
             print(f"     新错误分类: {retrain_result.get('error_category', 'UNKNOWN')}")
             
             # 如果新错误也是 CODE_ERROR → 可能需要修复不同的 bug
@@ -1030,11 +1131,265 @@ class RecSelfEvolveAgent:
                 "status": f"CODE_FIX_BUT_RETRAIN_FAILED_{phase_name}",
                 "self_correction_round": round_idx,
                 "fix_explanation": fix_explanation,
-                "retrain_error": retrain_result.get("error", "")[:300],
+                "retrain_error": retrain_result.get("error", ""),
                 "retrain_error_category": retrain_result.get("error_category", ""),
             })
             
             return retrain_result
+
+    def _fix_code_error_with_class_replacement(
+        self, iteration: int, train_error: dict,
+        phase_name: str, round_idx: int,
+        param_overrides: Optional[dict] = None) -> dict:
+        """
+        BUG FIX #6: 策略适应 — 用 replace_class 代替 replace_function
+        
+        当连续多轮 replace_function 失败时 (通常是因为 structure_applier
+        无法找到目标方法), 切换到 replace_class 策略, 直接替换整个类定义。
+        这绕过了方法级定位的困难。
+        """
+        print(f"  🏗️ 策略切换: 用 replace_class 替代 replace_function")
+        
+        source_code_ctx = self.adapter.build_source_code_context(
+            include_files=["models.py", "modules.py", "trainers.py"],
+            iterative_memory=self.iter_memory,
+        )
+        
+        tb_details = train_error.get("traceback_details", {})
+        error_message = tb_details.get("error_message", train_error.get("error", ""))
+        traceback_text = tb_details.get("traceback_text", "")
+        
+        # 构建 prompt — 明确告知 LLM 输出完整的 class 定义
+        prompt = CODE_FIX_PROMPT.format(
+            _error_type=tb_details.get("error_type", "CODE_ERROR"),
+            _error_category="CODE_ERROR",
+            _error_message=error_message[:2000],
+            _traceback_details=f"\n### Traceback:\n```\n{traceback_text[:2000]}\n```",
+            _offending_code_snippets="\n".join(tb_details.get("offending_code_snippets", [])) or "(未提取到)",
+            _current_source_code=source_code_ctx,
+            current_hidden_size=self.adapter.base_args.get("hidden_size", 64),
+        )
+        
+        rollback_warning = self.iter_memory.build_rollback_aware_context()
+        if rollback_warning:
+            prompt += rollback_warning
+        
+        # 明确告知 LLM: 用 replace_class, 输出完整的类定义
+        prompt += (
+            "\n\n### ⚠ 重要修改: 请使用 replace_class 策略!"
+            "\n之前的 replace_function 策略连续失败, 因为代码定位困难。"
+            "\n这次请**输出完整的类定义** (包含类头和所有方法), 使用 insert_position='replace_class'。"
+            "\n不要只输出单个方法, 要输出整个类的完整代码。"
+            "\n确保类定义中的所有方法都完整、语法正确、无省略号。"
+        )
+        
+        response = self.llm.chat(
+            messages=[
+                {"role": "system", "content": (
+                    "你是一位 Python 代码调试专家。"
+                    "连续多轮尝试替换单个方法失败, 现在需要你输出完整的类定义代码。"
+                    "你必须输出包含类头 (class XXX(nn.Module):) 和所有方法的完整代码。"
+                    "代码必须语法正确、维度对齐、import完整、与现有代码兼容。"
+                )},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=self.config.llm_max_tokens,
+        )
+        
+        if response is None:
+            return {"action": "code_fix_failed", "error": "LLM call failed"}
+        
+        fix_proposal = self._parse_proposal_response(response)
+        if fix_proposal is None:
+            return {"action": "code_fix_failed", "error": "Cannot parse fix proposal"}
+        
+        structural_fixes = fix_proposal.get("structural_changes", [])
+        fix_explanation = fix_proposal.get("explanation", "")
+        
+        # 强制将所有 fix 的 insert_position 设置为 replace_class
+        for sc in structural_fixes:
+            target_name = sc.get("target_class_or_function", "")
+            if "." in target_name:
+                # "SelfAttention.__init__" → 只取类名部分用于 replace_class
+                sc["target_class_or_function"] = target_name.split(".", 1)[0]
+            sc["insert_position"] = "replace_class"
+        
+        print(f"     💡 策略切换修复: {fix_explanation[:150]}")
+        print(f"     🏗️ 使用 replace_class 策略: {len(structural_fixes)} 处修改")
+        for sc in structural_fixes:
+            print(f"       → [{sc.get('target_file', '?')}] "
+                  f"{sc.get('target_class_or_function', '?')}: "
+                  f"{sc.get('description', '?')[:60]}...")
+        
+        if not structural_fixes:
+            return {"action": "code_fix_failed", "error": "No fixes proposed"}
+        
+        apply_result = self.struct_applier.apply_structural_changes(structural_fixes)
+        
+        if apply_result["status"] == "ROLLBACK":
+            print(f"     ↩ replace_class 策略也被回滚: {apply_result.get('rollback_reason', '')[:100]}")
+            self.iter_memory.record_rollback(
+                iteration=iteration,
+                reason=f"replace_class strategy round {round_idx} rolled back: {apply_result.get('rollback_reason', '')[:200]}",
+            )
+            return {"action": "code_fix_failed", "error": apply_result.get("rollback_reason", "")}
+        
+        elif apply_result["status"] in ("SUCCESS", "PARTIAL_SUCCESS"):
+            print(f"     ✓ replace_class 策略修复已应用!")
+        
+        elif apply_result["status"] == "ALL_FAILED":
+            return {"action": "code_fix_failed", "error": "replace_class: All fixes failed"}
+        
+        # 重新训练验证
+        retrain_result = self.trainer.run(param_overrides=param_overrides)
+        
+        if retrain_result["status"] == "SUCCESS":
+            retrain_result["action"] = "code_fixed_and_retrained"
+            retrain_result["fix_explanation"] = f"[replace_class策略] {fix_explanation}"
+            return retrain_result
+        
+        retrain_result["action"] = "code_fixed_but_retrain_failed"
+        retrain_result["fix_explanation"] = f"[replace_class策略] {fix_explanation}"
+        return retrain_result
+
+    def _fix_code_error_whole_file(
+        self, iteration: int, train_error: dict,
+        phase_name: str, round_idx: int,
+        param_overrides: Optional[dict] = None) -> dict:
+        """
+        BUG FIX #6: 策略适应 — 整文件重写
+        
+        当所有其他策略都失败时, 让 LLM 输出整个文件的完整代码,
+        直接替换整个文件。这是最激进但也是最可靠的方式。
+        """
+        print(f"  📝 策略切换: 整文件重写")
+        
+        source_code_ctx = self.adapter.build_source_code_context(
+            include_files=["models.py", "modules.py", "trainers.py"],
+            iterative_memory=self.iter_memory,
+        )
+        
+        tb_details = train_error.get("traceback_details", {})
+        error_message = tb_details.get("error_message", train_error.get("error", ""))
+        traceback_text = tb_details.get("traceback_text", "")
+        
+        # 从 traceback 中确定出错的是哪个文件
+        error_files = tb_details.get("files", [])
+        target_file = "modules.py"  # 默认
+        if error_files:
+            for ef in error_files:
+                if "modules" in ef:
+                    target_file = "modules.py"
+                    break
+                elif "models" in ef:
+                    target_file = "models.py"
+                    break
+                elif "trainers" in ef:
+                    target_file = "trainers.py"
+                    break
+        
+        # 读取当前文件内容
+        file_path = self.struct_applier._resolve_file_path(target_file)
+        if not file_path:
+            return {"action": "code_fix_failed", "error": f"Cannot find {target_file}"}
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            current_file_content = f.read()
+        
+        prompt = (
+            f"训练运行失败, 错误来自**{target_file}**中的代码 bug。\n"
+            f"所有之前的修复策略 (replace_function, replace_class) 都连续失败。\n"
+            f"现在需要你**输出 {target_file} 的完整修复后的代码**。\n\n"
+            f"## 错误信息\n```\n{error_message[:1500]}\n```\n\n"
+            f"## Traceback\n```\n{traceback_text[:2000]}\n```\n\n"
+            f"## 当前 {target_file} 的内容\n```python\n{current_file_content}\n```\n\n"
+            f"## 修复要求\n"
+            f"输出 {target_file} 的**完整代码** (不能有任何省略号)。\n"
+            f"修复上述错误, 但保持所有其他类/函数不变。\n"
+            f"确保: 1)语法正确 2)import完整 3)维度与 hidden_size={self.adapter.base_args.get('hidden_size', 64)} 对齐\n"
+            f"4)所有关键类仍然存在\n\n"
+            f"### 输出格式\n"
+            f"输出完整的 Python 代码, 不要用 JSON 包裹, 不要有省略号:\n"
+            f"```python\n完整的代码...\n```\n"
+        )
+        
+        rollback_warning = self.iter_memory.build_rollback_aware_context()
+        if rollback_warning:
+            prompt += rollback_warning
+        
+        response = self.llm.chat(
+            messages=[
+                {"role": "system", "content": (
+                    "你是一位 Python 代码修复专家。"
+                    "请输出修复后的完整文件代码, 不能有省略号。"
+                    "保持所有没有 bug 的类/函数不变, 只修复出错的部分。"
+                )},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=self.config.llm_max_tokens,
+        )
+        
+        if response is None:
+            return {"action": "code_fix_failed", "error": "LLM call failed"}
+        
+        # 提取代码 (从 ```python ... ``` 或直接提取)
+        new_file_content = StructureApplier.clean_new_code(response)
+        
+        # 语法检查
+        try:
+            ast.parse(new_file_content)
+        except SyntaxError as e:
+            logger.warning(f"Whole-file rewrite has syntax error: line {e.lineno}: {e.msg}")
+            return {"action": "code_fix_failed", "error": f"Syntax error in rewritten file: line {e.lineno}: {e.msg}"}
+        
+        # 关键符号检查
+        missing = []
+        for sym in ["class SelfAttention", "class Intermediate", "class EncoderLayer"]:
+            if target_file == "modules.py" and sym not in new_file_content:
+                missing.append(sym)
+        if missing:
+            return {"action": "code_fix_failed", "error": f"Missing critical symbols: {missing}"}
+        
+        # 创建快照 + 写入
+        snapshot = self.struct_applier._create_local_snapshot()
+        if not snapshot["ok"]:
+            return {"action": "code_fix_failed", "error": "Snapshot creation failed"}
+        self.struct_applier._current_snapshot_id = snapshot["snapshot_id"]
+        
+        # 写入文件
+        shutil_copy = shutil.copy2  # 先备份
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(new_file_content)
+            logger.info(f"Whole-file rewrite applied to {file_path}")
+        except Exception as e:
+            self.struct_applier._local_rollback(snapshot["snapshot_id"])
+            return {"action": "code_fix_failed", "error": f"Cannot write file: {e}"}
+        
+        # 验证 (语法 + 关键符号)
+        validation = self.struct_applier._validate_all_modified_files([file_path])
+        if not validation["all_passed"]:
+            logger.warning(f"Whole-file rewrite validation failed: {validation['errors']}")
+            self.struct_applier._local_rollback(snapshot["snapshot_id"])
+            return {"action": "code_fix_failed", "error": f"Validation failed: {validation['errors']}"}
+        
+        print(f"     ✓ 整文件重写已应用并通过验证!")
+        
+        # 重新训练验证
+        retrain_result = self.trainer.run(param_overrides=param_overrides)
+        
+        if retrain_result["status"] == "SUCCESS":
+            retrain_result["action"] = "code_fixed_and_retrained"
+            retrain_result["fix_explanation"] = f"[整文件重写策略] Fixed {target_file}"
+            return retrain_result
+        
+        # 重训失败 → 回滚文件
+        self.struct_applier._local_rollback(snapshot["snapshot_id"])
+        retrain_result["action"] = "code_fixed_but_retrain_failed"
+        retrain_result["fix_explanation"] = f"[整文件重写策略] Fixed {target_file} but retrain failed"
+        return retrain_result
 
     def _fix_config_error(self, iteration: int, train_error: dict,
                           phase_name: str, param_overrides: Optional[dict],
@@ -1628,6 +1983,8 @@ class RecSelfEvolveAgent:
             if start >= 0 and end > start:
                 json_str = response[start:end + 1]
             else:
+                print(f"\n  ⚠ [PARSE DIAGNOSIS] Cannot extract JSON from LLM proposal response")
+                print(f"     LLM response: {response}")
                 logger.warning("Cannot extract JSON from LLM proposal response")
                 # 尝试用旧格式解析
                 parsed_old = self.parser.parse(response)
@@ -1644,6 +2001,8 @@ class RecSelfEvolveAgent:
         try:
             data = json.loads(json_str)
         except json.JSONDecodeError as e:
+            print(f"\n  ⚠ [PARSE DIAGNOSIS] JSON decode failed: {e}")
+            print(f"     Extracted JSON string first 200 chars: {json_str[:200]}")
             logger.warning(f"JSON parse error: {e}")
             # 尝试宽松解析
             try:
