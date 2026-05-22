@@ -35,15 +35,18 @@ class SeqRecAdapter:
 ### 项目信息
 这是一个**序列推荐 (Sequential Recommendation) 模型**项目。
 - 训练脚本: run_finetune_full.py (接受命令行参数)
-- 支持的 Backbone: SASRec (Self-Attentive Sequential Recommendation)
-- 支持的 Loss 类型: BCE (交叉熵), BPR (贝叶斯个性化排序)
-- 支持的负采样器: Uniform (均匀采样), DNS (动态负采样)
-- 支持的对比学习: Radical, Gentle
-- 评估指标: NDCG@K, R@K (Recall), MRR@K (K=5,10,20)
-- 惊喜评估: 在"惊喜"子集上单独评估模型对惊喜交互的捕获能力
+- 这是一个**完全开放**的系统，LLM 可以自由探索任何可能的模型架构、损失函数、采样策略
+
+### 核心理念: 自主探索与创新
+**不要被现有实现限制想象力!** LLM 应该：
+1. 质疑现有设计: 当前 SASRec + InfoNCE 是最优的吗?
+2. 大胆提出新架构:  替代 Transformer?
+3. 探索新损失函数: 对比学习、度量学习、生成式损失...任何可能的方案
+4. 发明新采样策略: 基于图、基于知识、基于强化学习的采样...
+5. 添加新模块: 注意力机制、记忆网络、多兴趣提取器、时序建模...
 
 ### 模型源码结构 (LLM 可以修改的代码文件)
-项目中有两个核心模型源码文件，LLM 可以**直接提出修改方案并自动执行**:
+项目中的所有 .py 文件都可以被修改，LLM 可以自由探索:
 
 1. **models.py** — 模型顶层定义
    - `SRModel`: 基础推荐模型类 (item_embeddings + init_weights)
@@ -64,105 +67,180 @@ class SeqRecAdapter:
    - `_get_neg_sample()`: 负采样逻辑
    - `acc_metric()`: 评估指标计算
 
-### 可执行的结构修改类型
-LLM 可以提出以下类型的结构修改 (不仅仅是调参!):
+4. **datasets.py** — 数据集处理
 
-- **添加新模块**: 如添加 TimeAwareAttention、MultiInterestHead、DiversityRegularizer 等
-- **修改已有模块**: 如改 SelfAttention 的注意力计算方式、改 Intermediate 的 FFN 结构
-- **修改位置编码**: 如从固定位置编码改为时间衰减位置编码、相对位置编码
-- **修改嵌入策略**: 如添加类别嵌入、添加用户嵌入、修改嵌入初始化方式
-- **修改训练逻辑**: 如修改负采样策略代码、添加多样性损失、修改评估逻辑
-- **修改前向传播**: 如添加残差连接、添加门控机制、修改输出层
+### 可执行的结构修改类型 (完全开放!)
+**没有任何预定义的修改类型限制!** LLM 可以提出任何类型的修改:
+- 修改、添加、替换任何模型组件
+- 修改训练逻辑、损失计算、采样策略
+- 添加任何新模块或完全重写某个组件
+- 任何你认为能提升模型性能的修改
 
 每项结构修改必须输出: (1) 修改哪个文件 (2) 修改哪个类/函数 (3) 具体的代码变更 (Python diff 格式)
+
+
+**关键原则**: 如果现有实现不支持你想要的方法，直接修改代码来实现它!
 """
 
     # ════════════════════════════════════════
     # 2. LLM 可以修改的参数空间 + 结构修改空间
     # ════════════════════════════════════════
 
-    # --- 可修改的源码文件: 不预设范围，LLM 可以修改项目中任何 .py 文件 ---
-    # SOURCE_FILE_MAP 仅用于常见文件的快捷映射，LLM 也可以指定项目中的任意 .py 文件
+    # --- 源码文件: LLM 可以修改项目中任何 .py 文件 ---
+    # 不预设范围，LLM 可以直接指定任意 .py 文件路径
     SOURCE_FILE_MAP = {
         "models.py": "models.py",
         "modules.py": "modules.py",
         "trainers.py": "trainers.py",
         "datasets.py": "datasets.py",
+        # LLM 可以通过完整路径指定其他文件，如 "Recmodel/layers.py"
     }
 
-    # --- 结构修改类型: 不预设固定类型，LLM 可以自由描述任何修改 ---
-    # STRUCTURAL_ACTIONS 仅作为参考分类，LLM 可以使用任意 action_type 或不填
+    # --- 结构修改类型: 完全开放，没有预定义限制 ---
+    # LLM 可以自由描述任何类型的结构修改，不需要使用预定义的 action_type
+    # 系统会接受任何合理的结构修改请求
     STRUCTURAL_ACTIONS = {
+        # 这是一个完全开放的字典
+        # LLM 可以提出任何类型的修改，不需要局限于以下类型
+        # 保留这些只是为了兼容性，LLM 可以完全忽略它们
         "modify": {
-            "desc": "修改已有的类/函数",
-            "note": "可以是注意力、FFN、位置编码、嵌入、forward、训练逻辑等任何修改",
+            "desc": "修改已有的类/函数/模块",
+            "note": "可以是任何修改: 注意力机制、FFN、位置编码、嵌入、前向传播、训练逻辑等",
         },
         "add_module": {
-            "desc": "添加新的模块/类",
-            "note": "可以是任何新组件",
+            "desc": "添加新的模块/类/组件",
+            "note": "可以是任何新组件: 新架构、新注意力、新损失、新采样器等",
         },
         "add_loss": {
-            "desc": "添加新的损失组件",
-            "note": "可以是任何额外的损失项",
+            "desc": "添加新的损失组件或训练目标",
+            "note": "可以是任何额外的损失项: 对比学习、度量学习、生成式、对抗性等",
         },
-        "bug_fix": {
-            "desc": "修复代码 bug",
-            "note": "修复运行错误",
+        "replace_backbone": {
+            "desc": "替换整个模型 backbone",
+            "note": "可以用任何模型替代 SASRec"},
         },
-        "other": {
-            "desc": "其他任何类型的修改",
-            "note": "LLM 可以自由定义",
+        "custom": {
+            "desc": "任何其他自定义修改",
+            "note": "LLM 可以自由定义，不受任何限制",
         },
     }
 
-    # --- 可调参数: 扩大范围，给 LLM 更多探索空间 ---
-    # 不再强制范围限制，range 仅作为宽松参考; LLM 可以提出超出范围的值，系统会做温和提醒而非拒绝
+    # --- 可调参数: 完全开放，LLM 可以自由探索任何参数 ---
+    # 不再预设固定参数列表，LLM 可以提出任何新的参数
+    # range 仅作为宽松参考; LLM 可以提出超出范围的值，系统会做温和提醒而非拒绝
+    # 关键: LLM 也可以提出全新的参数名，系统会尝试将其添加到命令行
     TUNABLE_PARAMS = {
-        # === 超参数 ===
+        # === 超参数 (宽松范围，LLM 可自由选择) ===
         "lr": {"type": "float", "range": [1e-6, 1e-1], "default": 0.001, "soft_limit": True,
-               "desc": "学习率 (宽松范围，LLM 可自由选择)"},
+               "desc": "学习率 (宽松范围，LLM 可自由选择任何正值)"},
         "batch_size": {"type": "int", "range": [16, 8192], "default": 1024, "soft_limit": True,
-                       "desc": "批量大小 (宽松范围)"},
+                       "desc": "批量大小 (宽松范围，LLM 可自由选择)"},
         "hidden_size": {"type": "int", "range": [16, 1024], "default": 64, "soft_limit": True,
                         "desc": "隐藏层维度 (宽松范围，注意与模型结构对齐)"},
         "hidden_dropout_prob": {"type": "float", "range": [0.0, 0.99], "default": 0.5, "soft_limit": True,
-                                "desc": "Dropout 概率"},
+                                "desc": "Dropout 概率 (0.0-0.99，LLM 可自由探索)"},
         "attention_probs_dropout_prob": {"type": "float", "range": [0.0, 0.99], "default": 0.5, "soft_limit": True,
-                                         "desc": "Attention Dropout"},
+                                         "desc": "Attention Dropout (0.0-0.99)"},
         "weight_decay": {"type": "float", "range": [0.0, 0.5], "default": 0.0, "soft_limit": True,
-                         "desc": "权重衰减 (宽松范围)"},
+                         "desc": "权重衰减 (宽松范围，LLM 可自由选择)"},
         "max_seq_length": {"type": "int", "range": [10, 500], "default": 50, "soft_limit": True,
                            "desc": "最大序列长度 (宽松范围)"},
 
-        # === 架构 ===
+        # === 架构参数 (LLM 可自由探索) ===
         "num_hidden_layers": {"type": "int", "range": [1, 16], "default": 2, "soft_limit": True,
-                              "desc": "Transformer 层数 (宽松范围)"},
+                              "desc": "Transformer 层数 (1-16，LLM 可自由探索)"},
         "num_attention_heads": {"type": "int", "range": [1, 32], "default": 2, "soft_limit": True,
-                                "desc": "Attention 头数 (宽松范围)"},
+                                "desc": "Attention 头数 (1-32)"},
         "hidden_act": {"type": "str", "choices": None, "default": "gelu", "soft_limit": True,
-                       "desc": "激活函数 (可以是任何合法的激活函数名)"},
+                       "desc": "激活函数 (可以是任何合法的 PyTorch 激活函数名)"},
 
-        # === 损失与采样 ===
-        "loss_type": {"type": "str", "choices": None, "default": "BCE", "soft_limit": True,
-                      "desc": "损失函数类型 (LLM 可以自由命名)"},
+        # === 损失函数 (完全开放，LLM 可以探索任何损失) ===
+        "loss_type": {"type": "str", "choices": None, "default": "InfoNCE", "soft_limit": True,
+                      "desc": "损失函数类型 (完全开放，自主选择)"}},
+        "temperature": {"type": "float", "range": [0.01, 2.0], "default": 0.1, "soft_limit": True,
+                        "desc": "温度系数 (用于 InfoNCE 等对比学习损失，LLM 可探索 0.001~10.0)"},
+        "margin": {"type": "float", "range": [0.0, 5.0], "default": 1.0, "soft_limit": True,
+                   "desc": "Triplet/Margin loss margin (LLM 可探索 0.0~10.0)"},
+        "tau": {"type": "float", "range": [0.01, 2.0], "default": 0.1, "soft_limit": True,
+                "desc": "对比学习温度 tau (类似 temperature，LLM 可探索 0.001~10.0)"},
+
+        # === 负采样策略 (完全开放，LLM 可以发明新采样策略) ===
         "neg_sampler": {"type": "str", "choices": None, "default": "Uniform", "soft_limit": True,
-                        "desc": "负采样器 (LLM 可以自由命名)"},
-        "N": {"type": "int", "range": [10, 5000], "default": 200, "soft_limit": True,
-              "desc": "负采样候选数 (宽松范围)"},
-        "M": {"type": "int", "range": [1, 500], "default": 10, "soft_limit": True,
-              "desc": "DNS pool 大小 (宽松范围)"},
-        "CL_type": {"type": "str", "choices": None, "default": "Radical", "soft_limit": True,
-                    "desc": "对比学习类型 (LLM 可以自由命名)"},
-        "start_epoch": {"type": "int", "range": [0, 500], "default": 30, "soft_limit": True,
-                        "desc": "开始困难负采样的轮次 (宽松范围)"},
-        "K": {"type": "float", "range": [0.001, 1.0], "default": 0.05, "soft_limit": True,
-              "desc": "对比学习参数 (宽松范围)"},
+                        "desc": "负采样策略 (完全开放，自主选择)"}},
+        "N": {"type": "int", "range": [1, 10000], "default": 200, "soft_limit": True,
+              "desc": "负采样候选数 (LLM 可探索 1~100000)"},
+        "M": {"type": "int", "range": [1, 1000], "default": 10, "soft_limit": True,
+              "desc": "负采样池大小 (LLM 可探索 1~10000)"},
 
-        # === 训练 ===
+        # === 对比学习 (完全开放) ===
+        "CL_type": {"type": "str", "choices": None, "default": "Radical", "soft_limit": True,
+                    "desc": "对比学习类型 (完全开放，自主选择)"}},
+        "start_epoch": {"type": "int", "range": [0, 1000], "default": 30, "soft_limit": True,
+                        "desc": "开始困难负采样的轮次 (LLM 可探索 0~10000)"},
+        "K": {"type": "float", "range": [0.0, 1.0], "default": 0.05, "soft_limit": True,
+              "desc": "对比学习超参数 (LLM 可探索 0.0~10.0)"},
+
+        # === 训练参数 (宽松范围) ===
         "epochs": {"type": "int", "range": [10, 2000], "default": 500, "soft_limit": True,
                    "desc": "最大训练轮次 (宽松范围)"},
         "seed": {"type": "int", "range": [0, 99999], "default": 42, "soft_limit": True,
                  "desc": "随机种子"},
+
+        # === 模型结构参数 (新增，完全开放) ===
+        "backbone": {"type": "str", "choices": None, "default": "SASRec", "soft_limit": True,
+                     "desc": "模型 backbone (完全开放，自主选择)"}},
+        "embedding_dim": {"type": "int", "range": [16, 2048], "default": 64, "soft_limit": True,
+                         "desc": "嵌入维度 (与 hidden_size 类似但独立，LLM 可探索 16~4096)"},
+        "num_layers": {"type": "int", "range": [1, 32], "default": 2, "soft_limit": True,
+                       "desc": "模型层数 (与 num_hidden_layers 类似，LLM 可探索 1~64)"},
+
+        # === 优化器参数 (新增) ===
+        "optimizer": {"type": "str", "choices": None, "default": "Adam", "soft_limit": True,
+                     "desc": "优化器类型 (完全开放，自主选择)"}},
+        "adam_beta1": {"type": "float", "range": [0.0, 1.0], "default": 0.9, "soft_limit": True,
+                       "desc": "Adam beta1 (0.0-1.0)"},
+        "adam_beta2": {"type": "float", "range": [0.0, 1.0], "default": 0.999, "soft_limit": True,
+                       "desc": "Adam beta2 (0.0-1.0)"},
+        "adam_epsilon": {"type": "float", "range": [1e-10, 1e-1], "default": 1e-8, "soft_limit": True,
+                         "desc": "Adam epsilon (1e-10~1e-1)"},
+
+        # === 学习率调度 (新增) ===
+        "lr_scheduler": {"type": "str", "choices": None, "default": "none", "soft_limit": True,
+                        "desc": "学习率调度器 (完全开放，自主选择)"}},
+        "lr_decay_step": {"type": "int", "range": [1, 10000], "default": 1000, "soft_limit": True,
+                          "desc": "学习率衰减步数"},
+        "lr_decay_rate": {"type": "float", "range": [0.01, 1.0], "default": 0.5, "soft_limit": True,
+                          "desc": "学习率衰减率"},
+        "warmup_steps": {"type": "int", "range": [0, 10000], "default": 0, "soft_limit": True,
+                         "desc": "warmup 步数"},
+
+        # === 正则化 (新增) ===
+        "layer_norm_eps": {"type": "float", "range": [1e-10, 1e-3], "default": 1e-8, "soft_limit": True,
+                          "desc": "LayerNorm epsilon"},
+        "initializer_range": {"type": "float", "range": [0.001, 1.0], "default": 0.02, "soft_limit": True,
+                             "desc": "初始化范围"},
+
+        # === 评估参数 (新增) ===
+        "eval_at": {"type": "str", "choices": None, "default": "5,10,20", "soft_limit": True,
+                    "desc": "评估 K 值 (如 5,10,20，LLM 可以设置任意组合)"},
+        "do_eval": {"type": "bool", "choices": None, "default": True, "soft_limit": True,
+                    "desc": "是否在训练过程中评估"},
+        "eval_batch_size": {"type": "int", "range": [1, 4096], "default": 256, "soft_limit": True,
+                            "desc": "评估批量大小"},
+
+        # === 早停与保存 (新增) ===
+        "patience": {"type": "int", "range": [1, 100], "default": 10, "soft_limit": True,
+                     "desc": "早停耐心值"},
+        "save_freq": {"type": "int", "range": [1, 100], "default": 100, "soft_limit": True,
+                      "desc": "保存频率 (轮次)"},
+        "log_freq": {"type": "int", "range": [1, 1000], "default": 1, "soft_limit": True,
+                     "desc": "日志输出频率 (轮次)"},
+
+        # === 梯度相关 (新增) ===
+        "max_grad_norm": {"type": "float", "range": [0.1, 10.0], "default": 5.0, "soft_limit": True,
+                         "desc": "梯度裁剪范数"},
+        "gradient_accumulation_steps": {"type": "int", "range": [1, 64], "default": 1, "soft_limit": True,
+                                        "desc": "梯度累积步数"},
     }
 
     # ════════════════════════════════════════
@@ -199,7 +277,10 @@ LLM 可以提出以下类型的结构修改 (不仅仅是调参!):
             "N": 200,
             "M": 10,
             "neg_sampler": "Uniform",
-            "loss_type": "BCE",
+            "loss_type": "InfoNCE",
+            "temperature": 0.1,
+            "tau": 0.1,
+            "margin": 1.0,
             "CL_type": "Radical",
             "start_epoch": 30,
             "K": 0.05,
@@ -436,6 +517,8 @@ LLM 可以提出以下类型的结构修改 (不仅仅是调参!):
         """
         构建项目的上下文描述，作为 LLM Prompt 的一部分
         让 LLM 理解它可以修改什么 (参数 + 模型结构)
+
+        核心理念: 完全开放，让 LLM 自主探索
         """
         args = current_args or self.base_args
 
@@ -457,36 +540,43 @@ Batch Size: {args.get('batch_size', '?')}
 序列长度: {args.get('max_seq_length', '?')}
 ```
 
-### 可调优参数列表 (超参数修改)
+### 可调优参数列表 (超参数修改 — 完全开放!)
 ```
 {json.dumps({k:
     {"type": v["type"],
-     "range": v.get("range") or v.get("choices"),
      "current": args.get(k, v["default"]),
      "desc": v["desc"]}
     for k, v in self.TUNABLE_PARAMS.items()
 }, indent=2, ensure_ascii=False)}
 ```
 
-### 可执行的结构修改类型 (模型结构修改 — 这是核心创新点!)
+**重要**: 上述参数列表不是限制! LLM 可以:
+1. 自由探索列表中的任何参数 (范围仅供参考，不是限制)
+2. 提出全新的参数名，系统会尝试将其添加到命令行
+3. 质疑任何参数的合理性，提出替代方案
+
+### 可执行的结构修改类型 (模型结构修改 — 完全开放!)
 ```
 {json.dumps({k:
     {"desc": v["desc"],
-     "example": v["example"],
-     "target_file": v["target_file"],
-     "risk": v["risk"]}
+     "note": v.get("note", ""),
+     "target_file": v.get("target_file", "see SOURCE_FILE_MAP"),
+     "risk": v.get("risk", "low")}
     for k, v in self.STRUCTURAL_ACTIONS.items()
 }, indent=2, ensure_ascii=False)}
 ```
 
+**重要**: 上述修改类型不是限制! LLM 可以:
+1. 提出任何类型的结构修改，不需要局限于预定义类型
+2. 完全替换或重写任何组件
+3. 从对推荐系统的深度理解出发提出创新方案
+
 ### 注意事项
 1. 训练脚本是 `run_finetune_full.py`，所有参数通过命令行传入
 2. 如果有 `checkpoint_path`，训练会从已有 checkpoint 继续
-3. 修改 `backbone` 需要确保模型类存在
-4. 修改 `loss_type` 会影响训练目标（BCE: 二分类, BPR: 排序）
-5. 修改 `neg_sampler` 和 `CL_type` 会影响训练数据采样方式
-6. **结构修改时务必确保**: 新增模块的输入/输出维度与 hidden_size 对齐，新增参数需要 args 支持
-7. **结构修改是关键**: 不要只调参数! 如果模型瓶颈是架构性的 (如 SelfAttention 无法捕获惊喜模式)，请提出结构性修改方案
+3. **结构修改时务必确保**: 新增模块的输入/输出维度与 hidden_size 对齐，新增参数需要 args 支持
+4. **结构修改是关键**: 不要只调参数! 如果模型瓶颈是架构性的，请提出结构性修改方案
+5. **完全开放的理念**: 不要被现有实现限制想象力! 任何创新都是可能的
 """
         return context
 

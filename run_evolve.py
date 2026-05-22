@@ -72,9 +72,11 @@ def parse_args():
     hyper_group.add_argument("--neg-sampler", default="Uniform",
                              choices=["Uniform", "DNS"],
                              help="负采样策略")
-    hyper_group.add_argument("--loss-type", default="BCE",
-                             choices=["BCE", "BPR"],
+    hyper_group.add_argument("--loss-type", default="InfoNCE",
+                             choices=["BCE", "BPR", "InfoNCE"],
                              help="损失函数")
+    hyper_group.add_argument("--info-nce-temp", type=float, default=0.1,
+                             help="InfoNCE 温度系数 (默认: 0.1, 推荐范围 0.05~0.5)")
     hyper_group.add_argument("--cl-type", default="Radical",
                              choices=["Radical", "Gentle"],
                              help="对比学习类型")

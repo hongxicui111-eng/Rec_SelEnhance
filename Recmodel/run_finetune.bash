@@ -16,6 +16,8 @@ CL_TYPE="Radical"
 HIDDEN_SIZE=64
 N=100
 M=(100)
+LOSS_TYPE="InfoNCE"
+TEMPERATURE=0.1
 
 
 JOBS_PER_GPU=2
@@ -80,7 +82,8 @@ for start_epoch in "${START_EPOCHS[@]}"; do
           --ckp=0 \
           --hidden_size=64 \
           --start_epoch="$start_epoch" \
-          --loss_type=BCE \
+          --loss_type="$LOSS_TYPE" \
+          --temperature="$TEMPERATURE" \
           --N="$N" \
           --M="$m" \
           --neg_sampler="$NEG_SAMPLER" \

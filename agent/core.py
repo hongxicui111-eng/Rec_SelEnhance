@@ -2579,12 +2579,13 @@ class RecSelfEvolveAgent:
         }
 
     def _validate_param_changes(self, param_changes: dict) -> dict:
-        """验证参数变更 — soft_limit 模式: 超出范围仅警告不拒绝"""
+        """验证参数变更 — 完全开放模式: 默认 soft_limit=True，超出范围仅警告不拒绝"""
         valid_changes = {}
         for key, value in param_changes.items():
             if key in self.adapter.TUNABLE_PARAMS:
                 param_info = self.adapter.TUNABLE_PARAMS[key]
-                soft_limit = param_info.get("soft_limit", False)
+                # 默认 soft_limit=True: 完全开放模式，不拒绝任何参数值
+                soft_limit = param_info.get("soft_limit", True)
                 try:
                     if param_info["type"] == "float":
                         value = float(value)
@@ -2788,7 +2789,7 @@ class RecSelfEvolveAgent:
         patterns = [
             r"(?:将|把)\s*(?:学习率|learning_rate|lr)\s*(?:改为|设为|设置为|调为)\s*([\d.e+\-]+)",
             r"(?:lr|learning_rate|batch_size|hidden_size|dropout|epochs|N|M|K)\s*[=:]\s*([\d.e+\-]+)",
-            r"(?:loss_type|neg_sampler|CL_type|hidden_act|backbone)\s*[=:]\s*['\"]?(\w+)['\"]?",
+            r"(?:loss_type|neg_sampler|CL_type|hidden_act|backbone|temperature)\s*[=:]\s*['\"]?(\w+)['\"]?",
         ]
 
         # 提取键值对
@@ -2799,7 +2800,8 @@ class RecSelfEvolveAgent:
                      "epochs", "N", "M", "K", "backbone", "CL_type", "hidden_act",
                      "hidden_dropout_prob", "num_hidden_layers", "weight_decay",
                      "dropout", "seed", "start_epoch", "gpu_id", "max_seq_length",
-                     "num_attention_heads", "d_state", "d_conv", "expand"]:
+                     "num_attention_heads", "d_state", "d_conv", "expand", "temperature",
+                     "tau", "margin"]:
                 try:
                     if "." in v:
                         params[k] = float(v)

@@ -8,6 +8,7 @@ import random
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import Adam
 
 from utils import recall_at_k, ndcg_k, get_metric, generate_scaled_fx
@@ -287,6 +288,52 @@ class Trainer:
         
         return loss
 
+    def info_nce_loss(self, seq_out, pos_ids, neg_ids=None):
+        """
+        InfoNCE (Information Noise Contrastive Estimation) Loss
+        
+        利用 batch 内所有样本作为负例进行对比学习，相比 BCE/BPR 只用单个负例，
+        InfoNCE 提供了更强的梯度信号，能显著加速收敛。
+        
+        公式: L = -log( exp(sim(q, k+) / τ) / Σ_j exp(sim(q, k_j) / τ) )
+        其中 q=序列输出, k+=正例物品嵌入, k_j=batch内所有物品嵌入, τ=温度系数
+        
+        Args:
+            seq_out: 序列输出, [batch, hidden_size]
+            pos_ids: 正样本ID, [batch]
+            neg_ids: 不使用（InfoNCE用batch内所有样本作为负例），保留参数以保持接口一致
+            
+        Returns:
+            loss: InfoNCE损失值
+        """
+        # 温度系数 τ：越小则对比越严格（梯度越尖锐），越大则越宽松
+        # 经验值一般在 0.05 ~ 0.5 之间，推荐默认 0.1
+        temperature = self.args.temperature if hasattr(self.args, 'temperature') else 0.1
+        
+        # 获取所有物品的嵌入矩阵作为负例候选池
+        # [item_num, hidden_size]
+        all_item_emb = self.model.item_embeddings.weight
+        
+        # 计算序列输出与所有物品的内积得分
+        # [batch, item_num]
+        logits = torch.matmul(seq_out, all_item_emb.transpose(0, 1))
+        
+        # 温度缩放：使softmax分布更尖锐或更平滑
+        logits = logits / temperature
+        
+        # 构建目标标签：正例物品的索引
+        # pos_ids 是每个样本正例物品的ID，直接作为 softmax 的目标类别
+        istarget = (pos_ids > 0).float()  # [batch] 标记有效位置
+        
+        # InfoNCE loss = 交叉熵形式，将正例视为正确类别
+        # batch内每个样本的正例物品是"正确答案"，其余所有物品都是"干扰项"
+        loss = F.cross_entropy(logits, pos_ids, reduction='none')  # [batch]
+        
+        # 只计算有效位置的损失并取平均
+        loss = (loss * istarget).sum() / istarget.sum()
+        
+        return loss
+
     def predict_full(self, seq_out):
         # [item_num hidden_size]
         test_item_emb = self.model.item_embeddings.weight
@@ -311,6 +358,8 @@ class FinetuneTrainer(Trainer):
             self.loss = self.cross_entropy
         elif self.args.loss_type=="BPR":
             self.loss = self.bpr_loss
+        elif self.args.loss_type=="InfoNCE":
+            self.loss = self.info_nce_loss
         
     def iteration(self, epoch, dataloader, full_sort=False, train=True):
 
