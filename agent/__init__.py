@@ -19,5 +19,6 @@ from .llm_analyzer import LLMCaseAnalyzer
 from .structure_applier import StructureApplier
 from .iterative_memory import IterativeMemory
 from .context_compressor import LLMContextCompressor
+from .code_query_tool import CodeQueryTool
 
-__version__ = "0.4.0"
+__version__ = "0.6.0"

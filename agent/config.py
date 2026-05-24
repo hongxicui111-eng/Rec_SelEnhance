@@ -82,3 +82,8 @@ class AgentConfig:
     coder_temperature: float = 0.4      # Coder 温度
     debugger_temperature: float = 0.2   # Debugger 温度
     max_reflection_rounds: int = 3      # 最大反思轮次
+
+    # ---- 代码查询模式配置 (核心新增!) ----
+    enable_code_query: bool = True       # 是否启用查询模式 (替代塞全部源码+截断)
+    max_query_rounds: int = 5            # 最大查询轮数 (LLM 可查询几次后再出提案)
+    code_query_max_chars_per_result: int = 8000  # 单次查询结果最大字符数

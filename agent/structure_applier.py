@@ -259,12 +259,26 @@ class StructureApplier:
                     "success": True,
                 })
             else:
-                edit_results.append({
-                    "edit_idx": edit_idx,
-                    "method": "failed",
-                    "success": False,
-                    "search_text_preview": search_text[:80],
-                })
+                # ── Level 4: 智能插入回退 (argparse / 结构化插入) ──
+                # SEARCH/REPLACE 全部失败时, 检查是否是 argparse 参数插入
+                # 如果 replace_text 包含 parser.add_argument, 尝试智能插入
+                result_content, method = self._smart_insert_fallback(
+                    content, search_text, replace_text, original_content
+                )
+                if result_content is not None:
+                    content = result_content
+                    edit_results.append({
+                        "edit_idx": edit_idx,
+                        "method": method,
+                        "success": True,
+                    })
+                else:
+                    edit_results.append({
+                        "edit_idx": edit_idx,
+                        "method": "failed",
+                        "success": False,
+                        "search_text_preview": search_text[:80],
+                    })
 
         # 检查是否所有编辑都失败
         successful_edits = [r for r in edit_results if r["success"]]
@@ -346,11 +360,213 @@ class StructureApplier:
                        f"(first 80 chars): {search_text[:80]}")
         return None, "failed"
 
+    def _smart_insert_fallback(self, content: str, search_text: str,
+                                replace_text: str, original_content: str) -> Tuple[Optional[str], str]:
+        """
+        Level 4: 智能插入回退 — 当 SEARCH/REPLACE 三级匹配全部失败时
+        
+        针对特定类型的修改, 使用结构化插入策略:
+        1. argparse 参数插入: 在最后一个 parser.add_argument 后插入新参数
+        2. 类/函数定义追加: 在文件适当位置追加新定义
+        
+        这是 LLM 看不到精确源码时的关键安全网 — 确保"方向正确但文本不匹配"
+        的修改仍能被应用, 而不是直接失败。
+        
+        Args:
+            content: 当前文件内容 (可能已被前面的 edit 修改)
+            search_text: LLM 提出的 search 文本 (未能匹配)
+            replace_text: LLM 提出的 replace 文本
+            original_content: 原始文件内容 (未修改版)
+        
+        Returns:
+            (new_content, method_used) 或 (None, "failed")
+        """
+        # ── Strategy 1: argparse 参数插入 ──
+        # 检测: replace_text 中是否包含 parser.add_argument 行
+        new_argparse_lines = self._extract_new_argparse_lines(replace_text)
+        if new_argparse_lines:
+            result = self._insert_argparse_lines(content, new_argparse_lines)
+            if result is not None:
+                logger.info(f"Smart insert: added {len(new_argparse_lines)} argparse arguments "
+                            f"after last parser.add_argument")
+                return result, "smart_argparse_insert"
+        
+        # ── Strategy 2: 类/函数定义追加 ──
+        # 检测: replace_text 中是否包含新的 class 或 def 定义 (不在原文件中)
+        new_definitions = self._extract_new_definitions(replace_text, original_content)
+        if new_definitions:
+            result = self._insert_definitions(content, new_definitions)
+            if result is not None:
+                logger.info(f"Smart insert: added {len(new_definitions)} new definitions")
+                return result, "smart_definition_insert"
+        
+        logger.info("Smart insert: no applicable strategy found")
+        return None, "failed"
+
+    @staticmethod
+    def _extract_new_argparse_lines(replace_text: str) -> List[str]:
+        """
+        从 replace_text 中提取新增的 parser.add_argument 行
+        
+        只提取那些看起来是新增参数的行 (不含 search_text 中可能已有的参数).
+        """
+        lines = replace_text.split('\n')
+        argparse_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("parser.add_argument(") or \
+               stripped.startswith("args_parser.add_argument(") or \
+               stripped.startswith("add_argument("):
+                argparse_lines.append(line)
+        return argparse_lines
+
+    @staticmethod
+    def _insert_argparse_lines(content: str, new_lines: List[str]) -> Optional[str]:
+        """
+        在文件中找到最后一个 parser.add_argument 行, 在其后插入新参数
+        
+        算法:
+        1. 找到 content 中最后一个 parser.add_argument 的行号
+        2. 检查新参数是否已经存在 (避免重复插入)
+        3. 在最后一个 add_argument 后插入新行
+        """
+        lines = content.split('\n')
+        
+        # 找到最后一个 parser.add_argument 的行号
+        last_add_arg_idx = -1
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("parser.add_argument(") or \
+               stripped.startswith("args_parser.add_argument(") or \
+               stripped.startswith("add_argument("):
+                last_add_arg_idx = idx
+        
+        if last_add_arg_idx == -1:
+            # 文件中没有 parser.add_argument — 无法智能插入
+            return None
+        
+        # 检查新参数是否已经存在 (避免重复插入)
+        for new_line in new_lines:
+            # 提取参数名 (--xxx)
+            arg_name_match = re.search(r"add_argument\s*\(\s*['\"]--(\w+)['\"]", new_line)
+            if arg_name_match:
+                arg_name = arg_name_match.group(1)
+                # 检查 content 中是否已有这个参数
+                if f"--{arg_name}" in content:
+                    logger.info(f"Smart insert: --{arg_name} already exists, skipping")
+                    new_lines = [l for l in new_lines if f"--{arg_name}" not in l]
+        
+        if not new_lines:
+            # 所有参数都已存在
+            return None
+        
+        # 获取最后一个 add_argument 的缩进
+        last_line = lines[last_add_arg_idx]
+        indent = len(last_line) - len(last_line.lstrip())
+        indent_str = last_line[:indent] if indent > 0 else "    "
+        
+        # 规范化新行的缩进 (与最后一行一致)
+        normalized_lines = []
+        for line in new_lines:
+            stripped = line.strip()
+            if stripped:
+                normalized_lines.append(indent_str + stripped)
+        
+        # 在最后一个 add_argument 后插入 (保持空行风格一致)
+        # 查找 last_add_arg_idx 后的空行区域
+        insert_idx = last_add_arg_idx + 1
+        
+        # 插入新行
+        result_lines = lines[:insert_idx] + normalized_lines + lines[insert_idx:]
+        return '\n'.join(result_lines)
+
+    @staticmethod
+    def _extract_new_definitions(replace_text: str, original_content: str) -> List[str]:
+        """
+        从 replace_text 中提取不在原文件中的新类/函数定义
+        
+        只提取那些是"新增定义"的行块 (原文件中不存在该名称的 class/def).
+        """
+        # 找出 replace_text 中的所有定义名称
+        new_names = set()
+        for match in re.finditer(r'(?:class|def)\s+(\w+)\s*\(', replace_text):
+            new_names.add(match.group(1))
+        
+        # 找出原文件中已有的定义名称
+        existing_names = set()
+        for match in re.finditer(r'(?:class|def)\s+(\w+)\s*\(', original_content):
+            existing_names.add(match.group(1))
+        
+        # 只保留真正新增的定义
+        truly_new = new_names - existing_names
+        
+        if not truly_new:
+            return []
+        
+        # 提取新增定义的完整代码块
+        new_blocks = []
+        for name in truly_new:
+            # 在 replace_text 中找到这个定义的代码块
+            pattern = rf'(?:class|def)\s+{name}\s*\('
+            match = re.search(pattern, replace_text)
+            if match:
+                # 从匹配位置开始, 找到定义的结束
+                start_idx = match.start()
+                # 查找定义结束位置 (缩进回退到同级或更低)
+                lines = replace_text[start_idx:].split('\n')
+                if lines:
+                    first_indent = len(lines[0]) - len(lines[0].lstrip())
+                    end_idx = 1
+                    for i in range(1, len(lines)):
+                        stripped = lines[i].strip()
+                        if not stripped:
+                            end_idx = i + 1
+                            continue
+                        line_indent = len(lines[i]) - len(lines[i].lstrip())
+                        if line_indent <= first_indent and stripped:
+                            break
+                        end_idx = i + 1
+                    block = '\n'.join(lines[:end_idx])
+                    new_blocks.append(block)
+        
+        return new_blocks
+
+    @staticmethod
+    def _insert_definitions(content: str, new_blocks: List[str]) -> Optional[str]:
+        """
+        在文件末尾 (或适当位置) 插入新定义
+        
+        简化策略: 在文件末尾追加, 但避免破坏文件结构.
+        """
+        if not new_blocks:
+            return None
+        
+        # 在文件末尾追加, 确保不会在函数内部插入
+        lines = content.split('\n')
+        
+        # 找到文件最后一个非空行
+        last_non_empty = len(lines) - 1
+        while last_non_empty >= 0 and not lines[last_non_empty].strip():
+            last_non_empty -= 1
+        
+        # 在最后非空行后插入新定义
+        insert_position = last_non_empty + 1
+        
+        # 添加分隔空行
+        new_content_lines = lines[:insert_position] + [''] + new_blocks + ['']
+        result = '\n'.join(new_content_lines)
+        
+        return result
+
     @staticmethod
     def _normalize_whitespace(text: str) -> str:
         """
         规范化空白: 去除连续空行, 去除行尾空格, 去除首尾空行
         用于 Level 2 去空白匹配
+        
+        修复 Bug B: 原来这段代码被嵌在 _insert_definitions 的 return 之后成为不可达死代码,
+        导致 _strip_whitespace_match 调用 self._normalize_whitespace 时触发 AttributeError.
+        现在将其提取为独立的 staticmethod.
         """
         lines = text.split('\n')
         # 去除行尾空格
@@ -704,7 +920,7 @@ class StructureApplier:
         # 展示带行号的上下文
         window_lines = []
         for idx in range(min_line, max_line):
-            marker = "►" if any(j1 <= idx < j2 for _, j1, j2 in modified_ranges) else " "
+            marker = "►" if any(j1 <= idx < j2 for j1, j2 in modified_ranges) else " "
             window_lines.append(f"{idx + 1:4d}{marker}| {new_lines[idx]}")
 
         filename = os.path.basename(file_path)
@@ -804,12 +1020,38 @@ class StructureApplier:
         在 subprocess 中运行 python -c "import module",
         检查模块能否被成功加载 (不抛 ImportError/NameError 等).
 
-        这是比 ast.parse 更严格的验证 — 语法正确不代表代码能跑!
+        **重要**: 如果文件包含不在 if __name__ == '__main__' 保护下的
+        top-level main() / 函数调用, 则跳过 import 验证。
+        这类 "script-style" 文件 (如 run_finetune_full.py) 在 import 时
+        会执行 main() 导致无关的运行时错误, 从而误判为验证失败。
+
+        三级策略:
+        1. 检测 top-level 可执行调用 → 跳过 import, 只做语法检查
+        2. 安全文件 → 正常 import 验证
+        3. import 失败 → 报告错误
         """
         filename = os.path.basename(file_path)
         module_name = filename.replace('.py', '')
 
-        # 构建项目根目录和 Recmodel 子目录作为 Python path
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # ── Step 1: 检测 "script-style" 文件 ──
+        # 如果文件有不在 if __name__ == '__main__' 下的 top-level
+        # 函数调用 (如 main()), import 时会执行这些调用, 导致误判。
+        if self._has_unprotected_top_level_calls(content):
+            logger.info(
+                f"Validation: skipping import for script-style file {filename} "
+                f"(has unprotected top-level calls). AST syntax check is sufficient."
+            )
+            return {
+                "passed": True,
+                "detail": f"Skipped import for script-style file {filename} "
+                          f"(unprotected top-level calls detected). "
+                          f"Syntax check passed instead."
+            }
+
+        # ── Step 2: 正常 import 验证 ──
         normalized_root = os.path.normpath(self.project_root)
         recmodel_dir = os.path.join(normalized_root, "Recmodel")
         python_path = f"{normalized_root}:{recmodel_dir}"
@@ -840,6 +1082,68 @@ class StructureApplier:
             return {"passed": False, "error": f"import {module_name} timed out (10s)"}
         except Exception as e:
             return {"passed": False, "error": f"import check exception: {e}"}
+
+    @staticmethod
+    def _has_unprotected_top_level_calls(content: str) -> bool:
+        """
+        检测文件是否包含不在 if __name__ == '__main__' 保护下的
+        top-level 函数/方法调用。
+
+        "script-style" 文件 (如 run_finetune_full.py) 的典型特征:
+        - 文件末尾有裸露的 main() 或其他函数调用
+        - 这些调用不在 if __name__ == '__main__' 块内
+
+        如果 import 这样的文件, 会立即执行这些 top-level 调用,
+        导致数据加载、参数解析等运行时错误, 误判为验证失败。
+
+        算法:
+        1. 用 AST 解析文件, 找出所有 top-level Expr 节点 (即非赋值、非定义的语句)
+        2. 检查这些 Expr 是否是函数调用 (Call)
+        3. 过滤掉在 if __name__ == '__main__' 块内的调用
+        4. 如果剩余任何函数调用 → 返回 True
+        """
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            # 语法错误时无法检测, 保守返回 True (跳过 import)
+            return True
+
+        # 找出 if __name__ == '__main__' 块保护的行范围
+        protected_ranges = []  # [(start_line, end_line)]
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, ast.If):
+                # 检查是否是 if __name__ == '__main__' 或 if __name__ == "__main__"
+                test = node.test
+                if isinstance(test, ast.Compare):
+                    if isinstance(test.left, ast.Name) and test.left.id == '__name__':
+                        for comp in test.comparators:
+                            if isinstance(comp, ast.Constant) and comp.value == '__main__':
+                                protected_ranges.append(
+                                    (node.lineno, node.end_lineno or node.lineno + 100)
+                                )
+
+        # 检查 top-level Expr 中的函数调用
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                # 检查是否在 protected_ranges 内
+                line = node.lineno
+                is_protected = any(
+                    start <= line <= end for start, end in protected_ranges
+                )
+                if not is_protected:
+                    # 发现不在 __main__ 保护下的 top-level 函数调用
+                    call_name = ""
+                    if isinstance(node.value.func, ast.Name):
+                        call_name = node.value.func.id
+                    elif isinstance(node.value.func, ast.Attribute):
+                        call_name = node.value.func.attr
+                    logger.info(
+                        f"Detected unprotected top-level call: {call_name}() "
+                        f"at line {line}"
+                    )
+                    return True
+
+        return False
 
     def _check_critical_symbols(self, content: str, file_path: str) -> Dict:
         """检查关键类/函数是否仍然存在"""

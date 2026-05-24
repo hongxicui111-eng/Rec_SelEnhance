@@ -6,6 +6,7 @@ RecSelfEvolveAgent — 推荐系统自增强 Agent 主循环
 - Self-EvolveRec: 方向性反馈 + 诊断-模型协同进化
 - **你的项目适配**: 通过 ProjectAdapter 理解具体运行方式
 """
+import ast
 import json
 import re
 import logging
@@ -30,11 +31,17 @@ from .prompts import (
     PLANNER_INSTRUCTIONS, RESEARCHER_INSTRUCTIONS,
     REFLECTION_INSTRUCTIONS, SEARCH_INSTRUCTIONS,
     CODER_INSTRUCTIONS, DEBUGGER_INSTRUCTIONS,
+    # 代码查询模式 prompt 模板 (核心新增!)
+    QUERY_BASED_PHASE1_PROMPT, QUERY_BASED_PHASE2_PROMPT, QUERY_BASED_FINAL_PROMPT,
+    # 纠错查询模式 prompt 模板 (核心新增!)
+    QUERY_BASED_FIX_PHASE1_PROMPT, QUERY_BASED_FIX_PHASE2_PROMPT,
+    QUERY_BASED_FIX_FINAL_PROMPT, QUERY_BASED_PREFLIGHT_FIX_PROMPT,
 )
 from .llm_analyzer import LLMCaseAnalyzer
 from .structure_applier import StructureApplier
 from .iterative_memory import IterativeMemory
 from .context_compressor import LLMContextCompressor
+from .code_query_tool import CodeQueryTool
 
 logger = logging.getLogger("rec_self_evolve.core")
 
@@ -110,6 +117,16 @@ class RecSelfEvolveAgent:
         # ---- 惊喜评估与案例分析 ----
         self.item_text_map = self._load_item_text_map()
         self.case_analyzer = LLMCaseAnalyzer(self.llm, self.item_text_map)
+
+        # ---- 代码查询工具 (核心新增!) ----
+        self._code_query_enabled = self.config.enable_code_query
+        if self._code_query_enabled:
+            self._code_query_tool = CodeQueryTool(
+                project_root=self.config.project_root,
+                source_file_map=dict(self.adapter.SOURCE_FILE_MAP),
+                adapter=self.adapter,
+            )
+            logger.info("Code query tool enabled — LLM will query code on-demand instead of receiving all source code upfront")
 
         self.current_iteration = 0
         self.current_strategy = "balanced"
@@ -214,8 +231,8 @@ class RecSelfEvolveAgent:
         logger.info(f"Starting evolution: {max_iters} max iterations")
 
         print(f"\n{'='*60}")
-        print(f"  RecSelfEvolve — 推荐系统自增强 Agent (v0.5)")
-        print(f"  核心改进: 运行→验证→修复→重试 自纠错闭环")
+        print(f"  RecSelfEvolve — 推荐系统自增强 Agent (v0.6)")
+        print(f"  核心改进: 代码查询模式 — LLM 按需获取代码, 不塞全部源码+截断")
         print(f"  LLM: {self.config.llm_model} @ {self.config.llm_api_url}")
         print(f"  Project: {self.config.project_root}")
         print(f"  Backbone: {self.adapter.backbone}")
@@ -223,6 +240,11 @@ class RecSelfEvolveAgent:
         print(f"  Max iterations: {max_iters}")
         print(f"  Max code fix rounds: {self._max_code_fix_rounds}")
         print(f"  Max self correction rounds: {self._max_self_correction_rounds}")
+        mode_str = "QUERY (LLM按需获取代码)" if self._code_query_enabled else "TRADITIONAL (塞全部源码)"
+        if self._multi_role_enabled:
+            mode_str = "MULTI-ROLE (Planner→Researcher→Coder)"
+        print(f"  Code analysis mode: {mode_str}")
+        print(f"  Max query rounds: {self.config.max_query_rounds}")
         print(f"{'='*60}\n")
 
         # ---- Step 0: 检查 LLM 健康状态 ----
@@ -337,8 +359,11 @@ class RecSelfEvolveAgent:
             if self._multi_role_enabled:
                 # 多角色工作流: Planner → Researcher → Coder → Debugger
                 proposal_result = self._phase_multi_role_analyze_and_propose(metrics)
+            elif self._code_query_enabled:
+                # 查询模式: LLM 按需获取代码, 不塞全部源码 (核心新增!)
+                proposal_result = self._phase_query_based_analyze_and_propose(metrics)
             else:
-                # 单角色工作流: 传统 MLE 分析
+                # 传统模式: 塞全部源码 + 截断
                 proposal_result = self._phase_analyze_and_propose(metrics)
             if proposal_result is None:
                 print(f"  ⚠ LLM analysis failed, skipping")
@@ -564,6 +589,265 @@ class RecSelfEvolveAgent:
         
         return result
 
+    # ════════════════════════════════════════════════════════
+    # 通用: 纠错阶段的查询模式 (核心新增!)
+    # ════════════════════════════════════════════════════════
+    #
+    # 让纠错过程也用 query 模式, 不再塞全部源码+截断!
+    # 所有纠错方法 (_preflight_fix, _fix_code_error, etc.) 共用此方法
+    #
+
+    def _fix_with_query_mode(
+        self,
+        phase1_prompt_template: str,
+        phase2_prompt_template: str,
+        final_prompt_template: str,
+        phase1_prompt_kwargs: dict,
+        phase2_extra_kwargs: dict = None,
+        final_extra_kwargs: dict = None,
+        system_prompt: str = None,
+        temperature: float = 0.2,
+        max_query_rounds: int = 3,
+    ) -> Optional[dict]:
+        """
+        纠错阶段的通用 query 模式方法
+        
+        让 LLM 通过按需查询代码来修复 bug, 而不是塞全部源码+截断。
+        工作流程:
+          1. 第一轮: 给 LLM 错误信息 + 代码索引 → LLM 查询出错位置代码
+          2. 后续轮: LLM 继续查询或输出修复方案
+          3. 最终轮: 强制输出修复方案
+        
+        Args:
+            phase1_prompt_template: 第一轮 prompt 模板 (含 {_error_type} 等占位符)
+            phase2_prompt_template: 第二轮 prompt 模板
+            final_prompt_template: 最终轮 prompt 模板
+            phase1_prompt_kwargs: 第一轮 prompt 的格式化参数
+            phase2_extra_kwargs: 第二轮额外参数 (如 {_error_type})
+            final_extra_kwargs: 最终轮额外参数
+            system_prompt: system message 内容
+            temperature: LLM 温度
+            max_query_rounds: 最大查询轮数
+        
+        Returns:
+            Dict: 修复方案 (与 _parse_proposal_response 格式一致)
+            None: 查询失败或无法解析
+        """
+        if system_prompt is None:
+            system_prompt = (
+                "你是一位 Python 代码调试专家。"
+                "你可以通过代码查询工具按需获取源码详情, 然后基于精确的代码提出修复方案。"
+                "⚠ 重要: 如果你想修改代码, 请先查询要修改的代码, "
+                "确保 SEARCH/REPLACE 的 search 文本与源码完全匹配!"
+            )
+        
+        if phase2_extra_kwargs is None:
+            phase2_extra_kwargs = {}
+        if final_extra_kwargs is None:
+            final_extra_kwargs = {}
+        
+        # ── 累积查询结果 ──
+        all_queried_code = ""
+        observation_summary = ""
+        reasoning_summary = ""
+        analysis_direction = ""
+        query_results_this_round = ""
+        
+        for round_idx in range(max_query_rounds):
+            print(f"  🔍 [Fix Query Round {round_idx + 1}/{max_query_rounds}]")
+            
+            # ── 构建当前轮的 prompt ──
+            if round_idx == 0:
+                # 第一轮: 使用 phase1 prompt
+                kwargs = dict(phase1_prompt_kwargs)
+                kwargs["queried_code"] = kwargs.get("queried_code", 
+                    "(暂无 — 这是第一轮, 请提出你想查询的代码)")
+                prompt = phase1_prompt_template.format(**kwargs)
+            else:
+                # 后续轮: 使用 phase2 prompt
+                kwargs = {
+                    "query_results": query_results_this_round,
+                    "previous_observation": observation_summary,
+                    "previous_analysis_direction": analysis_direction or "待确认",
+                }
+                kwargs.update(phase2_extra_kwargs)
+                prompt = phase2_prompt_template.format(**kwargs)
+            
+            # ── 添加回滚黑名单 ──
+            rollback_warning = self.iter_memory.build_rollback_aware_context()
+            if rollback_warning:
+                prompt += rollback_warning
+            
+            # ── 调用 LLM ──
+            response = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=temperature,
+                max_tokens=self.config.llm_max_tokens,
+            )
+            
+            if response is None:
+                print(f"     ✗ [Fix Query] LLM 调用失败 at round {round_idx + 1}")
+                if round_idx == 0:
+                    return None  # 第一轮就失败 → 直接返回
+                break
+            
+            # ── 解析 LLM 回复 ──
+            parsed = self._parse_query_response(response)
+            
+            if parsed is None:
+                # 解析失败 → 尝试直接作为提案解析
+                proposal = self._parse_proposal_response(response)
+                if proposal:
+                    print(f"     ✓ [Fix Query] Parsed as proposal directly at round {round_idx + 1}")
+                    return proposal
+                print(f"     ✗ [Fix Query] Response parse failed at round {round_idx + 1}")
+                if round_idx == 0:
+                    return None
+                break
+            
+            phase = parsed.get("phase", "")
+            
+            # ── 记录观察和分析 ──
+            observation_summary = parsed.get("observation", observation_summary)
+            reasoning_summary = parsed.get("reasoning", reasoning_summary)
+            analysis_direction = parsed.get("analysis_direction", "")
+            
+            if phase == "proposal":
+                # ── LLM 已经做出修复提案! ──
+                print(f"     ✓ [Fix Query] LLM produced fix proposal after {round_idx + 1} round(s)")
+                print(f"       Diagnosis: {reasoning_summary[:120]}")
+                return {
+                    "structural_changes": parsed.get("structural_changes", []),
+                    "param_changes": parsed.get("param_changes", {}),
+                    "explanation": parsed.get("rationale", "") or parsed.get("message", "") or reasoning_summary,
+                    "analysis": observation_summary + "\n" + reasoning_summary,
+                    "_query_mode_used": True,
+                    "_query_rounds": round_idx + 1,
+                    "_queried_code_chars": len(all_queried_code),
+                    "_raw_response": response,  # 保留原始 LLM 响应, 用于回退解析
+                }
+            
+            elif phase == "query":
+                # ── LLM 提出查询请求 ──
+                queries = parsed.get("queries", [])
+                if not queries:
+                    print(f"     ⚠ No queries in response, forcing next round")
+                    continue
+                
+                print(f"     🔎 LLM queries: {len(queries)} requests")
+                # ── 兼容 LLM 输出的简化格式: strings → dicts ──
+                # LLM 有时会输出 queries 为纯字符串列表 (如 ["SASRec.__init__"]),
+                # 而不是结构化的 [{"action": "search_function", "args": {"name": "SASRec.__init__}}]
+                normalized_queries = []
+                for q in queries:
+                    if isinstance(q, str):
+                        # ── 清洗 LLM 格式污染 ──
+                        # LLM 有时将 SEARCH/REPLACE edit 格式与查询格式混淆,
+                        # 输出 "SEARCH: class SASRec" 或 "SEARCH: SASRec.__init__" 等
+                        import re as regex_module
+                        cleaned_q = q.strip()
+                        # 移除 "SEARCH:" / "REPLACE:" / "class " / "def " 等前缀
+                        cleaned_q = regex_module.sub(
+                            r'^\s*(SEARCH|REPLACE)\s*:\s*(class\s+|def\s+)?', '',
+                            cleaned_q, flags=regex_module.IGNORECASE
+                        ).strip()
+                        # 移除包裹的引号
+                        cleaned_q = cleaned_q.strip('"\'`<>')
+                        # 自动将字符串转为 search_function 查询
+                        normalized_queries.append({"action": "search_function", "args": {"name": cleaned_q}})
+                        print(f"       → search_function(name={cleaned_q})  [auto-converted from string{' (cleaned from: '+q+')' if cleaned_q != q else ''}]")
+                    elif isinstance(q, dict):
+                        action = q.get("action", "?")
+                        args = q.get("args", {})
+                        print(f"       → {action}({args})")
+                        normalized_queries.append(q)
+                    else:
+                        print(f"       ⚠ Skipping invalid query item: {type(q)} = {q}")
+                queries = normalized_queries
+                if not queries:
+                    print(f"     ⚠ No valid queries after normalization, forcing next round")
+                    continue
+                
+                # ── 执行查询 ──
+                query_results_this_round = self._code_query_tool.execute_queries(queries)
+                
+                # 限制单次查询结果大小
+                max_chars = self.config.code_query_max_chars_per_result
+                if len(query_results_this_round) > max_chars:
+                    query_results_this_round = query_results_this_round[:max_chars] + \
+                        f"\n\n⚠ 查询结果超过 {max_chars} 字符, 已截断。如需更多细节, 请使用 get_region 获取具体行范围。"
+                
+                all_queried_code += "\n\n" + query_results_this_round
+                
+                # 刷新缓存 (源码可能已被修改)
+                self._code_query_tool.refresh_cache()
+                
+                print(f"       Results: {len(query_results_this_round)} chars returned")
+            
+            else:
+                # 未知 phase → 尝试作为提案解析
+                print(f"     ⚠ Unknown phase '{phase}' in fix query response")
+                proposal = self._parse_proposal_response(response)
+                if proposal:
+                    return proposal
+                if round_idx == 0:
+                    return None
+                break
+        
+        # ── 查询轮数用尽 → 强制输出修复方案 ──
+        print(f"  📢 [Fix Query] Max rounds reached, forcing final proposal")
+        kwargs = {
+            "all_queried_code": all_queried_code,
+            "observation_summary": observation_summary,
+            "reasoning_summary": reasoning_summary,
+            "current_hidden_size": self.adapter.base_args.get("hidden_size", 64),
+        }
+        kwargs.update(final_extra_kwargs)
+        final_prompt = final_prompt_template.format(**kwargs)
+        
+        # 添加回滚黑名单
+        rollback_warning = self.iter_memory.build_rollback_aware_context()
+        if rollback_warning:
+            final_prompt += rollback_warning
+        
+        response = self.llm.chat(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": final_prompt},
+            ],
+            temperature=temperature,
+            max_tokens=self.config.llm_max_tokens,
+        )
+        
+        if response is None:
+            return None
+        
+        # 尝试解析为提案
+        proposal = self._parse_proposal_response(response)
+        if proposal:
+            proposal["_query_mode_used"] = True
+            proposal["_query_rounds"] = max_query_rounds
+            proposal["_queried_code_chars"] = len(all_queried_code)
+            return proposal
+        
+        # 尝试从 query 格式中提取 proposal
+        parsed = self._parse_query_response(response)
+        if parsed and parsed.get("phase") == "proposal":
+            return {
+                "structural_changes": parsed.get("structural_changes", []),
+                "param_changes": parsed.get("param_changes", {}),
+                "explanation": parsed.get("rationale", ""),
+                "analysis": observation_summary + "\n" + reasoning_summary,
+                "_query_mode_used": True,
+                "_query_rounds": max_query_rounds,
+                "_queried_code_chars": len(all_queried_code),
+            }
+        
+        return None
+
     def _preflight_fix_and_retry(self, preflight_result: dict, iteration: int) -> Optional[dict]:
         """
         预检修复: 当源码有语法错误时, 让 LLM 修复并验证
@@ -585,12 +869,6 @@ class RecSelfEvolveAgent:
         for round_idx in range(1, max_fix_rounds + 1):
             print(f"\n  🔁 预检修复第 {round_idx}/{max_fix_rounds} 轮")
             
-            # ── 构建当前源码上下文 ──
-            source_code_ctx = self.adapter.build_source_code_context(
-                include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
-                max_total_chars=7000,
-            )
-            
             # ── 构建错误详情 ──
             errors_detail = ""
             for err in errors:
@@ -601,32 +879,61 @@ class RecSelfEvolveAgent:
                 if err.get('text'):
                     errors_detail += f"- **出错行代码**: {err.get('text', '')[:100]}\n"
             
-            # ── 构建 PREFLIGHT_FIX_PROMPT ──
-            prompt = PREFLIGHT_FIX_PROMPT.format(
-                _preflight_errors=errors_detail,
-                _current_source_code=source_code_ctx,
-            )
+            # ── 根据 query 模式选择不同的修复流程 ──
+            if self._code_query_enabled:
+                fix_proposal = self._fix_with_query_mode(
+                    phase1_prompt_template=QUERY_BASED_PREFLIGHT_FIX_PROMPT,
+                    phase2_prompt_template=QUERY_BASED_FIX_PHASE2_PROMPT,
+                    final_prompt_template=QUERY_BASED_FIX_FINAL_PROMPT,
+                    phase1_prompt_kwargs={
+                        "_preflight_errors": errors_detail,
+                        "code_index": self._code_query_tool.build_code_index(),
+                        "queried_code": "(暂无 — 这是第一轮, 请提出你想查询的代码)",
+                        "rollback_warning": "",
+                    },
+                    phase2_extra_kwargs={
+                        "_error_type": "SyntaxError",
+                        "_error_message": errors_detail[:500],
+                    },
+                    final_extra_kwargs={
+                        "_error_type": "SyntaxError",
+                        "_error_message": errors_detail[:500],
+                    },
+                    system_prompt="你是一位 Python 语法修复专家。你可以通过代码查询工具按需获取源码详情, 然后基于精确的代码提出修复方案。修复后的代码必须语法正确, 不能有省略号或占位符。⚠ 重要: 如果你想修改代码, 请先查询要修改的代码, 确保 SEARCH/REPLACE 的 search 文本与源码完全匹配!",
+                    temperature=0.2,
+                    max_query_rounds=3,  # 语法修复通常简单, 只允许3轮查询
+                )
+            else:
+                # ── 传统模式: 塞全部源码 ──
+                source_code_ctx = self.adapter.build_source_code_context(
+                    include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
+                    max_total_chars=15000,
+                )
+                
+                prompt = PREFLIGHT_FIX_PROMPT.format(
+                    _preflight_errors=errors_detail,
+                    _current_source_code=source_code_ctx,
+                )
+                
+                response = self.llm.chat(
+                    messages=[
+                        {"role": "system", "content": (
+                            "你是一位 Python 语法修复专家。"
+                            "你需要修复模型源码中的语法错误, 确保代码可以正常运行。"
+                            "修复后的代码必须语法正确, 不能有省略号或占位符。"
+                        )},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.2,
+                    max_tokens=self.config.llm_max_tokens,
+                )
+                
+                if response is None:
+                    print(f"     ✗ LLM 调用失败")
+                    continue
+                
+                fix_proposal = self._parse_proposal_response(response)
             
-            # ── 调用 LLM ──
-            response = self.llm.chat(
-                messages=[
-                    {"role": "system", "content": (
-                        "你是一位 Python 语法修复专家。"
-                        "你需要修复模型源码中的语法错误, 确保代码可以正常运行。"
-                        "修复后的代码必须语法正确, 不能有省略号或占位符。"
-                    )},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-                max_tokens=self.config.llm_max_tokens,
-            )
-            
-            if response is None:
-                print(f"     ✗ LLM 调用失败")
-                continue
-            
-            # ── 解析修复方案 ──
-            fix_proposal = self._parse_proposal_response(response)
             if fix_proposal is None:
                 print(f"     ✗ 无法解析 LLM 修复方案")
                 continue
@@ -681,10 +988,15 @@ class RecSelfEvolveAgent:
                     errors = new_preflight["errors"]
                     # 回滚这次修复
                     self.struct_applier.rollback_last_changes()
+                    # 刷新 query 缓存 (源码已回滚)
+                    if self._code_query_enabled:
+                        self._code_query_tool.refresh_cache()
                     continue
             
             elif fix_result["status"] == "ROLLBACK":
                 print(f"     ↩ 语法修复被回滚: {fix_result.get('rollback_reason', '')[:80]}")
+                if self._code_query_enabled:
+                    self._code_query_tool.refresh_cache()
                 continue
             
             else:
@@ -982,6 +1294,7 @@ class RecSelfEvolveAgent:
         修复 CODE_ERROR: 源码中有 bug (语法错误、运行时错误、维度不匹配等)
         
         让 LLM 根据 traceback 信息直接修改源码文件, 然后重新训练验证。
+        当 enable_code_query=True 时, 使用查询模式让 LLM 按需获取出错代码。
         
         Returns:
             {
@@ -989,13 +1302,6 @@ class RecSelfEvolveAgent:
                 ...其他字段同 train_result 格式
             }
         """
-        # ── 构建源码上下文 ──
-        source_code_ctx = self.adapter.build_source_code_context(
-            include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
-            max_total_chars=7000,
-            iterative_memory=self.iter_memory,
-        )
-        
         # ── 构建 traceback 详情 ──
         tb_details = train_error.get("traceback_details", {})
         traceback_text = tb_details.get("traceback_text", "")
@@ -1020,51 +1326,114 @@ class RecSelfEvolveAgent:
         if not tb_display:
             tb_display = f"\n### 错误信息:\n```\n{train_error.get('error', '')[:1500]}\n```"
         
-        # ── 构建 CODE_FIX_PROMPT ──
-        prompt = CODE_FIX_PROMPT.format(
-            _error_type=error_type,
-            _error_category=train_error.get("error_category", "CODE_ERROR"),
-            _error_message=error_message[:2000],
-            _traceback_details=tb_display,
-            _offending_code_snippets="\n".join(offending_snippets) if offending_snippets else "(未提取到出错代码片段)",
-            _current_source_code=source_code_ctx,
-            current_hidden_size=self.adapter.base_args.get("hidden_size", 64),
-        )
-        
-        # ── 添加回滚黑名单 ──
-        rollback_warning = self.iter_memory.build_rollback_aware_context()
-        if rollback_warning:
-            prompt += rollback_warning
-        
-        # ── 调用 LLM ──
-        logger.info(f"Code fix round {round_idx}: sending traceback to LLM")
-        response = self.llm.chat(
-            messages=[
-                {"role": "system", "content": (
+        # ── 根据 query 模式选择不同的修复流程 ──
+        if self._code_query_enabled:
+            # ── 查询模式: LLM 按需获取出错代码 (核心新增!) ──
+            fix_proposal = self._fix_with_query_mode(
+                phase1_prompt_template=QUERY_BASED_FIX_PHASE1_PROMPT,
+                phase2_prompt_template=QUERY_BASED_FIX_PHASE2_PROMPT,
+                final_prompt_template=QUERY_BASED_FIX_FINAL_PROMPT,
+                phase1_prompt_kwargs={
+                    "_error_type": error_type,
+                    "_error_category": train_error.get("error_category", "CODE_ERROR"),
+                    "_error_message": error_message[:2000],
+                    "_traceback_details": tb_display,
+                    "code_index": self._code_query_tool.build_code_index(),
+                    "queried_code": "(暂无 — 这是第一轮, 请提出你想查询的代码)",
+                    "rollback_warning": self.iter_memory.build_rollback_aware_context(),
+                    "current_hidden_size": self.adapter.base_args.get("hidden_size", 64),
+                },
+                phase2_extra_kwargs={
+                    "_error_type": error_type,
+                    "_error_message": error_message[:500],
+                },
+                final_extra_kwargs={
+                    "_error_type": error_type,
+                    "_error_message": error_message[:500],
+                },
+                system_prompt=(
                     "你是一位 Python 代码调试专家，擅长从 traceback 信息中精准定位 bug 并修复。"
-                    "你需要根据 traceback 的文件名和行号定位出错的代码，然后给出修正后的完整代码。"
+                    "你可以通过代码查询工具按需获取源码详情, 然后基于精确的代码提出修复方案。"
                     "修正后的代码必须: 1)语法正确 2)维度与 hidden_size 对齐 "
                     "3)import完整 4)与现有代码兼容 5)是可执行的完整代码，无省略号。"
-                    "特别注意: 你必须根据 traceback 信息精准定位, 不要猜测!"
-                )},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,  # 代码修复用极低温度
-            max_tokens=self.config.llm_max_tokens,
-        )
-        
-        if response is None:
-            return {"action": "code_fix_failed", "error": "LLM call failed"}
-        
-        # ── 解析修复方案 ──
-        fix_proposal = self._parse_proposal_response(response)
-        if fix_proposal is None:
-            print(f"     ✗ 无法解析 LLM 代码修复方案")
-            # 尝试用 LLMFixer 修复格式
-            fixed_response = self.fixer.fix_format(response, "无法从回复中提取有效JSON")
-            fix_proposal = self._parse_proposal_response(fixed_response)
+                    "⚠ 重要: 你必须根据 traceback 信息精准定位, 不要猜测! "
+                    "如果你想修改代码, 请先查询要修改的代码, 确保 SEARCH/REPLACE 的 search 文本与源码完全匹配!"
+                ),
+                temperature=0.2,
+                max_query_rounds=3,
+            )
+            
             if fix_proposal is None:
-                return {"action": "code_fix_failed", "error": "Cannot parse fix proposal"}
+                return {"action": "code_fix_failed", "error": "Query mode LLM call failed or unparseable"}
+            
+            # 尝试用 LLMFixer 修复格式 (如果 query 模式返回的不标准)
+            if not fix_proposal.get("structural_changes") and not fix_proposal.get("param_changes"):
+                # 可能 query 模式的输出格式有小问题
+                # 检查是否有原始的顶层 "edits" 被 _parse_query_response 遗漏
+                print(f"     ⚠ Query mode returned no fixes, trying format fix...")
+                print(f"       Available keys in fix_proposal: {list(fix_proposal.keys())}")
+                # 尝试直接把整个 proposal 当作 _parse_proposal_response 解析
+                raw_response = fix_proposal.get("_raw_response", "")
+                if raw_response:
+                    print(f"       Trying _parse_proposal_response on raw response...")
+                    fallback_proposal = self._parse_proposal_response(raw_response)
+                    if fallback_proposal and (fallback_proposal.get("structural_changes") or fallback_proposal.get("param_changes")):
+                        print(f"       ✓ Fallback parse succeeded!")
+                        fix_proposal = fallback_proposal
+        
+        else:
+            # ── 传统模式: 塞全部源码 ──
+            source_code_ctx = self.adapter.build_source_code_context(
+                include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
+                max_total_chars=15000,
+                iterative_memory=self.iter_memory,
+            )
+            
+            # ── 构建 CODE_FIX_PROMPT ──
+            prompt = CODE_FIX_PROMPT.format(
+                _error_type=error_type,
+                _error_category=train_error.get("error_category", "CODE_ERROR"),
+                _error_message=error_message[:2000],
+                _traceback_details=tb_display,
+                _offending_code_snippets="\n".join(offending_snippets) if offending_snippets else "(未提取到出错代码片段)",
+                _current_source_code=source_code_ctx,
+                current_hidden_size=self.adapter.base_args.get("hidden_size", 64),
+            )
+            
+            # ── 添加回滚黑名单 ──
+            rollback_warning = self.iter_memory.build_rollback_aware_context()
+            if rollback_warning:
+                prompt += rollback_warning
+            
+            # ── 调用 LLM ──
+            logger.info(f"Code fix round {round_idx}: sending traceback to LLM")
+            response = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": (
+                        "你是一位 Python 代码调试专家，擅长从 traceback 信息中精准定位 bug 并修复。"
+                        "你需要根据 traceback 的文件名和行号定位出错的代码，然后给出修正后的完整代码。"
+                        "修正后的代码必须: 1)语法正确 2)维度与 hidden_size 对齐 "
+                        "3)import完整 4)与现有代码兼容 5)是可执行的完整代码，无省略号。"
+                        "特别注意: 你必须根据 traceback 信息精准定位, 不要猜测!"
+                    )},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,  # 代码修复用极低温度
+                max_tokens=self.config.llm_max_tokens,
+            )
+            
+            if response is None:
+                return {"action": "code_fix_failed", "error": "LLM call failed"}
+            
+            # ── 解析修复方案 ──
+            fix_proposal = self._parse_proposal_response(response)
+            if fix_proposal is None:
+                print(f"     ✗ 无法解析 LLM 代码修复方案")
+                # 尝试用 LLMFixer 修复格式
+                fixed_response = self.fixer.fix_format(response, "无法从回复中提取有效JSON")
+                fix_proposal = self._parse_proposal_response(fixed_response)
+                if fix_proposal is None:
+                    return {"action": "code_fix_failed", "error": "Cannot parse fix proposal"}
         
         structural_fixes = fix_proposal.get("structural_changes", [])
         param_fixes = fix_proposal.get("param_changes", {})
@@ -1210,60 +1579,101 @@ class RecSelfEvolveAgent:
         """
         print(f"  🏗️ 策略切换: 用 replace_class 替代 replace_function")
         
-        source_code_ctx = self.adapter.build_source_code_context(
-            include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
-            max_total_chars=7000,
-            iterative_memory=self.iter_memory,
-        )
-        
         tb_details = train_error.get("traceback_details", {})
         error_message = tb_details.get("error_message", train_error.get("error", ""))
         traceback_text = tb_details.get("traceback_text", "")
+        error_type = tb_details.get("error_type", "CODE_ERROR")
         
-        # 构建 prompt — 明确告知 LLM 输出完整的 class 定义
-        prompt = CODE_FIX_PROMPT.format(
-            _error_type=tb_details.get("error_type", "CODE_ERROR"),
-            _error_category="CODE_ERROR",
-            _error_message=error_message[:2000],
-            _traceback_details=f"\n### Traceback:\n```\n{traceback_text[:2000]}\n```",
-            _offending_code_snippets="\n".join(tb_details.get("offending_code_snippets", [])) or "(未提取到)",
-            _current_source_code=source_code_ctx,
-            current_hidden_size=self.adapter.base_args.get("hidden_size", 64),
-        )
-        
-        rollback_warning = self.iter_memory.build_rollback_aware_context()
-        if rollback_warning:
-            prompt += rollback_warning
-        
-        # 明确告知 LLM: 使用 SEARCH/REPLACE 格式, 输出完整的类定义
-        prompt += (
-            "\n\n### ⚠ 重要修改: 请使用 SEARCH/REPLACE 格式, 输出完整类定义!"
-            "\n之前的修改策略连续失败, 因为代码定位困难。"
-            "\n这次请**使用 SEARCH/REPLACE 格式**, search 部分写出原始的完整类定义代码, "
-            "\nreplace 部分写出修改后的完整类定义代码。"
-            "\n确保类定义中的所有方法都完整、语法正确、无省略号。"
-        )
-        
-        response = self.llm.chat(
-            messages=[
-                {"role": "system", "content": (
+        # ── 根据 query 模式选择不同的修复流程 ──
+        if self._code_query_enabled:
+            fix_proposal = self._fix_with_query_mode(
+                phase1_prompt_template=QUERY_BASED_FIX_PHASE1_PROMPT,
+                phase2_prompt_template=QUERY_BASED_FIX_PHASE2_PROMPT,
+                final_prompt_template=QUERY_BASED_FIX_FINAL_PROMPT,
+                phase1_prompt_kwargs={
+                    "_error_type": error_type,
+                    "_error_category": "CODE_ERROR",
+                    "_error_message": error_message[:2000],
+                    "_traceback_details": f"\n### Traceback:\n```\n{traceback_text[:2000]}\n```",
+                    "code_index": self._code_query_tool.build_code_index(),
+                    "queried_code": "(暂无 — 这是第一轮, 请提出你想查询的代码)",
+                    "rollback_warning": self.iter_memory.build_rollback_aware_context(),
+                    "current_hidden_size": self.adapter.base_args.get("hidden_size", 64),
+                },
+                phase2_extra_kwargs={
+                    "_error_type": error_type,
+                    "_error_message": error_message[:500],
+                },
+                final_extra_kwargs={
+                    "_error_type": error_type,
+                    "_error_message": error_message[:500],
+                },
+                system_prompt=(
                     "你是一位 Python 代码调试专家。"
                     "连续多轮尝试替换单个方法失败, 现在需要你输出完整的类定义代码。"
+                    "你可以通过代码查询工具按需获取源码详情, 然后基于精确的代码提出修复方案。"
                     "你必须输出包含类头 (class XXX(nn.Module):) 和所有方法的完整代码。"
                     "代码必须语法正确、维度对齐、import完整、与现有代码兼容。"
-                )},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            max_tokens=self.config.llm_max_tokens,
-        )
-        
-        if response is None:
-            return {"action": "code_fix_failed", "error": "LLM call failed"}
-        
-        fix_proposal = self._parse_proposal_response(response)
-        if fix_proposal is None:
-            return {"action": "code_fix_failed", "error": "Cannot parse fix proposal"}
+                    "⚠ 重要: 先查询你要修改的类代码, 确保 SEARCH/REPLACE 的 search 文本与源码完全匹配!"
+                ),
+                temperature=0.2,
+                max_query_rounds=3,
+            )
+            
+            if fix_proposal is None:
+                return {"action": "code_fix_failed", "error": "Query mode LLM call failed or unparseable"}
+        else:
+            # ── 传统模式: 塞全部源码 ──
+            source_code_ctx = self.adapter.build_source_code_context(
+                include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
+                max_total_chars=15000,
+                iterative_memory=self.iter_memory,
+            )
+            
+            # 构建 prompt — 明确告知 LLM 输出完整的 class 定义
+            prompt = CODE_FIX_PROMPT.format(
+                _error_type=error_type,
+                _error_category="CODE_ERROR",
+                _error_message=error_message[:2000],
+                _traceback_details=f"\n### Traceback:\n```\n{traceback_text[:2000]}\n```",
+                _offending_code_snippets="\n".join(tb_details.get("offending_code_snippets", [])) or "(未提取到)",
+                _current_source_code=source_code_ctx,
+                current_hidden_size=self.adapter.base_args.get("hidden_size", 64),
+            )
+            
+            rollback_warning = self.iter_memory.build_rollback_aware_context()
+            if rollback_warning:
+                prompt += rollback_warning
+            
+            # 明确告知 LLM: 使用 SEARCH/REPLACE 格式, 输出完整的类定义
+            prompt += (
+                "\n\n### ⚠ 重要修改: 请使用 SEARCH/REPLACE 格式, 输出完整类定义!"
+                "\n之前的修改策略连续失败, 因为代码定位困难。"
+                "\n这次请**使用 SEARCH/REPLACE 格式**, search 部分写出原始的完整类定义代码, "
+                "\nreplace 部分写出修改后的完整类定义代码。"
+                "\n确保类定义中的所有方法都完整、语法正确、无省略号。"
+            )
+            
+            response = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": (
+                        "你是一位 Python 代码调试专家。"
+                        "连续多轮尝试替换单个方法失败, 现在需要你输出完整的类定义代码。"
+                        "你必须输出包含类头 (class XXX(nn.Module):) 和所有方法的完整代码。"
+                        "代码必须语法正确、维度对齐、import完整、与现有代码兼容。"
+                    )},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=self.config.llm_max_tokens,
+            )
+            
+            if response is None:
+                return {"action": "code_fix_failed", "error": "LLM call failed"}
+            
+            fix_proposal = self._parse_proposal_response(response)
+            if fix_proposal is None:
+                return {"action": "code_fix_failed", "error": "Cannot parse fix proposal"}
         
         structural_fixes = fix_proposal.get("structural_changes", [])
         fix_explanation = fix_proposal.get("explanation", "")
@@ -1323,14 +1733,12 @@ class RecSelfEvolveAgent:
         
         当所有其他策略都失败时, 让 LLM 输出整个文件的完整代码,
         直接替换整个文件。这是最激进但也是最可靠的方式。
+        
+        当 enable_code_query=True 时, 不塞截断的全部源码, 
+        而是通过 read_file 查询获取出错文件的完整内容,
+        并允许 LLM 查询其他相关文件来辅助理解。
         """
         print(f"  📝 策略切换: 整文件重写")
-        
-        source_code_ctx = self.adapter.build_source_code_context(
-            include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
-            max_total_chars=7000,
-            iterative_memory=self.iter_memory,
-        )
         
         tb_details = train_error.get("traceback_details", {})
         error_message = tb_details.get("error_message", train_error.get("error", ""))
@@ -1349,13 +1757,35 @@ class RecSelfEvolveAgent:
                         target_file = src_key
                         break
         
-        # 读取当前文件内容
+        # ── 读取当前文件内容 ──
         file_path = self.struct_applier._resolve_file_path(target_file)
         if not file_path:
             return {"action": "code_fix_failed", "error": f"Cannot find {target_file}"}
         
-        with open(file_path, 'r', encoding='utf-8') as f:
-            current_file_content = f.read()
+        if self._code_query_enabled:
+            # 查询模式: 通过 query 工具获取完整文件内容 (不受截断!)
+            # 同时自动查询其他相关文件来辅助 LLM 理解上下文
+            current_file_content = self._code_query_tool.read_file(target_file)
+            if not current_file_content:
+                # fallback: 直接文件读取
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    current_file_content = f.read()
+            
+            # 构建轻量索引, 供 LLM 查看其他文件的结构
+            code_index = self._code_query_tool.build_code_index()
+            # 在 prompt 中包含索引, 让 LLM 可以决定是否需要查询其他文件
+            other_files_hint = f"\n## 其他源码文件索引 (你可以查询任何文件来理解上下文)\n{code_index}\n"
+        else:
+            # 传统模式: 直接读取 + 塞截断的全部源码 (虽然有 current_file_content 但还塞了截断版本)
+            with open(file_path, 'r', encoding='utf-8') as f:
+                current_file_content = f.read()
+            other_files_hint = ""
+            # 传统模式塞全部源码作额外上下文 (虽然主要用 current_file_content)
+            source_code_ctx = self.adapter.build_source_code_context(
+                include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
+                max_total_chars=15000,
+                iterative_memory=self.iter_memory,
+            )
         
         prompt = (
             f"训练运行失败, 错误来自**{target_file}**中的代码 bug。\n"
@@ -1364,6 +1794,7 @@ class RecSelfEvolveAgent:
             f"## 错误信息\n```\n{error_message[:1500]}\n```\n\n"
             f"## Traceback\n```\n{traceback_text[:2000]}\n```\n\n"
             f"## 当前 {target_file} 的内容\n```python\n{current_file_content}\n```\n\n"
+            f"{other_files_hint}"
             f"## 修复要求\n"
             f"输出 {target_file} 的**完整代码** (不能有任何省略号)。\n"
             f"修复上述错误, 但保持所有其他类/函数不变。\n"
@@ -1747,7 +2178,7 @@ class RecSelfEvolveAgent:
             # 获取模型源码摘要供案例分析使用
             source_summary = self.adapter.build_source_code_context(
                 include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
-                max_total_chars=5000,
+                max_total_chars=15000,
             )
             case_analysis = self.case_analyzer.analyze_wrong_cases(
                 text_cases=wrong_text_cases,
@@ -1891,7 +2322,7 @@ class RecSelfEvolveAgent:
         # 不再使用旧的截断方式，而是让 IterativeMemory 优先展示修改区域
         source_code_ctx = self.adapter.build_source_code_context(
             include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
-            max_total_chars=6500,
+            max_total_chars=15000,
             iterative_memory=self.iter_memory,  # 传入 IterativeMemory → 智能截断!
         )
 
@@ -2010,6 +2441,348 @@ class RecSelfEvolveAgent:
         return self._parse_proposal_response(response)
 
     # ════════════════════════════════════════
+    # 代码查询模式: LLM 按需获取代码, 而不是塞全部源码
+    # ════════════════════════════════════════
+
+    def _phase_query_based_analyze_and_propose(self, metrics: dict) -> Optional[dict]:
+        """
+        查询模式分析 — LLM 按需获取代码, 替代塞全部源码
+        
+        工作流程:
+        1. 构建轻量索引 (文件名 + 类/函数签名, 通常 2000-4000 字符)
+        2. 第一轮 LLM: 收到索引 + 指标 → 输出查询请求或直接提案
+        3. 执行查询 → 返回精确代码片段
+        4. 第二轮 LLM: 收到查询结果 → 继续查询或输出提案
+        5. 循环 2-4, 最多 max_query_rounds 轮
+        6. 最后强制输出提案
+        
+        核心优势:
+        - 无截断! LLM 看到的是**精确**的代码, 不是截断后的残缺代码
+        - SEARCH/REPLACE 的 search 文本一定能匹配源码
+        - 索引只占 2000-4000 字符, 留出更多空间给指标和历史
+        
+        Returns:
+            Dict: 同 _phase_analyze_and_propose 的格式
+        """
+        print(f"  🔍 [Query Mode] LLM 将按需查询代码...")
+        
+        # ── 构建轻量索引 ──
+        code_index = self._code_query_tool.build_code_index()
+        print(f"  📇 Code index built: {len(code_index)} chars")
+        
+        # ── 构建项目上下文 (不含全部源码!) ──
+        project_ctx = self.adapter.build_llm_context()
+        
+        # ── 构建历史摘要 ──
+        journal_summary = self.journal.summarize(n=8)
+        if self.config.llm_enable_semantic_compression:
+            journal_summary = self.context_compressor.compress_text(
+                journal_summary,
+                chunk_chars=self.config.llm_compression_chunk_chars,
+                target_chars=self.config.llm_compression_target_chars,
+                section_name="journal_summary",
+                profile="journal",
+            )
+        journal_summary = self._clip_text_by_chars(journal_summary, max_chars=4500)
+        
+        # ── 构建结构修改历史 ──
+        structural_history = self.iter_memory.build_history_context_for_llm(
+            current_iteration=self.current_iteration,
+            current_metrics=metrics,
+        )
+        if self.config.llm_enable_semantic_compression:
+            structural_history = self.context_compressor.compress_text(
+                structural_history,
+                chunk_chars=self.config.llm_compression_chunk_chars,
+                target_chars=max(4200, self.config.llm_compression_target_chars),
+                section_name="structural_history",
+                profile="history",
+            )
+        structural_history = self._clip_text_by_chars(structural_history, max_chars=6000)
+        
+        # ── 构建回滚黑名单 ──
+        rollback_warning = self.iter_memory.build_rollback_aware_context()
+        
+        # ── 构建惊喜评估和案例分析信息 ──
+        surprise_info = ""
+        if self._last_surprise_report:
+            surprise_info = f"""
+## 惊喜评估结果
+```json
+{json.dumps(self._last_surprise_report.get("evaluation_report_summary", {}), indent=2, ensure_ascii=False)}
+```
+"""
+        
+        case_info = ""
+        if self._last_case_analysis:
+            ca = self._last_case_analysis
+            if ca.get("parse_success"):
+                case_info = f"""
+## LLM 对错误案例的分析结论
+- **错误模式**: {json.dumps(ca.get("error_patterns", {}), ensure_ascii=False)}
+- **模型瓶颈**: {json.dumps(ca.get("model_bottleneck", {}), ensure_ascii=False)}
+- **改进建议**: {json.dumps(ca.get("improvement_suggestions", []), ensure_ascii=False)[:800]}
+"""
+        
+        # ── 累积查询结果 ──
+        all_queried_code = ""
+        observation_summary = ""
+        reasoning_summary = ""
+        
+        # ── 多轮查询循环 ──
+        max_rounds = self.config.max_query_rounds
+        
+        for round_idx in range(max_rounds):
+            print(f"  🔍 [Query Round {round_idx + 1}/{max_rounds}]")
+            
+            # 构建当前轮的 prompt
+            if round_idx == 0:
+                # 第一轮: 使用 Phase1 prompt
+                prompt = QUERY_BASED_PHASE1_PROMPT.format(
+                    project_context=project_ctx,
+                    current_metrics=json.dumps(metrics, indent=2, ensure_ascii=False),
+                    experiment_journal=journal_summary,
+                    code_index=code_index,
+                    queried_code="(暂无 — 这是第一轮, 请提出你想查询的代码)",
+                    structural_history=structural_history,
+                    rollback_warning=rollback_warning,
+                    surprise_info=surprise_info + case_info,
+                    current_hidden_size=self.adapter.base_args.get("hidden_size", 64),
+                )
+            else:
+                # 后续轮: 使用 Phase2 prompt
+                prompt = QUERY_BASED_PHASE2_PROMPT.format(
+                    query_results=query_results_this_round,
+                    previous_observation=observation_summary,
+                    previous_analysis_direction=analysis_direction or "待确认",
+                    current_metrics=json.dumps(metrics, indent=2, ensure_ascii=False),
+                )
+            
+            # 添加策略指令
+            strategy_instruction = self._get_strategy_instruction()
+            if strategy_instruction:
+                prompt += f"\n\n## 当前探索策略\n{strategy_instruction}"
+            
+            # 调用 LLM
+            response = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": (
+                        "你是一位推荐系统算法研究员。"
+                        "你可以通过代码查询工具按需获取源码详情, 然后基于精确的代码提出改进方案。"
+                        "⚠ 重要: 如果你想修改代码, 请先查询要修改的代码, 确保 SEARCH/REPLACE 的 search 文本与源码完全匹配!"
+                    )},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=self._get_temperature(),
+                max_tokens=self.config.llm_max_tokens,
+            )
+            
+            if response is None:
+                logger.error(f"Query round {round_idx + 1} failed - no LLM response")
+                if round_idx == 0:
+                    # 第一轮就失败 → 降级回传统流程
+                    print(f"  ⚠ Query mode failed, falling back to traditional mode")
+                    return self._phase_analyze_and_propose(metrics)
+                break
+            
+            # ── 解析 LLM 回复 ──
+            parsed = self._parse_query_response(response)
+            
+            if parsed is None:
+                # 解析失败 → 降级
+                print(f"  ⚠ Query response parse failed at round {round_idx + 1}")
+                # 尝试直接作为提案解析
+                proposal = self._parse_proposal_response(response)
+                if proposal:
+                    print(f"  ✓ Parsed as proposal directly")
+                    return proposal
+                if round_idx == 0:
+                    return self._phase_analyze_and_propose(metrics)
+                break
+            
+            phase = parsed.get("phase", "")
+            
+            # ── 记录观察和分析 ──
+            observation_summary = parsed.get("observation", observation_summary)
+            reasoning_summary = parsed.get("reasoning", reasoning_summary)
+            analysis_direction = parsed.get("analysis_direction", "")
+            
+            if phase == "proposal":
+                # ── LLM 已经做出提案! ──
+                print(f"  ✓ [Query Mode] LLM produced proposal after {round_idx + 1} round(s)")
+                print(f"    Observation: {observation_summary[:120]}")
+                
+                # 将查询模式的回复转换为标准提案格式
+                return {
+                    "param_changes": parsed.get("param_changes", {}),
+                    "structural_changes": parsed.get("structural_changes", []),
+                    "explanation": parsed.get("rationale", "") or reasoning_summary,
+                    "analysis": observation_summary + "\n" + reasoning_summary,
+                    "_query_mode_used": True,
+                    "_query_rounds": round_idx + 1,
+                    "_queried_code_chars": len(all_queried_code),
+                }
+            
+            elif phase == "query":
+                # ── LLM 提出查询请求 ──
+                queries = parsed.get("queries", [])
+                if not queries:
+                    print(f"  ⚠ No queries in response, forcing proposal")
+                    continue  # 下一轮强制
+                
+                print(f"  🔎 LLM queries: {len(queries)} requests")
+                for q in queries:
+                    action = q.get("action", "?")
+                    args = q.get("args", {})
+                    print(f"    → {action}({args})")
+                
+                # ── 执行查询 ──
+                query_results_this_round = self._code_query_tool.execute_queries(queries)
+                
+                # 限制单次查询结果大小
+                max_chars = self.config.code_query_max_chars_per_result
+                if len(query_results_this_round) > max_chars:
+                    query_results_this_round = query_results_this_round[:max_chars] + \
+                        f"\n\n⚠ 查询结果超过 {max_chars} 字符, 已截断。如需更多细节, 请使用 get_region 获取具体行范围。"
+                
+                all_queried_code += "\n\n" + query_results_this_round
+                
+                # 刷新缓存 (源码可能已被修改)
+                self._code_query_tool.refresh_cache()
+                
+                print(f"    Results: {len(query_results_this_round)} chars returned")
+            
+            else:
+                # 未知 phase → 降级
+                print(f"  ⚠ Unknown phase '{phase}' in query response")
+                proposal = self._parse_proposal_response(response)
+                if proposal:
+                    return proposal
+                continue
+        
+        # ── 达到最大查询轮数 → 强制输出最终提案 ──
+        print(f"  📝 [Query Mode] Max rounds reached, forcing final proposal")
+        
+        final_prompt = QUERY_BASED_FINAL_PROMPT.format(
+            all_queried_code=all_queried_code if all_queried_code else "(未查询任何代码)",
+            current_metrics=json.dumps(metrics, indent=2, ensure_ascii=False),
+            observation_summary=observation_summary,
+            reasoning_summary=reasoning_summary,
+            current_hidden_size=self.adapter.base_args.get("hidden_size", 64),
+        )
+        
+        # 添加策略指令
+        strategy_instruction = self._get_strategy_instruction()
+        if strategy_instruction:
+            final_prompt += f"\n\n## 当前探索策略\n{strategy_instruction}"
+        
+        final_response = self.llm.chat(
+            messages=[
+                {"role": "system", "content": (
+                    "你是一位推荐系统算法研究员。"
+                    "你已通过多轮查询获取了精确的源码, 现在必须输出最终的改进方案。"
+                    "⚠ SEARCH/REPLACE 的 search 文本必须与你查询到的代码完全匹配!"
+                )},
+                {"role": "user", "content": final_prompt},
+            ],
+            temperature=self._get_temperature(),
+            max_tokens=self.config.llm_max_tokens,
+        )
+        
+        if final_response is None:
+            logger.error("Final query-based proposal failed")
+            return self._phase_analyze_and_propose(metrics)  # 降级
+        
+        return self._parse_proposal_response(final_response)
+
+    def _parse_query_response(self, response: str) -> Optional[dict]:
+        """解析 LLM 在查询模式中的回复 (可能是查询请求或提案)
+        
+        兼容 LLM 输出的多种 proposal 格式:
+        1. 标准格式: {"phase": "proposal", "structural_changes": [...], "param_changes": {...}}
+        2. 扁平格式: {"phase": "proposal", "edits": [{"filename": "...", "action": "modify", "search": "...", "replace": "..."}]}
+           (LLM 直接把 edits 放在顶层, 而不是嵌套在 structural_changes 里)
+        3. 混合格式: {"phase": "proposal", "edits": [...], "structural_changes": [...]}
+        
+        统一转换为标准格式 (structural_changes + param_changes)
+        """
+        # 提取 JSON
+        import re as regex_module
+        json_match = regex_module.search(
+            r'```(?:json)?\s*\n?(.*?)\n?```', response, regex_module.DOTALL
+        )
+        if json_match:
+            json_str = json_match.group(1)
+        else:
+            start = response.find('{')
+            end = response.rfind('}')
+            if start >= 0 and end > start:
+                json_str = response[start:end + 1]
+            else:
+                return None
+        
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError:
+            try:
+                data = ast.literal_eval(json_str)
+                if not isinstance(data, dict):
+                    return None
+            except Exception:
+                return None
+        
+        # ── 格式转换: 顶层 "edits" → "structural_changes" ──
+        # LLM 有时会输出 {"phase": "proposal", "edits": [...]},
+        # 但下游代码期望 {"structural_changes": [{"edits": [...]}]} 格式
+        if "edits" in data and "structural_changes" not in data:
+            top_level_edits = data.pop("edits")
+            if isinstance(top_level_edits, list) and top_level_edits:
+                # 将每个 edit 转换为 structural_changes 条目
+                # LLM 扁平格式的 edit 通常包含 "file"/"instruction" + "search"/"replace"
+                structural_entries = []
+                for edit in top_level_edits:
+                    if isinstance(edit, dict):
+                        # 提取 target_file (可能是 "file" 或 "filename" 或 "target_file")
+                        target_file = edit.get("file", edit.get("filename", edit.get("target_file", "")))
+                        instruction = edit.get("instruction", edit.get("description", ""))
+                        search_text = edit.get("search", "")
+                        replace_text = edit.get("replace", "")
+                        action = edit.get("action", edit.get("action_type", "modify"))
+                        
+                        if search_text or replace_text:
+                            entry = {
+                                "target_file": target_file,
+                                "description": instruction,
+                                "edits": [{"search": search_text, "replace": replace_text}],
+                            }
+                            # 保留其他有用字段
+                            for key in ["expected_effect", "confidence"]:
+                                if key in edit:
+                                    entry[key] = edit[key]
+                            # action / action_type → action_type
+                            entry["action_type"] = action
+                            structural_entries.append(entry)
+                
+                if structural_entries:
+                    data["structural_changes"] = structural_entries
+                    logger.info(f"Normalized top-level 'edits' ({len(top_level_edits)} items) "
+                                f"→ 'structural_changes' ({len(structural_entries)} entries)")
+        
+        # 检查是否包含 "phase" 字段
+        if "phase" not in data:
+            # 可能是直接提案格式 (没有 phase 字段)
+            # 如果有 structural_changes 或 param_changes → 视为提案
+            if "structural_changes" in data or "param_changes" in data:
+                data["phase"] = "proposal"
+            elif "queries" in data:
+                data["phase"] = "query"
+            else:
+                # 无法判断 → 假设是提案
+                data["phase"] = "proposal"
+        
+        return data
+
+    # ════════════════════════════════════════
     # 多角色工作流: Planner → Researcher → Coder → Debugger
     # ════════════════════════════════════════
 
@@ -2044,7 +2817,7 @@ class RecSelfEvolveAgent:
         # 使用与 _phase_analyze_and_propose 一致的源码上下文构建方式
         source_code_ctx = self.adapter.build_source_code_context(
             include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
-            max_total_chars=6500,
+            max_total_chars=15000,
             iterative_memory=self.iter_memory,
         )
         project_ctx = self.adapter.format_metrics_for_llm(metrics)
@@ -2626,11 +3399,91 @@ class RecSelfEvolveAgent:
                 valid_changes[key] = value
         return valid_changes
 
+    @staticmethod
+    def _clean_markdown_wrapper(text: str) -> str:
+        """
+        只清理 markdown 代码块标记 (```python ... ```) 和多余空白,
+        不做"移除解释性前缀"处理 — 这是 SEARCH/REPLACE 格式的安全清理.
+
+        与 clean_new_code 的区别:
+        - clean_new_code 会删除不以 def/class/import 开头的行 (如 parser.add_argument)
+        - _clean_markdown_wrapper 只去掉 markdown 包裹, 保留所有代码内容
+        """
+        if not text:
+            return text
+        # 移除 markdown 代码块标记
+        text = re.sub(r'^```(?:python)?\s*\n?', '', text)
+        text = re.sub(r'\n?```\s*$', '', text)
+        # 去除首尾多余空行 (但保留代码内部的空行!)
+        lines = text.split('\n')
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return '\n'.join(lines)
+
+    def _normalize_change_format(self, change: dict) -> Optional[dict]:
+        """
+        修复 Bug C: 格式兼容性 — 自动检测并转换 LLM 输出的多种格式
+        
+        支持的输入格式:
+        1. 标准格式: {"target_file": "x.py", "edits": [{"search": "...", "replace": "..."}]}
+        2. 扁平格式: {"filename": "x.py", "action": "modify", "search": "...", "replace": "..."}
+           (缺少 edits 包裹, search/replace 在顶层)
+        3. 混合格式: {"target_file": "x.py", "search": "...", "replace": "..."}
+           (有 target_file 但缺少 edits 包裹)
+        
+        输出统一为标准格式.
+        """
+        # 格式1: 标准格式 (已有 target_file + edits) → 直接返回
+        if change.get("target_file") and change.get("edits"):
+            return change
+        
+        # 格式2: 扁平格式 (filename + action + search/replace)
+        if not change.get("target_file") and change.get("filename"):
+            change["target_file"] = change.pop("filename")
+            # 扁平 search/replace → 转为 edits 数组
+            if "search" in change or "replace" in change:
+                search_text = change.pop("search", "")
+                replace_text = change.pop("replace", "")
+                action = change.pop("action", "modify")
+                change["edits"] = [{"search": search_text, "replace": replace_text}]
+                change["action_type"] = action
+                # 删除不属于标准格式的多余字段
+                for key in ["action"]:
+                    change.pop(key, None)
+            logger.info(f"Format normalized: filename→target_file, flat→edits for {change.get('target_file')}")
+            return change
+        
+        # 格式3: 有 target_file 但 search/replace 在顶层 (缺少 edits 包裹)
+        if change.get("target_file") and ("search" in change or "replace" in change):
+            search_text = change.pop("search", "")
+            replace_text = change.pop("replace", "")
+            change["edits"] = [{"search": search_text, "replace": replace_text}]
+            logger.info(f"Format normalized: flat search/replace→edits for {change.get('target_file')}")
+            return change
+        
+        # 无法识别的格式
+        if not change.get("target_file") and not change.get("filename"):
+            logger.warning(f"Cannot normalize change format: missing both target_file and filename. "
+                          f"Available keys: {list(change.keys())}")
+            return None
+        
+        return change
+
     def _validate_structural_changes(self, structural_changes: list) -> list:
         """验证结构修改列表 — 支持 edits (SEARCH/REPLACE) 和 new_code (旧格式) 两种输入"""
         valid_changes = []
         for change in structural_changes:
-            # target_file: 允许任何项目中存在的 .py 文件
+            # ── 修复 Bug C: 格式兼容 — 支持 filename/action 扁平格式 ──
+            # LLM 可能输出多种格式:
+            #   标准: {"target_file": "x.py", "edits": [{"search": "...", "replace": "..."}]}
+            #   扁平: {"filename": "x.py", "action": "modify", "search": "...", "replace": "..."}
+            #   混合: {"target_file": "x.py", "search": "...", "replace": "..."} (缺少 edits 包裹)
+            change = self._normalize_change_format(change)
+            if not change:
+                continue
+            
             target_file = change.get("target_file", "")
             if not target_file:
                 logger.warning(f"Structural change missing target_file: {change.get('description', '?')}")
@@ -2656,10 +3509,12 @@ class RecSelfEvolveAgent:
                     if not replace:
                         logger.warning(f"Edit missing replace text, skipping")
                         continue
-                    # 清理 markdown 包裹
-                    if search:
-                        search = StructureApplier.clean_new_code(search)
-                    replace = StructureApplier.clean_new_code(replace)
+                    # ── 修复 Bug A: 不再使用 clean_new_code 处理 search/replace ──
+                    # clean_new_code 的"移除解释性前缀"逻辑会删除不以 def/class/import 开头的行,
+                    # 导致 parser.add_argument 等代码被清空 → 所有匹配必然失败!
+                    # SEARCH/REPLACE 格式本身就是纯代码, 只需清理 markdown 包裹即可.
+                    search = self._clean_markdown_wrapper(search)
+                    replace = self._clean_markdown_wrapper(replace)
                     valid_edits.append({"search": search, "replace": replace})
                 
                 if valid_edits:
@@ -2883,7 +3738,7 @@ class RecSelfEvolveAgent:
             # ── 1. 构建当前源码上下文 ──
             source_code_ctx = self.adapter.build_source_code_context(
                 include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
-                max_total_chars=6500,
+                max_total_chars=15000,
                 iterative_memory=self.iter_memory,
             )
             
@@ -3157,7 +4012,7 @@ class RecSelfEvolveAgent:
             # ── 1. 构建当前源码上下文 ──
             source_code_ctx = self.adapter.build_source_code_context(
                 include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
-                max_total_chars=6500,
+                max_total_chars=15000,
                 iterative_memory=self.iter_memory,
             )
             

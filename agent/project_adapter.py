@@ -623,7 +623,7 @@ Batch Size: {args.get('batch_size', '?')}
         return None
 
     def build_source_code_context(self, include_files: list = None,
-                                  max_total_chars: int = 8000,
+                                  max_total_chars: int = 15000,
                                   iterative_memory=None) -> str:
         """
         构建模型源码的上下文，让 LLM 能看到当前代码并提出修改

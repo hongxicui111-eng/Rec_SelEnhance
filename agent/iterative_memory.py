@@ -492,15 +492,19 @@ class IterativeMemory:
     # ════════════════════════════════════════
 
     def build_smart_source_context(self, include_files: List[str] = None,
-                                   max_total_chars: int = 8000) -> str:
+                                   max_total_chars: int = 15000) -> str:
         """
-        构建智能源码上下文 — 不再盲目截断
+        构建智能源码上下文 — 确保 SEARCH/REPLACE 可用
         
-        策略:
-        1. 如果文件未被修改过 → 只展示关键类/函数定义的签名 (省空间)
-        2. 如果文件被修改过 → 展示修改区域的完整代码 + 其上下文
-        3. 优先展示当前轮次被 LLM 修改过的区域
-        4. 总长度不超过 max_total_chars
+        ⚠ 核心设计原则: LLM 生成 SEARCH/REPLACE 编辑时需要看到精确的源码文本!
+        截断或总结化的源码会导致 LLM 无法生成匹配的 search 文本, 从而编辑失败。
+        
+        策略 (v2 — SEARCH/REPLACE 兼容):
+        1. 训练脚本 (run_*.py) 和 argparse 文件 → 必须完整展示, 不截断
+        2. 最近修改过的文件 → 展示修改区域 + 其上下文
+        3. 核心模型文件 (models.py, modules.py) → 完整展示 (不超过限制)
+        4. 其他文件 → 完整展示优先, 如果超过限制才签名化
+        5. 总长度不超过 max_total_chars
         
         Args:
             include_files: 要包含的文件列表
@@ -513,47 +517,166 @@ class IterativeMemory:
         parts = []
         remaining_chars = max_total_chars
         
-        # 优先级排序: 最近修改过的文件优先
-        priority_files = self._sort_files_by_modification_priority(include_files)
+        # ── 优先级排序 (v2): 不可截断的文件优先 ──
+        # 训练脚本和 argparse 文件必须完整展示, 否则 LLM 无法生成精确的 SEARCH/REPLACE
+        priority_files = self._sort_files_by_display_priority(include_files)
+        
+        # ── 两阶段分配策略 ──
+        # Phase 1: 完整展示不可截断的文件 (训练脚本 + argparse + 最近修改的)
+        # Phase 2: 完整展示其他文件 (如果空间够) 或签名化展示
+        
+        shown_files = []
+        omitted_files = []
         
         for file_key in priority_files:
-            if remaining_chars <= 200:
-                break
-            
             content = self._get_current_source(file_key)
             if not content:
                 continue
             
+            # 判断文件类型: 是否是不可截断的
+            is_indispensable = self._is_indispensable_file(file_key, content)
+            
             # 判断文件是否被修改过
             is_modified, modified_regions = self._detect_modified_regions(file_key)
             
-            if is_modified and modified_regions:
-                # 文件被修改过 → 展示修改区域 + 上下文
+            if is_indispensable:
+                # ── 不可截断文件: 必须完整展示 ──
+                # 训练脚本 (run_*.py)、包含 argparse 的文件 — LLM 必须
+                # 看到精确文本才能生成有效的 SEARCH/REPLACE
+                needed_chars = len(content) + 200  # markdown 包裹开销
+                if needed_chars <= remaining_chars:
+                    file_section = f"### 文件: {file_key} (完整展示 — 不可截断)\n```python\n{content}\n```\n\n"
+                    parts.append(file_section)
+                    remaining_chars -= len(file_section)
+                    shown_files.append(file_key)
+                else:
+                    # 空间不够 — 仍然完整展示, 但警告 LLM
+                    logger.warning(f"Indispensable file {file_key} ({len(content)} chars) "
+                                   f"exceeds remaining budget ({remaining_chars} chars)")
+                    file_section = f"### 文件: {file_key} (完整展示 — ⚠ 超出预算但仍展示)\n```python\n{content}\n```\n\n"
+                    parts.append(file_section)
+                    remaining_chars = max(0, remaining_chars - len(file_section))
+                    shown_files.append(file_key)
+            elif is_modified and modified_regions:
+                # ── 已修改文件: 展示修改区域 ──
                 file_section = self._build_modified_file_context(
                     file_key, content, modified_regions, remaining_chars
                 )
+                parts.append(file_section)
+                remaining_chars -= len(file_section)
+                shown_files.append(file_key)
             else:
-                # 文件未被修改过 → 展示完整代码 (如果不超过限制)
+                # ── 其他文件: 完整展示优先 ──
                 if len(content) <= remaining_chars - 200:
                     file_section = f"### 文件: {file_key} (原始版本，未修改)\n```python\n{content}\n```\n\n"
+                    parts.append(file_section)
+                    remaining_chars -= len(file_section)
+                    shown_files.append(file_key)
                 else:
-                    # 文件太长且未修改 → 展示关键定义签名 + 部分代码
+                    # 文件太长 → 签名化展示
                     file_section = self._build_unmodified_file_summary(
                         file_key, content, remaining_chars
                     )
-            
-            parts.append(file_section)
-            remaining_chars -= len(file_section)
+                    if file_section:
+                        parts.append(file_section)
+                        remaining_chars -= len(file_section)
+                        shown_files.append(file_key)
+                    else:
+                        omitted_files.append(file_key)
         
-        if remaining_chars <= 200 and priority_files:
-            # 空间不够了，至少告诉 LLM 还有其他文件
-            omitted = [f for f in priority_files if f not in [p.split("文件: ")[1].split(" ")[0] 
-                        for p in parts if "文件: " in p]]
-            if omitted:
-                parts.append(f"\n⚠ 以下文件因空间限制未完整展示: {', '.join(omitted)}\n")
-                parts.append("它们的完整内容可在上一轮的修改记录中查看。\n")
+        # ── 添加 SEARCH/REPLACE 使用提示 ──
+        parts.append(
+            "\n⚠ **SEARCH/REPLACE 编辑注意**: 你的 edits 中的 search 文本必须与上面展示的源码"
+            "**完全精确匹配** (包括空格、引号、换行)。不要猜测或凭记忆编写 search 文本 — "
+            "直接复制上面展示的源码内容作为 search 文本!\n"
+        )
+        
+        # ── 被省略的文件列表 ──
+        omitted = [f for f in priority_files if f not in shown_files]
+        if omitted:
+            parts.append(f"\n⚠ 以下文件因空间限制未完整展示: {', '.join(omitted)}\n")
+            parts.append("如需修改这些文件，请先请求系统展示其完整内容。\n")
         
         return "\n".join(parts)
+
+    def _is_indispensable_file(self, file_key: str, content: str) -> bool:
+        """
+        判断文件是否不可截断 — 必须完整展示
+        
+        不可截断的文件类型:
+        1. 训练脚本 (run_*.py) — LLM 需要精确的 argparse 定义
+        2. 包含 parser.add_argument 的文件 — LLM 需要精确的参数定义文本
+        3. 短文件 (< 500 chars) — 截断不如完整展示
+        
+        Args:
+            file_key: 文件标识
+            content: 文件内容
+        
+        Returns:
+            bool: True = 不可截断, 必须完整展示
+        """
+        # 训练脚本
+        if file_key.startswith("run_") or "train" in file_key.lower():
+            return True
+        
+        # 包含 argparse 的文件
+        if "parser.add_argument" in content or "ArgumentParser" in content:
+            return True
+        
+        # 短文件 (< 500 chars) — 完整展示更高效
+        if len(content) < 500:
+            return True
+        
+        return False
+
+    def _sort_files_by_display_priority(self, files: List[str]) -> List[str]:
+        """
+        按展示优先级排序文件 (v2 — 不可截断文件优先)
+        
+        优先级:
+        1. 不可截断文件 (训练脚本 + argparse) — 必须完整展示
+        2. 最近修改过的文件 — 需要展示修改区域
+        3. 核心模型文件 (models.py, modules.py, trainers.py)
+        4. 其他文件
+        """
+        # 计算每个文件的优先级分数
+        scored_files = []
+        for file_key in files:
+            content = self._get_current_source(file_key)
+            if not content:
+                scored_files.append((file_key, 0))
+                continue
+            
+            score = 0
+            
+            # 不可截断文件 → 最高优先级
+            if self._is_indispensable_file(file_key, content):
+                score += 100
+            
+            # 最近修改过的文件 → 高优先级
+            last_modified_iter = -1
+            for record in reversed(self.modification_records):
+                if record.get("rolled_back"):
+                    continue
+                for sc in record.get("structural_changes", []):
+                    if sc.get("target_file") == file_key:
+                        last_modified_iter = max(last_modified_iter, record["iteration"])
+                        break
+            score += last_modified_iter + 1  # +1 so unmodified gets 0
+            
+            # 核心模型文件 → 中等优先级
+            core_files = {"models.py": 10, "modules.py": 9, "trainers.py": 8}
+            score += core_files.get(file_key, 0)
+            
+            # 短文件 → 优先展示 (性价比高)
+            if content and len(content) < 1000:
+                score += 5
+            
+            scored_files.append((file_key, score))
+        
+        # 按分数降序排序
+        scored_files.sort(key=lambda x: x[1], reverse=True)
+        return [f[0] for f in scored_files]
 
     # ════════════════════════════════════════
     # 内部辅助方法

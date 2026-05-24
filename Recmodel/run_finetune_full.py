@@ -63,10 +63,8 @@ def main():
     parser.add_argument("--CL_type", type=str, default="Radical", help="Radical, Gentle")
     parser.add_argument("--start_epoch", default=30, type=int)
     parser.add_argument("--K", default=0.05, type=float)
-
-
-
-
+    parser.add_argument("--tau", type=float, default=0.1, help="Temperature coefficient for contrastive loss")
+    parser.add_argument("--margin", type=float, default=1.0, help="Margin for triplet or hinge-based loss")
     args = parser.parse_args()
 
     set_seed(args.seed)
