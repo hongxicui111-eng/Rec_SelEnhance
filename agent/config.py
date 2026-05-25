@@ -1,5 +1,5 @@
 """
-Agent 配置管理 — 增加项目特定参数
+Agent 配置管理
 """
 from dataclasses import dataclass, field
 from typing import Optional
@@ -17,28 +17,11 @@ class AgentConfig:
     llm_max_retries: int = 3
     llm_temperature: float = 0.7
     llm_max_tokens: int = 8192
-    # LLM 上下文控制：防止 prompt 过长导致 context overflow
-    llm_max_context_tokens: int = 32768
-    llm_prompt_safety_ratio: float = 0.75
-    # LLM 语义压缩配置
-    llm_enable_semantic_compression: bool = True
-    llm_compression_chunk_chars: int = 5000
-    llm_compression_target_chars: int = 3500
-    llm_compression_enable_cache: bool = True
-    llm_compression_cache_ttl_seconds: int = 86400
-    llm_compression_cache_path: str = "logs/context_compression_cache.json"
 
     # ---- 项目路径 ----
     project_root: str = "/path/to/your/rec_project"
-
-    # ---- 项目特定配置 ----
-    # 这些是 run_finetune_full.py 特有的参数
-    data_name: str = "Beauty"           # 数据集
-    backbone: str = "SASRec"            # 默认模型
-    gpu_id: str = "0"                   # GPU ID
-    script_name: str = "run_finetune_full.py"  # 训练脚本
-    output_dir: str = "output"          # 输出目录
-    extra_args: dict = field(default_factory=dict)  # 其他固定参数
+    train_script: str = "train.py"
+    eval_script: str = "eval.py"
 
     # ---- 训练容错 ----
     train_timeout: int = 7200  # 秒
@@ -56,13 +39,15 @@ class AgentConfig:
 
     # ---- 安全护栏 ----
     metric_guardrails: dict = field(default_factory=lambda: {
-        "NDCG@10": {"min": 0.0, "max": 1.0, "regression_limit": 0.05},
-        "R@10": {"min": 0.0, "max": 1.0, "regression_limit": 0.05},
+        "ndcg@5": {"min": 0.0, "max": 1.0, "regression_limit": 0.05},
     })
 
     # ---- 日志 ----
     log_dir: str = "logs"
     journal_file: str = "experiment_journal.jsonl"
+
+    # ---- 多角色工作流 ----
+    enable_multi_role_workflow: bool = False  # 启用 Planner→Researcher→Coder→Debugger 多角色工作流
 
     # ---- 惊喜评估配置 ----
     item_text_map_path: str = ""  # 物品 ID → 文本描述映射文件路径
@@ -70,20 +55,3 @@ class AgentConfig:
     num_wrong_case_samples: int = 500  # 提取的错误案例数量
     num_train_subset: int = 500  # 训练子集评估的用户数量
     surprise_threshold: float = 0.5  # 惊喜度阈值 (≥ 此值为"惊喜"交互)
-
-    # ---- 多角色工作流配置 ----
-    enable_multi_role_workflow: bool = False  # 是否启用 Planner→Researcher→Coder→Debugger 多角色工作流
-    planner_model: str = ""       # Planner 使用的模型 (空则使用 llm_model)
-    researcher_model: str = ""    # Researcher 使用的模型
-    coder_model: str = ""         # Coder 使用的模型
-    debugger_model: str = ""      # Debugger 使用的模型
-    planner_temperature: float = 0.7   # Planner 温度
-    researcher_temperature: float = 0.7  # Researcher 温度
-    coder_temperature: float = 0.4      # Coder 温度
-    debugger_temperature: float = 0.2   # Debugger 温度
-    max_reflection_rounds: int = 3      # 最大反思轮次
-
-    # ---- 代码查询模式配置 (核心新增!) ----
-    enable_code_query: bool = True       # 是否启用查询模式 (替代塞全部源码+截断)
-    max_query_rounds: int = 5            # 最大查询轮数 (LLM 可查询几次后再出提案)
-    code_query_max_chars_per_result: int = 8000  # 单次查询结果最大字符数

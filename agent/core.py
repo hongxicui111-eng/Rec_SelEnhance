@@ -36,6 +36,8 @@ from .prompts import (
     # 纠错查询模式 prompt 模板 (核心新增!)
     QUERY_BASED_FIX_PHASE1_PROMPT, QUERY_BASED_FIX_PHASE2_PROMPT,
     QUERY_BASED_FIX_FINAL_PROMPT, QUERY_BASED_PREFLIGHT_FIX_PROMPT,
+    # SEARCH/REPLACE 匹配失败重试 prompt
+    SEARCH_REPLACE_FIX_PROMPT,
 )
 from .llm_analyzer import LLMCaseAnalyzer
 from .structure_applier import StructureApplier
@@ -250,6 +252,10 @@ class RecSelfEvolveAgent:
         # ---- Step 0: 检查 LLM 健康状态 ----
         self._check_llm_health()
 
+        # ---- 记录上一轮 retrain 结果 (用于后续迭代跳过 baseline 训练) ----
+        last_retrain_metrics = None  # 上一轮 retrain 的指标
+        last_retrain_result = None   # 上一轮 retrain 的完整结果
+
         # ---- 主循环 ----
         for i in range(max_iters):
             self.current_iteration = i
@@ -282,43 +288,54 @@ class RecSelfEvolveAgent:
             # --- Phase 0.5: 保存当前轮次的源码快照 ---
             self.iter_memory.save_source_snapshot(i)
 
-            # ── Phase 1: 训练 Baseline (使用新的 run-verify-fix-retry 闭环!) ──
-            train_result = self._phase_run_verify_fix_retry(
-                iteration=i,
-                param_overrides=None,
-                phase_name="baseline",
-            )
+            # ── Phase 1: 获取当前指标 ──
+            # ★★★ 关键优化: 只有第一轮需要 baseline 训练 ★★★
+            # 从第二轮开始, 上一轮的 retrain 已经训练了修改后的代码并得到指标,
+            # 当前轮次的代码已经是修改后的版本, 不需要重新训练 baseline!
+            if i == 0 or last_retrain_metrics is None:
+                # 第一轮 / 上一轮 retrain 失败无指标 → 需要跑 baseline 训练
+                print(f"  🔄 Running baseline training (iteration {i+1} needs fresh metrics)")
+                train_result = self._phase_run_verify_fix_retry(
+                    iteration=i,
+                    param_overrides=None,
+                    phase_name="baseline",
+                )
 
-            if train_result["status"] != "SUCCESS":
-                # run-verify-fix-retry 闭环已经尝试了所有可能的修复
-                # 如果仍然失败 → 只有真正无法修复的问题才跳过
-                print(f"  ⏭ Baseline training failed after all self-correction attempts")
-                print(f"     Final error: {train_result.get('error', '')[:100]}")
-                print(f"     Error category: {train_result.get('error_category', 'UNKNOWN')}")
+                if train_result["status"] != "SUCCESS":
+                    # run-verify-fix-retry 闭环已经尝试了所有可能的修复
+                    # 如果仍然失败 → 只有真正无法修复的问题才跳过
+                    print(f"  ⏭ Baseline training failed after all self-correction attempts")
+                    print(f"     Final error: {train_result.get('error', '')[:100]}")
+                    print(f"     Error category: {train_result.get('error_category', 'UNKNOWN')}")
+                    
+                    self._consecutive_fail_count += 1
+                    self.journal.record({
+                        "iteration": i,
+                        "status": train_result["status"],
+                        "error": train_result.get("error", ""),
+                        "error_category": train_result.get("error_category", ""),
+                        "fix_attempts": train_result.get("fix_attempts", 0),
+                    })
+                    
+                    # 如果连续失败太多 → 尝试回滚到原始源码状态
+                    if self._consecutive_fail_count >= 3:
+                        print(f"  ⚠ 连续失败 {self._consecutive_fail_count} 次 → 回滚所有源码修改!")
+                        self._rollback_all_source_changes()
+                        self._consecutive_fail_count = 0
+                        print(f"  ↩ 所有源码修改已回滚, 下一轮使用原始代码")
+                    continue
                 
-                self._consecutive_fail_count += 1
-                self.journal.record({
-                    "iteration": i,
-                    "status": train_result["status"],
-                    "error": train_result.get("error", ""),
-                    "error_category": train_result.get("error_category", ""),
-                    "fix_attempts": train_result.get("fix_attempts", 0),
-                })
-                
-                # 如果连续失败太多 → 尝试回滚到原始源码状态
-                if self._consecutive_fail_count >= 3:
-                    print(f"  ⚠ 连续失败 {self._consecutive_fail_count} 次 → 回滚所有源码修改!")
-                    self._rollback_all_source_changes()
-                    self._consecutive_fail_count = 0
-                    print(f"  ↩ 所有源码修改已回滚, 下一轮使用原始代码")
-                continue
-            
-            # 训练成功 → 清零连续失败计数
-            self._consecutive_fail_count = 0
+                # 训练成功 → 清零连续失败计数
+                self._consecutive_fail_count = 0
 
-            # --- Phase 2: 提取指标 ---
-            metrics = train_result.get("metrics", {})
-            print(f"  📊 {self.adapter.format_metrics_for_llm(metrics)}")
+                # --- Phase 2: 提取指标 ---
+                metrics = train_result.get("metrics", {})
+                print(f"  📊 {self.adapter.format_metrics_for_llm(metrics)}")
+            else:
+                # 第二轮+ → 直接使用上一轮 retrain 的指标, 跳过 baseline 训练!
+                metrics = last_retrain_metrics
+                print(f"  ⏭ Skipping baseline training — using metrics from previous iteration's retrain")
+                print(f"  📊 {self.adapter.format_metrics_for_llm(metrics)}")
 
             # --- Phase 2.5: 惊喜评估 + 错误案例分析 ---
             surprise_and_analysis = self._phase_surprise_analysis(metrics)
@@ -349,6 +366,9 @@ class RecSelfEvolveAgent:
             violations = self.safety.check_metrics(metrics)
             if violations:
                 print(f"  ⚠ Safety: {violations}")
+                # 安全护栏拦截 → 代码未修改, 下一轮仍可使用当前指标
+                last_retrain_metrics = metrics
+                print(f"  ⚠ Metrics preserved for next iteration (code unchanged)")
                 self.journal.record({
                     "iteration": i, "status": "SAFETY_VIOLATION",
                     "metrics": metrics, "error": "; ".join(violations),
@@ -367,6 +387,9 @@ class RecSelfEvolveAgent:
                 proposal_result = self._phase_analyze_and_propose(metrics)
             if proposal_result is None:
                 print(f"  ⚠ LLM analysis failed, skipping")
+                # LLM分析失败 → 代码未修改, 下一轮仍可使用当前指标
+                last_retrain_metrics = metrics
+                print(f"  ⚠ Metrics preserved for next iteration (code unchanged)")
                 continue
 
             param_changes = proposal_result.get("param_changes", {})
@@ -447,16 +470,95 @@ class RecSelfEvolveAgent:
                         print(f"    Files modified: {struct_result.get('files_modified', [])}")
                         self._last_structural_changes = struct_result.get("applied_changes", [])
                 elif struct_result["status"] == "ALL_FAILED":
-                    print(f"  ✗ All structural changes failed")
-                    structural_changes = []
+                    # ── ALL_FAILED 重试机制: 将匹配失败诊断反馈给 LLM, 让它修正 ──
+                    print(f"  ✗ All structural changes failed — triggering SEARCH/REPLACE retry...")
+                    detailed_failure = struct_result.get("detailed_failure_info", [])
+
+                    # 打印详细失败诊断
+                    for df in detailed_failure:
+                        print(f"     问题: [{df.get('target_file', '?')}] "
+                              f"{df.get('description', '?')[:60]}")
+                        for ed in df.get("failed_edit_details", []):
+                            diag = ed.get("match_diagnostic", {})
+                            ratio = diag.get("best_fuzzy_ratio", "N/A")
+                            non_match = diag.get("level1_non_matching_lines", "N/A")
+                            print(f"       Edit {ed.get('edit_idx', '?')}: "
+                                  f"best_fuzzy_ratio={ratio}, "
+                                  f"non_matching_lines={non_match}, "
+                                  f"search_preview={ed.get('search_text_preview', '?')[:60]}...")
+
+                    # ── 自纠错: 让 LLM 根据 实际源码 + 失败诊断 重新编写 search 文本 ──
+                    fix_result = self._phase_search_replace_retry(
+                        iteration=i,
+                        original_structural_changes=structural_changes,
+                        detailed_failure_info=detailed_failure,
+                    )
+
+                    if fix_result and fix_result["status"] in ("SUCCESS", "PARTIAL_SUCCESS"):
+                        # 重试成功 → 使用修正后的结果
+                        struct_result = fix_result
+                        revised_structural_changes = fix_result.get("applied_changes", structural_changes)
+                        structural_changes = revised_structural_changes
+                        print(f"  ✓ SEARCH/REPLACE 重试成功: {fix_result['status']}")
+                        print(f"    修改文件: {fix_result.get('files_modified', [])}")
+                        self._last_structural_changes = fix_result.get("applied_changes", [])
+                        self.journal.record({
+                            "iteration": i, "status": "STRUCTURE_ALL_FAILED_WITH_RETRY_SUCCESS",
+                            "metrics": metrics,
+                            "structural_changes": structural_changes,
+                            "original_structural_changes": proposal_result.get("structural_changes", []),
+                            "detailed_failure_info": detailed_failure,
+                        })
+                    else:
+                        # 重试也失败 → 不可恢复
+                        # ── 关键决策: 是否跳过本轮 ──
+                        # 如果提案的核心意图是结构修改 (代码变更), 用原代码训练没有意义
+                        # 但如果提案还有独立的参数修改, 仍然可以仅做参数修改训练
+                        if param_changes:
+                            # 有独立的参数修改 → 仅保留参数修改, 跳过结构修改
+                            print(f"  ⚠ 结构修改失败但有参数修改 → 仅尝试参数修改")
+                            structural_changes = []
+                            self.journal.record({
+                                "iteration": i, "status": "STRUCTURE_ALL_FAILED_RETRY_ALSO_FAILED_WITH_PARAM_FALLBACK",
+                                "metrics": metrics,
+                                "structural_changes": proposal_result.get("structural_changes", []),
+                                "failed_changes": struct_result.get("failed_changes", []),
+                                "detailed_failure_info": detailed_failure,
+                                "retry_result": fix_result,
+                                "param_changes": param_changes,
+                                "error": "Structural changes failed, retry also failed; falling back to param-only",
+                            })
+                        else:
+                            # 没有参数修改 → 本轮完全无法产生有效变更, 跳过
+                            print(f"  ✗ SEARCH/REPLACE 重试也失败且无参数修改 — 本轮完全无效，跳过")
+                            structural_changes = []
+                            self.journal.record({
+                                "iteration": i, "status": "STRUCTURE_ALL_FAILED_RETRY_ALSO_FAILED",
+                                "metrics": metrics,
+                                "structural_changes": proposal_result.get("structural_changes", []),
+                                "failed_changes": struct_result.get("failed_changes", []),
+                                "detailed_failure_info": detailed_failure,
+                                "retry_result": fix_result,
+                                "error": "All structural changes failed, retry also failed, no param changes",
+                            })
 
             # --- Phase 6: 应用参数变更 + 训练验证 (使用新的 run-verify-fix-retry!) ---
             has_any_change = bool(param_changes) or bool(structural_changes)
             if not has_any_change:
-                print(f"  ⚠ No valid changes extracted")
+                # 区分两种 NO_CHANGES 情况：
+                # (1) 提案本身就无变更 (param_changes={}, structural_changes=[])
+                # (2) 提案有变更但被验证/应用环节清空了
+                had_changes_in_proposal = bool(proposal_result.get("structural_changes", [])) or bool(proposal_result.get("param_changes", {}))
+                reason = "changes_proposed_but_lost_after_validation" if had_changes_in_proposal else "no_changes_in_proposal"
+                print(f"  ⚠ No valid changes extracted (reason: {reason})")
+                # NO_CHANGES → 代码未修改, 下一轮仍可使用当前指标
+                last_retrain_metrics = metrics
+                print(f"  ⚠ Metrics preserved for next iteration (code unchanged)")
                 self.journal.record({
                     "iteration": i, "status": "NO_CHANGES",
                     "metrics": metrics, "proposal_result": proposal_result,
+                    "no_changes_reason": reason,
+                    "struct_result_status": struct_result.get("status") if struct_result else None,
                 })
                 continue
 
@@ -474,6 +576,11 @@ class RecSelfEvolveAgent:
             if new_train["status"] == "SUCCESS":
                 new_metrics = new_train.get("metrics", {})
                 print(f"  → After: {self.adapter.format_metrics_for_llm(new_metrics)}")
+
+                # ★★★ 保存 retrain 指标, 供下一轮迭代跳过 baseline 训练 ★★★
+                last_retrain_metrics = new_metrics
+                last_retrain_result = new_train
+                print(f"  ✓ Metrics saved for next iteration (will skip baseline training)")
 
                 # ── 记录修改因果链到 IterativeMemory ──
                 if structural_changes and struct_result:
@@ -526,6 +633,11 @@ class RecSelfEvolveAgent:
                 print(f"  ✗ Retrain failed after all self-correction attempts")
                 print(f"     Final error: {new_train.get('error', '')[:100]}")
                 print(f"     Error category: {new_train.get('error_category', 'UNKNOWN')}")
+                
+                # ★★★ retrain 失败 → 清空 last_retrain_metrics, 下一轮需要重新 baseline 训练 ★★★
+                last_retrain_metrics = None
+                last_retrain_result = None
+                print(f"  ⚠ Retrain failed — next iteration will run baseline training")
                 
                 self._consecutive_fail_count += 1
                 self.journal.record({
@@ -2631,10 +2743,36 @@ class RecSelfEvolveAgent:
                     continue  # 下一轮强制
                 
                 print(f"  🔎 LLM queries: {len(queries)} requests")
+                # ── 兼容 LLM 输出的简化格式: strings → dicts ──
+                # LLM 有时会输出 queries 为纯字符串列表 (如 ["Encoder.forward"]),
+                # 而不是结构化的 [{"action": "search_function", "args": {"name": "Encoder.forward"}}]
+                normalized_queries = []
+                import re as regex_module
                 for q in queries:
-                    action = q.get("action", "?")
-                    args = q.get("args", {})
-                    print(f"    → {action}({args})")
+                    if isinstance(q, str):
+                        # ── 清洗 LLM 格式污染 ──
+                        cleaned_q = q.strip()
+                        # 移除 "SEARCH:" / "REPLACE:" / "class " / "def " 等前缀
+                        cleaned_q = regex_module.sub(
+                            r'^\s*(SEARCH|REPLACE)\s*:\s*(class\s+|def\s+)?', '',
+                            cleaned_q, flags=regex_module.IGNORECASE
+                        ).strip()
+                        # 移除包裹的引号
+                        cleaned_q = cleaned_q.strip('"\'`<>')
+                        # 自动将字符串转为 search_function 查询
+                        normalized_queries.append({"action": "search_function", "args": {"name": cleaned_q}})
+                        print(f"    → search_function(name={cleaned_q})  [auto-converted from string{' (cleaned from: '+q+')' if cleaned_q != q else ''}]")
+                    elif isinstance(q, dict):
+                        action = q.get("action", "?")
+                        args = q.get("args", {})
+                        print(f"    → {action}({args})")
+                        normalized_queries.append(q)
+                    else:
+                        print(f"    ⚠ Skipping invalid query item: {type(q)} = {q}")
+                queries = normalized_queries
+                if not queries:
+                    print(f"  ⚠ No valid queries after normalization, forcing next round")
+                    continue
                 
                 # ── 执行查询 ──
                 query_results_this_round = self._code_query_tool.execute_queries(queries)
@@ -3113,18 +3251,37 @@ class RecSelfEvolveAgent:
         # ── 尝试解析 SEARCH/REPLACE 格式 ──
         sr_result = self._parse_search_replace_diff(response, research_idea)
         if sr_result:
+            # SEARCH/REPLACE 格式也需要验证 (与 _parse_proposal_response 保持一致)
+            sc = sr_result.get("structural_changes", [])
+            if sc:
+                validated = self._validate_structural_changes(sc)
+                sr_result["structural_changes"] = validated
+                if validated:
+                    logger.info(f"[_parse_multi_role_coder_output] SEARCH/REPLACE: "
+                                f"{len(sc)} changes → {len(validated)} validated")
+                else:
+                    logger.warning(f"[_parse_multi_role_coder_output] SEARCH/REPLACE: "
+                                   f"{len(sc)} changes → 0 after validation")
             return sr_result
         
         # ── 降级: 尝试解析 JSON 格式 ──
         json_result = self._parse_json_response(response)
         if json_result:
             # JSON 格式可能直接包含 structural_changes 和 param_changes
+            sc = json_result.get("structural_changes", [])
+            if sc:
+                validated = self._validate_structural_changes(sc)
+                json_result["structural_changes"] = validated
+                if not validated:
+                    logger.warning(f"[_parse_multi_role_coder_output] JSON: "
+                                   f"{len(sc)} structural_changes → 0 after validation")
             return {
                 "structural_changes": json_result.get("structural_changes", []),
                 "param_changes": json_result.get("param_changes", {}),
             }
         
         # ── 最后降级: 使用传统 _parse_proposal_response ──
+        # (已经包含 _validate_structural_changes 调用)
         traditional_result = self._parse_proposal_response(response)
         if traditional_result:
             return traditional_result
@@ -3328,6 +3485,39 @@ class RecSelfEvolveAgent:
                     return None
             except Exception:
                 return None
+
+        # ── 格式转换: 顶层 "edits" → "structural_changes" ──
+        # LLM 有时会输出 {"phase": "proposal", "edits": [...]},
+        # 但下游代码期望 {"structural_changes": [{"edits": [...]}]} 格式
+        # 这与 _parse_query_response 中同一问题的修复一致 (Bug I)
+        if "edits" in data and "structural_changes" not in data:
+            top_level_edits = data.pop("edits")
+            if isinstance(top_level_edits, list) and top_level_edits:
+                structural_entries = []
+                for edit in top_level_edits:
+                    if isinstance(edit, dict):
+                        target_file = edit.get("file", edit.get("filename", edit.get("target_file", "")))
+                        instruction = edit.get("instruction", edit.get("description", ""))
+                        search_text = edit.get("search", "")
+                        replace_text = edit.get("replace", "")
+                        action = edit.get("action", edit.get("action_type", "modify"))
+                        
+                        if search_text or replace_text:
+                            entry = {
+                                "target_file": target_file,
+                                "description": instruction,
+                                "edits": [{"search": search_text, "replace": replace_text}],
+                            }
+                            for key in ["expected_effect", "confidence"]:
+                                if key in edit:
+                                    entry[key] = edit[key]
+                            entry["action_type"] = action
+                            structural_entries.append(entry)
+                
+                if structural_entries:
+                    data["structural_changes"] = structural_entries
+                    logger.info(f"[_parse_proposal_response] Normalized top-level 'edits' "
+                                f"({len(top_level_edits)} items) → 'structural_changes' ({len(structural_entries)} entries)")
 
         # 提取各部分 — 兼容新旧字段名
         # 新prompt使用: observation/reasoning/rationale, 旧prompt使用: analysis/explanation
@@ -4119,8 +4309,253 @@ class RecSelfEvolveAgent:
         
         return None
 
-    def _phase_train_diagnosis_and_retry(
+    def _phase_search_replace_retry(
         self,
+        iteration: int,
+        original_structural_changes: list,
+        detailed_failure_info: list,
+        max_rounds: int = None,
+    ) -> Optional[dict]:
+        """
+        SEARCH/REPLACE 匹配失败重试机制
+        
+        当 StructureApplier 的 SEARCH/REPLACE 三级匹配全部失败时,
+        不是直接放弃, 而是将详细的匹配失败诊断 + 实际文件源码
+        反馈给 LLM, 让它根据真实源码重新编写 search 文本。
+        
+        这是确保每轮修改都成功应用的关键机制 — 修改失败不能
+        直接跳过, 因为用原代码训练没有意义。
+        
+        Args:
+            iteration: 当前迭代轮次
+            original_structural_changes: 原始的结构修改列表 (LLM 第一次提出的)
+            detailed_failure_info: StructureApplier 返回的详细失败诊断
+            max_rounds: 最大重试轮数
+            
+        Returns:
+            Dict: StructureApplier.apply_structural_changes 的返回格式
+            或 None: 重试全部失败
+        """
+        max_r = max_rounds or self._max_self_correction_rounds
+        
+        print(f"\n  🔁 SEARCH/REPLACE 重试启动: 最多 {max_r} 轮修正")
+        
+        # ── 构建失败诊断文本 ──
+        failure_diagnostic_text = self._format_match_failure_diagnostic(detailed_failure_info)
+        
+        # ── 计算最佳模糊匹配比率 (用于 prompt) ──
+        best_fuzzy_ratio = 0.0
+        fuzzy_threshold = 0.80
+        for df in detailed_failure_info:
+            for ed in df.get("failed_edit_details", []):
+                diag = ed.get("match_diagnostic", {})
+                ratio = diag.get("best_fuzzy_ratio", 0.0)
+                if ratio > best_fuzzy_ratio:
+                    best_fuzzy_ratio = ratio
+                fuzzy_threshold = diag.get("threshold", 0.80)
+        
+        for round_idx in range(1, max_r + 1):
+            print(f"\n  🔁 SEARCH/REPLACE 重试第 {round_idx}/{max_r} 轮")
+            
+            # ── 1. 构建当前源码上下文 ──
+            # 对于匹配失败, 最重要的是让 LLM 看到 实际的源码
+            source_code_ctx = self.adapter.build_source_code_context(
+                include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
+                max_total_chars=20000,  # 给更多空间让 LLM 看到真实源码
+                iterative_memory=self.iter_memory,
+            )
+            
+            # ── 2. 构建 SEARCH_REPLACE_FIX_PROMPT ──
+            prompt = SEARCH_REPLACE_FIX_PROMPT.format(
+                _original_structural_changes=json.dumps(
+                    original_structural_changes, indent=2, ensure_ascii=False
+                ),
+                _match_failure_diagnostic=failure_diagnostic_text,
+                _current_source_code=source_code_ctx,
+                _best_fuzzy_ratio=best_fuzzy_ratio,
+                _fuzzy_threshold=fuzzy_threshold,
+            )
+            
+            # ── 3. 调用 LLM ──
+            logger.info(f"SEARCH/REPLACE retry round {round_idx}: sending to LLM")
+            response = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": (
+                        "你是一位严谨的 Python 代码修改专家。"
+                        "你之前的 SEARCH/REPLACE 修改无法在目标文件中找到匹配。"
+                        "这说明你对源码内容的记忆与实际文件不一致。"
+                        "请仔细阅读下面提供的 实际源码, 从中精确复制你想修改的代码片段作为 search 文本, "
+                        "然后编写修改后的代码作为 replace 文本。"
+                        "search 文本必须与实际源码 逐行完全一致 (包括缩进、空行、注释), "
+                        "不能凭记忆编写或省略任何字符。"
+                    )},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,  # 极低温度, 确保精确复制源码
+                max_tokens=self.config.llm_max_tokens,
+            )
+            
+            if response is None:
+                logger.error(f"SEARCH/REPLACE retry round {round_idx}: LLM call failed")
+                print(f"     ✗ LLM 调用失败")
+                continue
+            
+            # ── 4. 解析修正后的结构修改 ──
+            revised_proposal = self._parse_proposal_response(response)
+            if revised_proposal is None:
+                print(f"     ✗ 无法解析 LLM 修正方案")
+                fixed_response = self.fixer.fix_format(response, "无法从回复中提取有效JSON")
+                revised_proposal = self._parse_proposal_response(fixed_response)
+                if revised_proposal is None:
+                    continue
+            
+            revised_structural_changes = revised_proposal.get("structural_changes", [])
+            if not revised_structural_changes:
+                print(f"     ⚠ LLM 修正方案中没有结构修改")
+                continue
+            
+            print(f"     💡 修正后的结构修改: {len(revised_structural_changes)} 项")
+            for sc in revised_structural_changes:
+                print(f"       → [{sc.get('target_file', '?')}] "
+                      f"{sc.get('target_class_or_function', '?')}: "
+                      f"{sc.get('description', '?')[:60]}...")
+            
+            # ── 5. 重新应用修正后的结构修改 ──
+            revised_struct_result = self.struct_applier.apply_structural_changes(revised_structural_changes)
+            
+            if revised_struct_result["status"] in ("SUCCESS", "PARTIAL_SUCCESS"):
+                print(f"     ✓ 修正后的结构修改成功!")
+                print(f"       状态: {revised_struct_result['status']}")
+                print(f"       修改文件: {revised_struct_result.get('files_modified', [])}")
+                
+                self.journal.record({
+                    "iteration": iteration,
+                    "status": "SEARCH_REPLACE_RETRY_SUCCESS",
+                    "self_correction_round": round_idx,
+                    "original_structural_changes_summary": json.dumps(
+                        original_structural_changes, ensure_ascii=False
+                    )[:500],
+                    "revised_structural_changes_summary": json.dumps(
+                        revised_structural_changes, ensure_ascii=False
+                    )[:500],
+                    "detailed_failure_info": detailed_failure_info,
+                })
+                
+                return revised_struct_result
+            
+            elif revised_struct_result["status"] == "ALL_FAILED":
+                # 修正后仍然 ALL_FAILED → 更新诊断, 继续下一轮
+                print(f"     ✗ 修正后仍然 ALL_FAILED — 继续下一轮重试")
+                new_detailed_failure = revised_struct_result.get("detailed_failure_info", [])
+                if new_detailed_failure:
+                    detailed_failure_info = new_detailed_failure
+                    failure_diagnostic_text = self._format_match_failure_diagnostic(detailed_failure_info)
+                # 更新 original_structural_changes 为修正后的版本
+                original_structural_changes = revised_structural_changes
+                # 更新最佳模糊比率
+                for df in detailed_failure_info:
+                    for ed in df.get("failed_edit_details", []):
+                        diag = ed.get("match_diagnostic", {})
+                        ratio = diag.get("best_fuzzy_ratio", 0.0)
+                        if ratio > best_fuzzy_ratio:
+                            best_fuzzy_ratio = ratio
+                continue
+            
+            elif revised_struct_result["status"] == "ROLLBACK":
+                # 修正后的代码有校验问题 → 转交给 validation retry 处理
+                print(f"     ↩ 修正后的结构修改被回滚: {revised_struct_result.get('rollback_reason', '')[:100]}")
+                # 先尝试 validation retry
+                validation_failures = revised_struct_result.get("failed_changes", [])
+                if not validation_failures:
+                    validation_failures = [{
+                        "description": sc.get("description", "unknown"),
+                        "error_type": "validation_error",
+                        "error": revised_struct_result.get("rollback_reason", "validation failed"),
+                        "target_class_or_function": sc.get("target_class_or_function", "?"),
+                    } for sc in revised_structural_changes]
+                
+                val_fix_result = self._phase_structure_validation_retry(
+                    iteration=iteration,
+                    original_structural_changes=revised_structural_changes,
+                    validation_failures=validation_failures,
+                )
+                if val_fix_result and val_fix_result["status"] in ("SUCCESS", "PARTIAL_SUCCESS"):
+                    print(f"     ✓ Validation retry 成功!")
+                    return val_fix_result
+                else:
+                    print(f"     ✗ Validation retry 也失败 — 继续下一轮 SEARCH/REPLACE 重试")
+                    continue
+            
+            else:
+                print(f"     ✗ 修正后的结构修改状态未知: {revised_struct_result['status']}")
+                continue
+        
+        # ── 所有重试轮次都失败了 ──
+        print(f"\n  ✗ SEARCH/REPLACE 重试: 所有 {max_r} 轮修正均失败")
+        logger.error(f"SEARCH/REPLACE retry loop exhausted {max_r} rounds, all failed")
+        
+        self.journal.record({
+            "iteration": iteration,
+            "status": "SEARCH_REPLACE_RETRY_ALL_FAILED",
+            "max_rounds": max_r,
+            "detailed_failure_info": detailed_failure_info,
+        })
+        
+        return None
+
+    @staticmethod
+    def _format_match_failure_diagnostic(detailed_failure_info: list) -> str:
+        """
+        将 detailed_failure_info 格式化为人类可读的文本, 用于发送给 LLM
+        
+        包含:
+        - 每个失败项的目标文件和描述
+        - 每个 edit 的 search 文本全文 (不截断!)
+        - 模糊匹配的详细诊断 (相似度、最相似片段、不匹配行)
+        - 实际文件中与 search 最相似的代码片段及上下文
+        """
+        text = ""
+        for idx, df in enumerate(detailed_failure_info, 1):
+            text += f"\n### 失败项 {idx}: [{df.get('target_file', '?')}] {df.get('description', '?')[:80]}\n"
+            text += f"- **错误**: {df.get('error', 'unknown')[:200]}\n\n"
+            
+            for ed in df.get("failed_edit_details", []):
+                edit_idx = ed.get("edit_idx", "?")
+                text += f"\n#### Edit {edit_idx} 匹配失败详情\n"
+                
+                # ── 展示 LLM 提供的 search 文本全文 ──
+                search_full = ed.get("search_text_full", "")
+                if search_full:
+                    text += f"- **LLM 提供的 search 文本** (全文):\n```\n{search_full}\n```\n"
+                else:
+                    search_preview = ed.get("search_text_preview", "")
+                    text += f"- **LLM 提供的 search 文本** (截断): `{search_preview}`\n"
+                
+                # ── 展示匹配诊断 ──
+                diag = ed.get("match_diagnostic", {})
+                if diag:
+                    text += f"- **Level 1 精确匹配**: ❌ 失败\n"
+                    text += f"  - search 中与文件内容匹配的行数: {diag.get('level1_matching_lines', 'N/A')}\n"
+                    text += f"  - search 中与文件内容不匹配的行数: {diag.get('level1_non_matching_lines', 'N/A')}\n"
+                    non_match_samples = diag.get('level1_non_matching_samples', [])
+                    if non_match_samples:
+                        text += f"  - 不匹配行示例:\n"
+                        for sample in non_match_samples[:3]:
+                            text += f"    `{sample}`\n"
+                    text += f"- **Level 2 去空白匹配**: {'✅ 成功' if diag.get('level2_whitespace_match') else '❌ 失败'}\n"
+                    text += f"- **Level 3 模糊匹配**: ❌ 失败 (best_ratio={diag.get('best_fuzzy_ratio', 'N/A')}, "
+                    text += f"threshold={diag.get('level3_fuzzy_threshold', 'N/A')})\n"
+                    
+                    # ── 展示文件中与 search 最相似的代码片段 ──
+                    closest_context = diag.get("closest_match_segment_with_context")
+                    if closest_context:
+                        text += f"\n- **文件中与 search 最相似的代码片段** (上下文 ±3 行):\n```\n{closest_context}\n```\n"
+                
+                text += "\n"
+        
+        return text
+
+    def _phase_train_diagnosis_and_retry(
         iteration: int,
         train_error: dict,
         max_rounds: int = None,

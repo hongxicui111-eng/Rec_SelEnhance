@@ -29,7 +29,6 @@ CASE_ANALYSIS_PROMPT = """你是一位顶尖的推荐系统算法工程师，正
 ## 项目背景
 这是一个**序列推荐系统**，基于 SASRec (Self-Attentive Sequential Recommendation) 模型。
 - 模型通过用户的历史交互序列来预测下一个可能交互的物品
-- 训练使用 BCE Loss + Uniform/DNS 负采样
 - 评估指标: NDCG@K, Recall@K (K=5,10,20)
 
 ## 当前模型配置

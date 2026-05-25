@@ -61,6 +61,11 @@ def parse_args():
     proj_group.add_argument("--gpu", default="0",
                             help="GPU ID (默认: 0)")
 
+    # ---- 多角色工作流 ----
+    workflow_group = parser.add_argument_group("多角色工作流")
+    workflow_group.add_argument("--enable-multi-role-workflow", action="store_true",
+                                help="启用多角色工作流 (Planner→Researcher→Coder→Debugger)")
+
     # ---- 初始训练参数 ----
     hyper_group = parser.add_argument_group("初始训练参数")
     hyper_group.add_argument("--lr", type=float, default=0.001,
@@ -148,6 +153,9 @@ def build_config(args) -> AgentConfig:
     config.script_name = args.script
     config.gpu_id = args.gpu
 
+    # 多角色工作流
+    config.enable_multi_role_workflow = args.enable_multi_role_workflow
+
     # 初始训练参数作为 extra_args
     config.extra_args = {
         "lr": args.lr,
@@ -187,6 +195,7 @@ def print_config(config: AgentConfig):
     print(f"  Backbone:   {config.backbone}")
     print(f"  Data:       {config.data_name}")
     print(f"  GPU:        {config.gpu_id}")
+    print(f"  Multi-role: {config.enable_multi_role_workflow}")
     print(f"  Iterations: {config.max_iterations}")
     print(f"  Strategy:   {args.strategy if 'args' in dir() else 'balanced'}")
     print(f"  Log dir:    {config.log_dir}")

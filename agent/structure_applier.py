@@ -75,6 +75,8 @@ class StructureApplier:
         self._backup_branch = None
         # ── 模糊匹配参数 ──
         self.fuzzy_min_similarity = 0.80  # 模糊匹配最低相似度阈值
+        # ── 匹配失败诊断 ──
+        self._last_match_diagnostic = None  # 最近一次 SEARCH/REPLACE 失败的详细诊断
 
     # ════════════════════════════════════════
     # 主入口 — 应用一组结构修改
@@ -139,12 +141,42 @@ class StructureApplier:
                 if result.get("post_edit_window"):
                     post_edit_context[result["file_path"]] = result["post_edit_window"]
             else:
-                failed.append({"change": change, "error": result.get("error", "unknown")})
+                # 保留完整的失败结果 (包含 failed_edit_details 和 original_content)
+                failed.append({"change": change, "error": result.get("error", "unknown"), "result": result})
                 logger.warning(f"Change failed: {result.get('error', 'unknown')}")
 
         # 没有一个修改成功
         if not applied and failed:
             logger.warning("No structural changes were successfully applied")
+
+            # ── 收集所有失败项的详细诊断信息 ──
+            detailed_failure_info = []
+            for f in failed:
+                change = f.get("change", {})
+                result_dict = f.get("result", {})  # 完整的 _apply_single_change 返回值
+
+                # 从 _apply_single_change 的失败结果中提取诊断
+                diag = result_dict.get("failed_edit_details", [])
+                original_content = result_dict.get("original_content", "")
+
+                detailed_failure_info.append({
+                    "target_file": change.get("target_file", "?"),
+                    "description": change.get("description", "?"),
+                    "edits": change.get("edits", []),
+                    "error": f.get("error", "unknown"),
+                    "failed_edit_details": diag,
+                    "original_content_preview": original_content[:2000] if original_content else "",
+                })
+
+            # ── 打印详细诊断日志 ──
+            for d in detailed_failure_info:
+                logger.warning(f"  Failed change: [{d['target_file']}] {d['description'][:60]}")
+                for edit_detail in d.get("failed_edit_details", []):
+                    diag = edit_detail.get("match_diagnostic", {})
+                    logger.warning(f"    Edit {edit_detail.get('edit_idx', '?')}: "
+                                   f"best_fuzzy_ratio={diag.get('best_fuzzy_ratio', 'N/A')}, "
+                                   f"non_matching_lines={diag.get('level1_non_matching_lines', 'N/A')}")
+
             return {
                 "status": "ALL_FAILED",
                 "applied_changes": [],
@@ -156,6 +188,7 @@ class StructureApplier:
                 },
                 "files_modified": [],
                 "post_edit_context": {},
+                "detailed_failure_info": detailed_failure_info,  # 新增: 详细失败诊断
             }
 
         # Step 3: 校验所有修改后的文件
@@ -273,22 +306,41 @@ class StructureApplier:
                         "success": True,
                     })
                 else:
+                    # ── 收集匹配失败的详细诊断 ──
+                    diag = self._last_match_diagnostic or {}
                     edit_results.append({
                         "edit_idx": edit_idx,
                         "method": "failed",
                         "success": False,
                         "search_text_preview": search_text[:80],
+                        "search_text_full": search_text,  # 完整 search 文本, 供 LLM 修正
+                        "match_diagnostic": diag,  # 详细匹配失败诊断
                     })
 
         # 检查是否所有编辑都失败
         successful_edits = [r for r in edit_results if r["success"]]
         if not successful_edits and edit_results:
             failed_methods = [r["method"] for r in edit_results if not r["success"]]
+            # ── 收集所有失败 edit 的详细诊断 ──
+            failed_edit_details = []
+            for r in edit_results:
+                if not r["success"]:
+                    detail = {
+                        "edit_idx": r.get("edit_idx", "?"),
+                        "method": r.get("method", "failed"),
+                        "search_text_preview": r.get("search_text_preview", ""),
+                        "search_text_full": r.get("search_text_full", ""),
+                        "match_diagnostic": r.get("match_diagnostic", {}),
+                    }
+                    failed_edit_details.append(detail)
+
             return {
                 "status": "FAILED",
                 "error": f"All SEARCH/REPLACE edits failed for {target_file} "
                          f"(methods tried: {failed_methods})",
                 "edit_results": edit_results,
+                "failed_edit_details": failed_edit_details,  # 新增: 详细失败诊断
+                "original_content": original_content,  # 新增: 文件原始内容, 供 LLM 对照
             }
 
         # ── 写入前语法检查 ──
@@ -335,11 +387,15 @@ class StructureApplier:
 
         Returns:
             (new_content, method_used) 或 (None, "failed")
+
+        失败时会在 self._last_match_diagnostic 中保存详细的诊断信息,
+        供后续重试机制将失败原因反馈给 LLM.
         """
         # ── Level 1: 精确匹配 ──
         if search_text in content:
             new_content = content.replace(search_text, replace_text, 1)
             logger.info("SEARCH/REPLACE: exact match succeeded")
+            self._last_match_diagnostic = None  # 成功则清除诊断
             return new_content, "exact_match"
 
         # ── Level 2: 去空白匹配 ──
@@ -347,18 +403,166 @@ class StructureApplier:
         result = self._strip_whitespace_match(content, search_text, replace_text)
         if result is not None:
             logger.info("SEARCH/REPLACE: whitespace-normalized match succeeded")
+            self._last_match_diagnostic = None
             return result, "whitespace_match"
 
         # ── Level 3: 模糊匹配 ──
         # 容忍 LLM 输出中少量行偏差 (多/少注释、行顺序微调等)
-        result = self._fuzzy_match(content, search_text, replace_text)
+        result, fuzzy_diagnostic = self._fuzzy_match_with_diagnostic(content, search_text, replace_text)
         if result is not None:
             logger.info("SEARCH/REPLACE: fuzzy match succeeded")
+            self._last_match_diagnostic = None
             return result, "fuzzy_match"
 
+        # ── 全部失败 → 生成详细诊断 ──
+        diagnostic = self._build_match_failure_diagnostic(content, search_text, fuzzy_diagnostic)
+        self._last_match_diagnostic = diagnostic
         logger.warning(f"SEARCH/REPLACE: all 3 levels failed for search text "
                        f"(first 80 chars): {search_text[:80]}")
+        logger.warning(f"  Diagnostic: best_fuzzy_ratio={diagnostic.get('best_fuzzy_ratio', 'N/A')}, "
+                       f"closest_match_lines={diagnostic.get('closest_match_start', 'N/A')}-"
+                       f"{diagnostic.get('closest_match_end', 'N/A')}")
         return None, "failed"
+
+    def _fuzzy_match_with_diagnostic(self, content: str, search_text: str,
+                                      replace_text: str) -> Tuple[Optional[str], Optional[Dict]]:
+        """
+        Level 3: 模糊匹配 — 在 content 中找与 search_text 最相似的代码片段
+
+        返回 (result_content, diagnostic_dict):
+        - result_content: 匹配成功时返回替换后的内容, 失败时返回 None
+        - diagnostic_dict: 总是返回诊断信息 (best_ratio, closest_start, closest_end, closest_segment)
+        """
+        content_lines = content.split('\n')
+        search_lines = search_text.split('\n')
+
+        if not search_lines or not content_lines:
+            return None, {"best_fuzzy_ratio": 0.0, "closest_match_start": None, "closest_match_end": None}
+
+        # 去除 search_lines 中的纯空行 (LLM 经常多写空行)
+        search_lines_stripped = [l for l in search_lines if l.strip()]
+        if not search_lines_stripped:
+            return None, {"best_fuzzy_ratio": 0.0, "closest_match_start": None, "closest_match_end": None}
+
+        n_search = len(search_lines_stripped)
+        n_content = len(content_lines)
+
+        # 滑动窗口大小: 从 n_search 向上下浮动 ±30%
+        min_window = max(1, n_search - max(1, int(n_search * 0.3)))
+        max_window = min(n_content, n_search + max(1, int(n_search * 0.3)))
+
+        best_ratio = 0.0
+        best_start = None
+        best_end = None
+
+        for window_size in range(min_window, max_window + 1):
+            for start in range(n_content - window_size + 1):
+                segment = content_lines[start:start + window_size]
+                # 去除 segment 中的纯空行用于比较
+                segment_stripped = [l for l in segment if l.strip()]
+                if not segment_stripped:
+                    continue
+
+                # 计算行级相似度
+                matcher = difflib.SequenceMatcher(None, segment_stripped, search_lines_stripped)
+                ratio = matcher.ratio()
+
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_start = start
+                    best_end = start + window_size
+
+        diagnostic = {
+            "best_fuzzy_ratio": round(best_ratio, 4),
+            "closest_match_start": best_start,
+            "closest_match_end": best_end,
+            "closest_match_segment": ('\n'.join(content_lines[best_start:best_end])
+                                      if best_start is not None else None),
+            "search_text_lines": len(search_lines_stripped),
+            "content_total_lines": n_content,
+            "threshold": self.fuzzy_min_similarity,
+        }
+
+        if best_ratio < self.fuzzy_min_similarity or best_start is None:
+            logger.info(f"Fuzzy match: best ratio {best_ratio:.2f} < threshold "
+                        f"{self.fuzzy_min_similarity}")
+            return None, diagnostic
+
+        logger.info(f"Fuzzy match: found segment at lines {best_start+1}-{best_end+1} "
+                    f"with similarity {best_ratio:.2f}")
+
+        # 替换匹配的行范围
+        new_lines = content_lines[:best_start] + replace_text.split('\n') + content_lines[best_end:]
+        return '\n'.join(new_lines), diagnostic
+
+    def _build_match_failure_diagnostic(self, content: str, search_text: str,
+                                          fuzzy_diagnostic: Optional[Dict]) -> Dict:
+        """
+        构建 SEARCH/REPLACE 匹配失败的详细诊断信息
+
+        包含:
+        1. LLM 提供的 search_text 全文 (不截断)
+        2. 文件中与 search_text 最相似的代码片段
+        3. 各级别匹配的详细结果 (精确、去空白、模糊)
+        4. 最相似片段的行号范围和相似度
+        5. 文件总行数和 search_text 行数对比
+
+        这些信息将反馈给 LLM, 让它修正 search_text 使之与实际文件内容匹配。
+        """
+        content_lines = content.split('\n')
+        search_lines = search_text.split('\n')
+
+        # ── Level 1 精确匹配失败诊断 ──
+        # 找出 search_text 中在 content 中存在的行 vs 不存在的行
+        search_lines_in_content = []
+        search_lines_not_in_content = []
+        for line in search_lines:
+            stripped = line.strip()
+            if stripped and stripped in content:
+                search_lines_in_content.append(line)
+            elif stripped:
+                search_lines_not_in_content.append(line)
+
+        # ── Level 2 去空白匹配失败诊断 ──
+        norm_search = self._normalize_whitespace(search_text)
+        norm_content = self._normalize_whitespace(content)
+        whitespace_match_found = norm_search in norm_content
+
+        # ── Level 3 模糊匹配失败诊断 ──
+        if fuzzy_diagnostic is None:
+            fuzzy_diagnostic = {"best_fuzzy_ratio": 0.0}
+
+        # ── 构建最相似片段的上下文 ──
+        closest_segment_with_context = None
+        if fuzzy_diagnostic.get("closest_match_start") is not None:
+            start = fuzzy_diagnostic["closest_match_start"]
+            end = fuzzy_diagnostic["closest_match_end"]
+            # 扩展上下文: ±3行
+            ctx_start = max(0, start - 3)
+            ctx_end = min(len(content_lines), end + 3)
+            context_lines = []
+            for idx in range(ctx_start, ctx_end):
+                marker = "►" if start <= idx < end else " "
+                context_lines.append(f"{idx + 1:4d}{marker}| {content_lines[idx]}")
+            closest_segment_with_context = '\n'.join(context_lines)
+
+        diagnostic = {
+            "search_text_full": search_text,  # LLM 提供的完整 search 文本 (不截断)
+            "search_text_line_count": len(search_lines),
+            "content_total_lines": len(content_lines),
+            "level1_exact_match": False,
+            "level1_matching_lines": len(search_lines_in_content),
+            "level1_non_matching_lines": len(search_lines_not_in_content),
+            "level1_non_matching_samples": search_lines_not_in_content[:5],  # 前5个不匹配行
+            "level2_whitespace_match": whitespace_match_found,
+            "level3_fuzzy_ratio": fuzzy_diagnostic.get("best_fuzzy_ratio", 0.0),
+            "level3_fuzzy_threshold": self.fuzzy_min_similarity,
+            "closest_match_start_line": fuzzy_diagnostic.get("closest_match_start"),
+            "closest_match_end_line": fuzzy_diagnostic.get("closest_match_end"),
+            "closest_match_segment_with_context": closest_segment_with_context,
+        }
+
+        return diagnostic
 
     def _smart_insert_fallback(self, content: str, search_text: str,
                                 replace_text: str, original_content: str) -> Tuple[Optional[str], str]:
