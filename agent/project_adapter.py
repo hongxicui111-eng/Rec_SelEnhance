@@ -478,9 +478,53 @@ class SeqRecAdapter:
                     metrics[key] = float(v)
 
         # ── 解析 Loss ──
-        loss_match = re.search(r"'loss':\s*'([\d.e+\-]+)'", log_text)
+        # 正常 loss: {'loss': '0.1234'}  NaN loss: {'loss': 'nan'}  Inf loss: {'loss': 'inf'}
+        loss_match = re.search(r"'loss':\s*'([\d.e+\-]+|nan|inf|NaN|Inf)'", log_text)
         if loss_match:
-            metrics["loss"] = float(loss_match.group(1))
+            loss_value = loss_match.group(1).lower()
+            if loss_value in ("nan", "inf"):
+                metrics["loss"] = float(loss_value)  # Python float('nan') 和 float('inf') 是合法的
+            else:
+                metrics["loss"] = float(loss_value)
+        
+        # ── 检测训练健康状态 ──
+        # 扫描所有 loss 输出，检测是否有 NaN / Inf / 异常值
+        all_loss_values = []
+        nan_count = 0
+        inf_count = 0
+        
+        for match in re.finditer(r"'loss':\s*'([\d.e+\-]+|nan|inf|NaN|Inf)'", log_text):
+            val_str = match.group(1).lower()
+            if val_str == "nan":
+                nan_count += 1
+            elif val_str == "inf":
+                inf_count += 1
+            else:
+                try:
+                    all_loss_values.append(float(val_str))
+                except ValueError:
+                    pass
+        
+        # 构建 training_health 字段
+        training_health = {
+            "nan_loss_count": nan_count,
+            "inf_loss_count": inf_count,
+            "has_nan_loss": nan_count > 0,
+            "has_inf_loss": inf_count > 0,
+            "loss_values": all_loss_values[-5:] if all_loss_values else [],  # 最近 5 个正常 loss 值
+        }
+        
+        # 如果所有 loss 都是 NaN → 训练完全发散
+        if all_loss_values == [] and (nan_count > 0 or inf_count > 0):
+            training_health["status"] = "fully_diverged"
+        # 如果部分 loss 为 NaN → 训练部分发散
+        elif nan_count > 0 or inf_count > 0:
+            training_health["status"] = "partially_diverged"
+        # 如果没有 NaN/Inf → 训练 loss 正常
+        else:
+            training_health["status"] = "healthy"
+        
+        metrics["training_health"] = training_health
 
         # ── 解析 Early Stopping ──
         # "Early stopping" 表示训练收敛

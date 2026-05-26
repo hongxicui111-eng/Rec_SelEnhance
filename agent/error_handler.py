@@ -293,8 +293,8 @@ class LLMFixer:
         """
         from .prompts import FORMAT_FIX_PROMPT
         prompt = FORMAT_FIX_PROMPT.format(
-            raw_output=raw_output,
-            error_reason=error_reason,
+            _raw_output=raw_output,
+            _error_reason=error_reason,
         )
         print(f"\n  🔁 [LLMFixer] Asking LLM to fix format (reason: {error_reason})")
         result = self.llm.chat([

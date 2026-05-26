@@ -1181,7 +1181,15 @@ class RecSelfEvolveAgent:
         error_category = train_result.get("error_category", "UNKNOWN")
         fixable = train_result.get("fixable", True)
         
-        print(f"  错误分类: {error_category}")
+        # ── 如果 train_runner 未做分类 (error_category="UNKNOWN")，让 LLM 判断 ──
+        if error_category == "UNKNOWN":
+            print(f"  🔍 错误分类由 LLM 判断 (不再使用硬编码规则)")
+            error_category = self._classify_error_with_llm(train_result)
+            train_result["error_category"] = error_category
+            print(f"  LLM 判断的错误分类: {error_category}")
+        else:
+            print(f"  错误分类: {error_category}")
+        
         print(f"  是否可修复: {fixable}")
         print(f"  错误摘要: {train_result.get('error', '')[:150]}")
         
@@ -1212,6 +1220,13 @@ class RecSelfEvolveAgent:
 
         for round_idx in range(1, max_rounds + 1):
             print(f"\n  ── 自纠错第 {round_idx}/{max_rounds} 轮 ──")
+
+            # ── 如果 error_category 仍为 UNKNOWN，让 LLM 重新分类 ──
+            if error_category == "UNKNOWN":
+                print(f"  🔍 错误分类仍为 UNKNOWN, 让 LLM 重新判断")
+                error_category = self._classify_error_with_llm(train_result)
+                train_result["error_category"] = error_category
+                print(f"  LLM 重新分类: {error_category}")
 
             # ── BUG FIX #6: 策略适应 — 连续失败时切换修复方式 ──
             if consecutive_fix_failures >= 3 and error_category == "CODE_ERROR":
@@ -3970,28 +3985,11 @@ class RecSelfEvolveAgent:
             structural_history = self._clip_text_by_chars(structural_history, max_chars=4500)
             
             # ── 4. 构建 ERROR_FEEDBACK_PROMPT ──
-            # 判断错误类型
+            # 直接将完整错误信息交给 LLM 分析，不做人工分类
             error_msg = train_error.get("error", "")
-            if "CUDA out of memory" in error_msg or "OOM" in error_msg:
-                error_type = "OOM (显存溢出)"
-            elif "NaN" in error_msg or "nan" in error_msg:
-                error_type = "NaN Loss (训练发散)"
-            elif "SyntaxError" in error_msg or "IndentationError" in error_msg:
-                error_type = "Syntax Error (语法错误)"
-            elif "RuntimeError" in error_msg:
-                error_type = "Runtime Error (运行时错误)"
-            elif "FileNotFoundError" in error_msg:
-                error_type = "File Not Found (文件缺失)"
-            elif "ImportError" in error_msg or "ModuleNotFoundError" in error_msg:
-                error_type = "Import Error (依赖缺失)"
-            elif "DimensionMismatch" in error_msg or "size mismatch" in error_msg.lower() or "dimension" in error_msg.lower():
-                error_type = "Dimension Mismatch (维度不匹配)"
-            else:
-                error_type = train_error.get("status", "UNKNOWN")
             
             prompt = ERROR_FEEDBACK_PROMPT.format(
                 _original_proposal=json.dumps(original_proposal, indent=2, ensure_ascii=False),
-                _error_type=error_type,
                 _error_message=error_msg[:1500],
                 _error_log=train_error.get("log", "")[:2000],
                 _current_source_code=source_code_ctx,
@@ -4101,11 +4099,11 @@ class RecSelfEvolveAgent:
                     "self_correction_round": round_idx,
                     "original_proposal": original_proposal,
                     "revised_proposal": revised_proposal,
-                    "error_type": error_type,
+                    "error_type": error_msg[:200] or train_error.get("status", "UNKNOWN"),
                     "revised_metrics": revised_metrics,
                     "param_changes": revised_param_changes,
                     "structural_changes": revised_structural_changes,
-                    "explanation": f"自纠错第{round_idx}轮修正成功 (原错误: {error_type})",
+                    "explanation": f"自纠错第{round_idx}轮修正成功 (原错误: {error_msg[:80]})",
                 })
                 
                 # 返回修正后的成功结果
@@ -4162,7 +4160,7 @@ class RecSelfEvolveAgent:
             "iteration": iteration,
             "status": "SELF_CORRECTION_ALL_FAILED",
             "max_rounds": max_r,
-            "original_error_type": error_type,
+            "original_error_type": error_msg or train_error.get("status", "UNKNOWN"),
         })
         
         return None
@@ -4555,7 +4553,149 @@ class RecSelfEvolveAgent:
         
         return text
 
+    def _classify_error_with_llm(self, train_result: dict) -> str:
+        """
+        让 LLM 判断错误分类 (替代硬编码的字符串匹配)
+        
+        返回: "CODE_ERROR" | "CONFIG_ERROR" | "DATA_ERROR" | "SYSTEM_ERROR"
+        
+        这是最关键的改变: 不再用 if/elif 级联做字符串匹配来分类,
+        而是把完整的错误信息交给 LLM, 让它推理判断。
+        
+        原因: 硬编码分类经常不准确, 比如:
+        - RuntimeError: shape '[256, 1, -1]' 是维度不匹配(CODE_ERROR), 但硬编码会匹配为 "RuntimeError" → 可能被误标为 CONFIG_ERROR
+        - CUDA error 可能是显存不足(CONFIG_ERROR), 也可能是代码中的内存访问错误(CODE_ERROR)
+        - FileNotFoundError 可能是数据路径(DATA_ERROR), 也可能是项目源码缺失(CODE_ERROR)
+        
+        LLM 能看到完整的 traceback, 理解上下文, 给出更准确的分类。
+        """
+        error_msg = train_result.get("error", "")
+        traceback_details = train_result.get("traceback_details", {})
+        tb_text = traceback_details.get("traceback_text", "")
+        returncode = train_result.get("returncode")
+        
+        # 构建 traceback 展示
+        tb_display = ""
+        if tb_text:
+            tb_display += f"\n### 完整 Traceback:\n```\n{tb_text[:2000]}\n```"
+        files = traceback_details.get("files", [])
+        line_numbers = traceback_details.get("line_numbers", [])
+        if files:
+            tb_display += f"\n### 出错文件和行号:"
+            for f, l in zip(files, line_numbers):
+                tb_display += f"\n- **文件**: `{f}` @ **行 {l}**"
+        if not tb_display:
+            tb_display = f"\n### 错误信息:\n```\n{error_msg[:1500]}\n```"
+        
+        prompt = f"""训练运行失败，需要你判断错误的分类类别。
+
+## 错误信息
+```
+{error_msg[:2000]}
+```
+
+{tb_display}
+
+## 进程退出码: {returncode}
+
+## 四种错误分类
+
+请根据完整的错误信息 (包括 traceback 上下文), 判断这个错误属于哪一类:
+
+- **CODE_ERROR**: 源码代码有问题 (语法错误、维度不匹配、变量名错误、运行时错误等)
+  → 需要修改模型源码文件来修复
+  → 判断依据: traceback 中的出错文件属于项目内部代码, 错误类型是语法/维度/变量等代码级问题
+  
+- **CONFIG_ERROR**: 参数配置有问题 (OOM显存溢出、NaN Loss、超时、指标格式不匹配等)
+  → 需要调整超参数 (batch_size, lr, hidden_size 等) 或配置来修复
+  → 判断依据: 错误与训练资源/参数有关, 如显存不足、训练发散、命令格式问题
+  
+- **DATA_ERROR**: 数据路径或格式有问题 (找不到数据文件、路径错误、格式不兼容等)
+  → 需要修正数据路径或配置来修复
+  → 判断依据: FileNotFoundError 且涉及 /data/ 路径, 或数据格式/编码问题
+  
+- **SYSTEM_ERROR**: 系统环境问题 (缺少外部包、GPU不可用、权限问题等)
+  → 无法通过自纠错修复, 需要人工干预
+  → 判断依据: 外部包缺失 (ModuleNotFoundError)、GPU不可用、权限被拒
+
+### 输出格式
+
+只输出一个 JSON, 格式如下:
+```json
+{{"error_category": "CODE_ERROR", "reason": "简短说明为什么是这个分类"}}
+```
+
+注意: 只输出这一个 JSON, 不要输出其他内容。"""
+
+        try:
+            response = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": (
+                        "你是一位深度学习训练诊断专家, 擅长从错误信息中判断根因类别。"
+                        "你需要根据完整的 traceback 上下文来判断错误分类, 不要只看错误类型名称。"
+                        "例如: RuntimeError 可能是 CODE_ERROR (维度不匹配) 或 CONFIG_ERROR (OOM), "
+                        "需要看 traceback 的具体内容和出错文件来判断。"
+                    )},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,  # 分类判断用极低温度, 确保确定性
+                max_tokens=150,   # 只需要输出分类, 不需要长回复
+            )
+            
+            if response is None:
+                logger.warning("LLM classification call failed, falling back to heuristic")
+                return self._classify_error_heuristic(train_result)
+            
+            # 解析 LLM 回复
+            # 尝试提取 JSON
+            json_match = re.search(r'\{[^{}]+\}', response)
+            if json_match:
+                try:
+                    result = json.loads(json_match.group())
+                    category = result.get("error_category", "")
+                    reason = result.get("reason", "")
+                    
+                    # 验证分类是合法的
+                    valid_categories = ("CODE_ERROR", "CONFIG_ERROR", "DATA_ERROR", "SYSTEM_ERROR")
+                    if category in valid_categories:
+                        logger.info(f"LLM classified error as {category}: {reason}")
+                        return category
+                    else:
+                        logger.warning(f"LLM returned invalid category '{category}', falling back to heuristic")
+                        return self._classify_error_heuristic(train_result)
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse LLM classification JSON: {response[:200]}")
+            
+            # 尝试从文本中提取分类
+            for cat in ("CODE_ERROR", "CONFIG_ERROR", "DATA_ERROR", "SYSTEM_ERROR"):
+                if cat in response:
+                    logger.info(f"LLM classification extracted from text: {cat}")
+                    return cat
+            
+            # 所有尝试都失败 → 回退到启发式
+            logger.warning("Could not extract classification from LLM response, falling back to heuristic")
+            return self._classify_error_heuristic(train_result)
+            
+        except Exception as e:
+            logger.error(f"Error during LLM classification: {e}")
+            return self._classify_error_heuristic(train_result)
+
+    @staticmethod
+    def _classify_error_heuristic(train_result: dict) -> str:
+        """
+        启发式回退: 当 LLM 分类失败时的简单兜底
+        
+        只做最基本的判断:
+        - 有 traceback → CODE_ERROR (源码问题)
+        - 无 traceback → SYSTEM_ERROR (系统/环境问题)
+        """
+        traceback_details = train_result.get("traceback_details", {})
+        if traceback_details.get("traceback_text"):
+            return "CODE_ERROR"
+        return "SYSTEM_ERROR"
+
     def _phase_train_diagnosis_and_retry(
+        self,
         iteration: int,
         train_error: dict,
         max_rounds: int = None,

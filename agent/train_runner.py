@@ -135,6 +135,33 @@ class FaultTolerantTrainRunner:
                     # 尝试解析指标 (从整个输出解析, 不再只从最后部分)
                     metrics = self.adapter.parse_metrics_from_log(combined)
 
+                    # ── 关键新增: 检测 NaN/Inf loss — 训练健康状态检查 ──
+                    training_health = metrics.get("training_health", {})
+                    health_status = training_health.get("status", "healthy")
+                    
+                    if health_status in ("fully_diverged", "partially_diverged"):
+                        # 训练 loss 出现 NaN/Inf → 即使进程没崩溃, 模型也是废的!
+                        nan_count = training_health.get("nan_loss_count", 0)
+                        inf_count = training_health.get("inf_loss_count", 0)
+                        logger.warning(f"NaN/Inf loss detected during training! NaN={nan_count}, Inf={inf_count}")
+                        print(f"  ✗ Training loss diverged: {nan_count} NaN epochs, {inf_count} Inf epochs")
+                        print(f"     health_status={health_status}")
+                        # 返回失败, 让上层 LLM 判断是 CONFIG_ERROR (需要调参) 还是 CODE_ERROR (模型有bug)
+                        return {
+                            "status": "FAILED",
+                            "error": f"Training loss diverged (NaN/Inf): {nan_count} NaN epochs, {inf_count} Inf epochs. "
+                                     f"Training health: {health_status}. "
+                                     f"Last few loss values: {training_health.get('loss_values', [])}",
+                            "error_category": "UNKNOWN",  # 让 LLM 判断是代码bug还是参数问题
+                            "fixable": True,
+                            "traceback_details": {},
+                            "log": combined[-3000:],
+                            "metrics": metrics,  # 保留 metrics (含 training_health), 供上层参考
+                            "applied_overrides": working_overrides,
+                            "action": "fix_and_retry",
+                            "returncode": returncode,
+                        }
+
                     if metrics:
                         logger.info(f"Training OK. Metrics: {metrics}")
                         print(f"  ✓ Training converged. Metrics: {self.adapter.format_metrics_for_llm(metrics)}")
@@ -154,6 +181,29 @@ class FaultTolerantTrainRunner:
                     has_training_keywords = any(
                         kw in combined for kw in ["Epoch", "epoch", "loss", "Loss", "train", "valid", "test"]
                     )
+                    
+                    # ── 即使 metrics 为空, 也要检查 NaN loss ──
+                    # 因为 parse_metrics_from_log 可能因为格式问题没有返回 metrics dict
+                    # 但 NaN loss 信息可以从原始输出直接扫描
+                    if not training_health or training_health.get("status") == "healthy":
+                        # training_health 没有或不完整 → 从原始输出直接扫描 NaN
+                        direct_nan_count = len(re.findall(r"'loss':\s*'nan'", combined, re.IGNORECASE))
+                        direct_inf_count = len(re.findall(r"'loss':\s*'inf'", combined, re.IGNORECASE))
+                        if direct_nan_count > 0 or direct_inf_count > 0:
+                            print(f"  ✗ NaN/Inf loss detected in raw output: {direct_nan_count} NaN, {direct_inf_count} Inf")
+                            return {
+                                "status": "FAILED",
+                                "error": f"Training loss diverged: {direct_nan_count} NaN epochs, {direct_inf_count} Inf epochs detected in raw output",
+                                "error_category": "UNKNOWN",
+                                "fixable": True,
+                                "traceback_details": {},
+                                "log": combined[-3000:],
+                                "metrics": metrics,
+                                "applied_overrides": working_overrides,
+                                "action": "fix_and_retry",
+                                "returncode": returncode,
+                            }
+                    
                     if has_training_keywords and likely_success:
                         # 训练看起来是成功的, 只是指标格式不匹配
                         logger.warning("Training likely succeeded but metrics format not recognized")
@@ -246,38 +296,14 @@ class FaultTolerantTrainRunner:
                         "diagnostics": diagnostics,
                     }
 
-                # ---------- 错误分类与自动恢复 ----------
+                # ---------- 错误信息提取 (不做分类, 由上层 LLM 判断) ----------
                 error_msg = combined[-3000:]
 
                 # ── 提取完整 traceback 详情 ──
                 traceback_details = self._extract_traceback_details(combined)
 
-                # ── 分类错误 ──
-                error_category = self._classify_error(error_msg, traceback_details)
-
-                # ── CUDA OOM (CONFIG_ERROR — 可通过调参修复) ──
-                if error_category == "CONFIG_ERROR" and any(
-                    kw in error_msg for kw in ["CUDA out of memory", "out of memory", "OOM", "memory exhausted"]
-                ):
-                    current_batch = working_overrides.get("batch_size",
-                                                          self.adapter.base_args.get("batch_size", 1024))
-                    new_batch = max(int(current_batch * self.oom_reduce_factor), 1)
-                    working_overrides["batch_size"] = new_batch
-                    logger.warning(f"OOM! Reducing batch_size: {current_batch} → {new_batch}")
-                    continue  # 重试 (这是配置错误, 自动调参即可)
-
-                # ── NaN Loss (CONFIG_ERROR — 可通过调参修复) ──
-                if error_category == "CONFIG_ERROR" and any(
-                    kw in error_msg for kw in ["NaN", "nan", "inf", "division by zero", "unexpected EOF", "CUDA error"]
-                ):
-                    current_lr = working_overrides.get("lr",
-                                                       self.adapter.base_args.get("lr", 1e-3))
-                    new_lr = current_lr * self.nan_reduce_factor
-                    working_overrides["lr"] = new_lr
-                    logger.warning(f"NaN/Inf detected! Reducing lr: {current_lr} → {new_lr}")
-                    continue  # 重试
-
                 # ── 缺失外部依赖 (SYSTEM_ERROR — 可尝试安装) ──
+                # 这是唯一保留的自动恢复逻辑: pip install 缺失包是确定性操作, 不需要 LLM 判断
                 missing_pkg = self._extract_missing_package(error_msg)
                 if missing_pkg:
                     logger.info(f"Missing package: {missing_pkg}, auto-installing...")
@@ -288,24 +314,23 @@ class FaultTolerantTrainRunner:
                     logger.info(f"Install result: {install.stdout[-200:]}")
                     continue  # 重试
 
-                # ── 其他所有错误: 返回详细错误信息给上层 ──
-                # 关键改变: 不再简单返回 action="log_and_skip"
-                # 而是返回 fixable=True/False 和 error_category, 让上层自纠错循环决定如何处理
+                # ── 所有其他错误: 返回完整错误信息给上层, 由 LLM 判断分类和修复策略 ──
+                # 不再做硬编码的 OOM/NaN 自动恢复, 也不做 _classify_error 分类
+                # 上层 core.py 会调用 LLM 来判断 error_category
                 
-                # 如果有输出但没有 traceback, 且退出码为0 → 可能是指标解析问题, 不一定是训练失败
+                fixable = True  # 默认可修复, 上层 LLM 可能推翻此判断
+                if returncode in (134, 137, 139):
+                    # abort/kill/segfault → 系统层异常, LLM 也难以修复
+                    fixable = False
+                
+                # 如果有输出但没有 traceback, 且退出码为0 → 可能是指标解析问题
                 if returncode == 0 and not has_traceback:
-                    # 训练进程正常退出但没有解析到指标
-                    # 这更可能是指标格式问题, 而不是真正的训练失败
-                    error_category = "CONFIG_ERROR"  # 改为 CONFIG_ERROR, 让 LLM 尝试分析
                     fixable = True
-                else:
-                    error_category = self._classify_error(error_msg, traceback_details)
-                    fixable = self._is_fixable(error_category, traceback_details, returncode)
                 
                 return {
                     "status": "FAILED",
                     "error": error_msg[:1500],
-                    "error_category": error_category,
+                    "error_category": "UNKNOWN",  # 由上层 LLM 判断, 不再硬编码分类
                     "fixable": fixable,
                     "traceback_details": traceback_details,
                     "log": combined[-3000:],
@@ -340,9 +365,9 @@ class FaultTolerantTrainRunner:
 
         return {
             "status": "FAILED_AFTER_RETRY",
-            "error": f"Failed after {max_attempts} attempts (OOM/NaN auto-reduce also failed)",
-            "error_category": "CONFIG_ERROR",
-            "fixable": True,  # OOM/NaN 调参失败仍可能通过 LLM 诊断修复
+            "error": f"Failed after {max_attempts} attempts (missing package auto-install also failed)",
+            "error_category": "UNKNOWN",  # 由上层 LLM 判断
+            "fixable": True,
             "traceback_details": {},
             "action": "fix_and_retry",
         }
@@ -522,104 +547,26 @@ class FaultTolerantTrainRunner:
 
     def _classify_error(self, error_msg: str, traceback_details: dict) -> str:
         """
-        分类错误类型:
-        - CODE_ERROR:  源码有问题 (语法错误、运行时错误、维度不匹配、变量名错误等)
-                       → 需要修改源码文件来修复
-        - CONFIG_ERROR: 参数配置有问题 (OOM、NaN、超时等)
-                       → 需要调整超参数来修复
-        - DATA_ERROR:   数据路径或格式有问题
-                       → 需要修正路径或数据格式
-        - SYSTEM_ERROR: 系统环境问题 (缺少外部包、GPU不可用等)
-                       → 无法自动修复, 需要人工干预
+        不再硬编码分类错误 — 返回 "UNKNOWN" 让上层 LLM 判断
+        
+        错误分类 (CODE_ERROR / CONFIG_ERROR / DATA_ERROR / SYSTEM_ERROR)
+        现在完全由 core.py 中调用 LLM 来决定，而不是字符串匹配。
+        
+        train_runner 只负责提取原始错误信息 (traceback, error_msg 等)，
+        分类决策交给有推理能力的 LLM。
         """
-        # ── CODE_ERROR: 源码代码错误 ──
-        code_error_patterns = [
-            # 语法错误
-            "SyntaxError", "IndentationError", "TabError",
-            # 运行时错误 (通常来自模型代码中的 bug)
-            "RuntimeError: size mismatch", "RuntimeError: dimension",
-            "RuntimeError: Expected", "mat1 and mat2 shapes cannot be multiplied",
-            "dimension mismatch", "DimensionMismatch",
-            "size mismatch for", "shape mismatch",
-            "not enough values to unpack", "too many values to unpack",
-            # 变量/函数名错误
-            "NameError:", "AttributeError:", "TypeError:",
-            "UnboundLocalError:",
-            # 导入错误 (项目内部的, 不是外部包)
-            "cannot import name", "ImportError:",
-        ]
-        
-        # 需要排除: 如果是外部包缺失, 则是 SYSTEM_ERROR
-        for pattern in code_error_patterns:
-            if pattern in error_msg:
-                # 但如果是外部包 (如 torch/numpy 缺失), 不算 CODE_ERROR
-                if "ModuleNotFoundError: No module named" in error_msg:
-                    # 检查是否是项目内部模块
-                    missing_pkg = self._extract_missing_package(error_msg)
-                    if missing_pkg and missing_pkg not in ("torch", "numpy", "pandas", "sklearn",
-                                                           "transformers", "scipy", "tensorflow"):
-                        # 可能是项目内部模块导入路径有问题 → CODE_ERROR
-                        # 也可能是外部包缺失 → SYSTEM_ERROR
-                        # 检查 traceback 中的文件路径来判断
-                        tb_files = traceback_details.get("files", [])
-                        if any(self.project_root in f for f in tb_files):
-                            return "CODE_ERROR"  # 项目内部代码导入错误
-                        else:
-                            return "SYSTEM_ERROR"  # 外部包缺失
-                return "CODE_ERROR"
-        
-        # ── CONFIG_ERROR: 参数配置错误 ──
-        config_error_patterns = [
-            "CUDA out of memory", "out of memory", "OOM", "memory exhausted",
-            "NaN", "nan", "inf", "division by zero",
-            "CUDA error: an illegal memory access was encountered",
-        ]
-        for pattern in config_error_patterns:
-            if pattern in error_msg:
-                return "CONFIG_ERROR"
-        
-        # ── DATA_ERROR: 数据文件问题 ──
-        data_error_patterns = [
-            "FileNotFoundError", "No such file or directory",
-            "Permission denied",
-        ]
-        for pattern in data_error_patterns:
-            if pattern in error_msg:
-                # 检查是否是数据文件路径
-                if "/data/" in error_msg or "data_name" in error_msg or ".txt" in error_msg:
-                    return "DATA_ERROR"
-                # 可能是项目内部源码文件缺失 → CODE_ERROR
-                return "CODE_ERROR"
-        
-        # ── 如果 traceback 出错文件在项目根目录 → CODE_ERROR ──
-        tb_files = traceback_details.get("files", [])
-        if any(self.project_root in f or "Recmodel" in f for f in tb_files):
-            return "CODE_ERROR"
-        
-        # ── 默认: 如果有 traceback, 认为是 CODE_ERROR ──
-        if traceback_details.get("traceback_text"):
-            return "CODE_ERROR"
-        
-        # ── 无法分类 → SYSTEM_ERROR ──
-        return "SYSTEM_ERROR"
+        return "UNKNOWN"
 
     def _is_fixable(self, error_category: str, traceback_details: dict, returncode: Optional[int] = None) -> bool:
         """
-        判断错误是否可以通过自纠错修复:
-        - CODE_ERROR: fixable=True → LLM 可以修改源码修复
-        - CONFIG_ERROR: fixable=True → LLM 可以调整参数修复
-        - DATA_ERROR: fixable=True → LLM 可以修正路径/配置修复
-        - SYSTEM_ERROR: fixable=False → 需要人工干预
-
-        额外规则（开源 Agent 常见实践）:
-        - returncode 为 134/137/139（abort/kill/segfault）倾向系统层异常，默认不可修复
+        判断错误是否可以通过自纠错修复 — 简化版
+        
+        现在不再依赖硬编码的 error_category 分类，
+        只做最基本的判断: returncode 为 134/137/139 → 不可修复
+        其他情况默认 fixable=True, 让上层 LLM 来做最终决策
         """
         if returncode in (134, 137, 139):
             return False
-
-        if error_category == "SYSTEM_ERROR":
-            return False
-        # CODE_ERROR, CONFIG_ERROR, DATA_ERROR 都可以通过 LLM 自纠错修复
         return True
 
     def _extract_traceback_details(self, combined_output: str) -> dict:
