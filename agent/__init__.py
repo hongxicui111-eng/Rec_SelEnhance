@@ -21,4 +21,6 @@ from .iterative_memory import IterativeMemory
 from .context_compressor import LLMContextCompressor
 from .code_query_tool import CodeQueryTool
 
-__version__ = "0.6.0"
+from .hypothesis_verification_agent import HypothesisVerificationAgent
+
+__version__ = "0.7.0"

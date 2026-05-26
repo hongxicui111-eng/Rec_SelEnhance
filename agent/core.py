@@ -40,6 +40,7 @@ from .prompts import (
     SEARCH_REPLACE_FIX_PROMPT,
 )
 from .llm_analyzer import LLMCaseAnalyzer
+from .hypothesis_verification_agent import HypothesisVerificationAgent
 from .structure_applier import StructureApplier
 from .iterative_memory import IterativeMemory
 from .context_compressor import LLMContextCompressor
@@ -120,6 +121,14 @@ class RecSelfEvolveAgent:
         self.item_text_map = self._load_item_text_map()
         self.case_analyzer = LLMCaseAnalyzer(self.llm, self.item_text_map)
 
+        # ---- 假设验证 Agent (自主式: LLM生成方案 → 写代码 → 执行 → 分析) ----
+        self.hypothesis_verifier = HypothesisVerificationAgent(
+            self.llm, self.item_text_map,
+            project_root=self.config.project_root,
+            data_dir=os.path.join(self.config.project_root, "Recmodel", "data"),
+            log_dir=self.config.log_dir,
+        )
+
         # ---- 代码查询工具 (核心新增!) ----
         self._code_query_enabled = self.config.enable_code_query
         if self._code_query_enabled:
@@ -135,6 +144,7 @@ class RecSelfEvolveAgent:
         self.llm_health_ok = False
         self._last_surprise_report = None  # 上次惊喜评估报告
         self._last_case_analysis = None     # 上次案例分析结果
+        self._last_verification_report = None   # 上次假设验证报告
         self._last_wrong_text_cases = None  # 上次提取的错误文本案例
         self._last_structural_changes = None   # 上次结构修改提案
         # _structural_change_history 已迁移到 IterativeMemory — 不再使用 list
@@ -361,6 +371,26 @@ class RecSelfEvolveAgent:
                     "surprise_report": surprise_and_analysis.get("evaluation_report_summary"),
                     "case_analysis_summary": surprise_and_analysis.get("case_analysis_summary"),
                 })
+
+                # --- Phase 2.6: 假设验证 (验证 LLM 分析结论是否有数据支撑) ---
+                verification_result = self._phase_verify_analysis(
+                    surprise_and_analysis, metrics
+                )
+                if verification_result:
+                    self._last_verification_report = verification_result
+                    # 将验证结果应用到案例分析, 过滤被反驳的结论
+                    self._last_case_analysis = self.hypothesis_verifier.apply_verification_to_analysis(
+                        self._last_case_analysis, verification_result
+                    )
+                    self.journal.record({
+                        "iteration": i,
+                        "phase": "hypothesis_verification",
+                        "status": "VERIFICATION_DONE",
+                        "overall_credibility": verification_result.get("overall_credibility", "LOW"),
+                        "confirmed_pct": verification_result.get("confirmed_pct", 0),
+                        "refuted_pct": verification_result.get("refuted_pct", 0),
+                        "refuted_claims": [r.get("claim", "") for r in verification_result.get("refuted", [])],
+                    })
 
             # --- Phase 3: 安全护栏 ---
             violations = self.safety.check_metrics(metrics)
@@ -2373,6 +2403,102 @@ class RecSelfEvolveAgent:
             traceback.print_exc()
             return None
 
+    def _phase_verify_analysis(self, surprise_and_analysis: dict, metrics: dict) -> Optional[dict]:
+        """
+        假设验证阶段 — 验证 LLM 分析结论是否有数据支撑
+        
+        工作流程 (新版 Agent 流程):
+        1. 从 LLM 案例分析结果中提取可验证的假设 (不限制验证类型)
+        2. 为每个假设: LLM生成验证方案 → 发现数据 → 写代码 → 执行 → LLM解读结果
+        3. 生成验证报告 (CONFIRMED / REFUTED / UNVERIFIABLE)
+        4. 将验证结果反馈给下游流程
+        
+        与旧版区别:
+        - 旧版: 固定6种验证方法 + 硬编码阈值
+        - 新版: LLM 自主生成验证方案 + 写代码执行 + 解读结果
+        
+        Args:
+            surprise_and_analysis: _phase_surprise_analysis 的返回结果
+            metrics: 当前评估指标
+            
+        Returns:
+            验证报告 dict, or None if 验证无法执行
+        """
+        case_analysis = surprise_and_analysis.get("case_analysis")
+        wrong_text_cases = surprise_and_analysis.get("wrong_text_cases")
+        
+        if not case_analysis or not case_analysis.get("parse_success"):
+            logger.info("Skipping hypothesis verification: no valid case analysis available")
+            return None
+        
+        print(f"  🔬 [Phase 2.6] Verifying LLM analysis hypotheses (Agent autonomous mode)...")
+        
+        try:
+            # --- Step 1: 从 LLM 分析中提取可验证的假设 ---
+            hypotheses = self.hypothesis_verifier.extract_hypotheses(case_analysis)
+            if not hypotheses:
+                logger.info("No verifiable hypotheses extracted from LLM analysis")
+                return None
+            
+            print(f"  📋 Extracted {len(hypotheses)} hypotheses to verify")
+            for h in hypotheses:
+                thought = h.get('verification_thought', h.get('verification_method', '?'))
+                print(f"    {h.get('id', '?')}: {h.get('claim', '')[:60]}... "
+                      f"[thought={thought[:40]}]")
+            
+            # --- Step 2: 准备验证所需的数据 ---
+            # 物品热度分布 (从训练数据中计算)
+            item_popularity = {}
+            eval_report = surprise_and_analysis.get("evaluation_report", {})
+            
+            # 尝试从已有数据中获取热度信息
+            # 如果 surprise_and_analysis 中有 train_data, 直接计算
+            # 否则从日志中加载
+            popularity_path = os.path.join(
+                self.config.log_dir,
+                f"item_popularity_{self.adapter.data_name}.json"
+            )
+            if os.path.exists(popularity_path):
+                with open(popularity_path, 'r', encoding='utf-8') as f:
+                    item_popularity = json.load(f)
+                logger.info(f"Loaded item popularity from {popularity_path}: {len(item_popularity)} items")
+            
+            overall_metrics = metrics
+            surprise_metrics = eval_report.get("surprise_subset")
+            
+            # --- Step 3: 运行验证 ---
+            verified_hypotheses = self.hypothesis_verifier.verify_hypotheses(
+                hypotheses=hypotheses,
+                wrong_text_cases=wrong_text_cases or [],
+                all_wrong_cases=None,  # 原始格式案例暂不可用
+                model_config=self.adapter.base_args,
+                item_popularity=item_popularity,
+                overall_metrics=overall_metrics,
+                surprise_metrics=surprise_metrics,
+            )
+            
+            # --- Step 4: 生成验证报告 ---
+            verification_report = self.hypothesis_verifier.generate_verification_report(
+                verified_hypotheses
+            )
+            
+            # --- Step 5: 保存验证报告 ---
+            verification_path = os.path.join(
+                self.config.log_dir,
+                f"verification_{self.adapter.data_name}_iter{self.current_iteration}.json"
+            )
+            self.hypothesis_verifier.save_verification_report(
+                verification_report, verification_path
+            )
+            
+            return verification_report
+            
+        except Exception as e:
+            logger.error(f"Hypothesis verification failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
     def _find_latest_checkpoint(self, project_root: str) -> Optional[str]:
         """
         查找最新的模型 checkpoint
@@ -2499,7 +2625,7 @@ class RecSelfEvolveAgent:
 ```
 """
 
-        # 构建案例分析信息 (如果有)
+        # 构建案例分析信息 (如果有) — 包含验证状态标注
         case_info = ""
         if self._last_case_analysis:
             ca = self._last_case_analysis
@@ -2512,6 +2638,35 @@ class RecSelfEvolveAgent:
 - **改进建议**: {json.dumps(ca.get("improvement_suggestions", []), ensure_ascii=False)[:800]}
 - **总结**: {ca.get("summary", "")}
 """
+                # ── 添加验证状态 (如果有) ──
+                if self._last_verification_report:
+                    vm = ca.get("verification_meta", {})
+                    if vm:
+                        refuted = vm.get("refuted_claims", [])
+                        credibility = vm.get("overall_credibility", "LOW")
+                        field_verification = vm.get("field_verification", {})
+                        
+                        verification_info = f"""
+## ⚠ 假设验证结果 (数据对 LLM 结论的验证)
+**综合可信度**: {credibility} (已确认{vm.get('confirmed_pct', 0):.0f}%, 被反驳{vm.get('refuted_pct', 0):.0f}%)
+
+"""
+                        if refuted:
+                            verification_info += "**❌ 以下结论被数据反驳, 不要基于这些结论提出改进**:\n"
+                            for rc in refuted:
+                                verification_info += f"- ❌ {rc[:100]}\n"
+                            verification_info += "\n"
+                        
+                        # 逐字段标注验证状态
+                        if field_verification:
+                            verification_info += "**逐字段验证状态**:\n"
+                            for field, verifications in field_verification.items():
+                                statuses = [v.get("status", "?") for v in verifications]
+                                confirmed_count = sum(1 for s in statuses if s == "CONFIRMED")
+                                refuted_count = sum(1 for s in statuses if s == "REFUTED")
+                                verification_info += f"- {field}: {confirmed_count}确认 / {refuted_count}反驳\n"
+                        
+                        case_info += verification_info
 
         # 构建 Prompt
         prompt = MLE_ANALYSIS_PROMPT.format(
