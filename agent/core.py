@@ -1136,17 +1136,19 @@ class RecSelfEvolveAgent:
         "每次运行结束不是先判断运行是否成功，从终端获取错误信息，
          如果错误的话，就修改代码，运行，不应该是这样吗"
         
-        工作流程:
+        工作流程 (统一诊断+修复模式, 不再按错误类型硬分支):
         1. 运行训练
         2. 立即检查是否成功
         3. 如果失败 → 从终端输出提取错误信息
-        4. 分类错误: CODE_ERROR(修源码) / CONFIG_ERROR(调参数) / DATA_ERROR(修路径)
-        5. 根据错误类型, 让 LLM 修复:
-           - CODE_ERROR → 修改源码文件中的 bug → 重训
-           - CONFIG_ERROR → 调整超参数 → 重训
-           - DATA_ERROR → 修正路径/配置 → 重训
-        6. 重复 1-5, 最多 max_rounds 次
-        7. 全部失败 → 回退并返回最终错误
+        4. 让 LLM 直接诊断根因并给出复合修复方案
+           - LLM 可以同时建议修源码 + 调参数 (不再强制归入单一分类)
+           - 例如 NaN Loss: LLM 判断是代码bug(如log(0)) → 修源码
+                           或参数问题(lr过大) → 调参数
+                           或两者都有 → 同时修源码+调参数
+        5. 应用 LLM 给出的修复方案 (structural_changes + param_changes)
+        6. 重新训练验证
+        7. 重复 4-6, 最多 max_rounds 次 (连续失败时自动升级策略)
+        8. 全部失败 → 回退并返回最终错误
         
         Args:
             iteration: 当前迭代轮次
@@ -1171,25 +1173,14 @@ class RecSelfEvolveAgent:
             print(f"  ✓ {phase_name} training SUCCESS")
             return train_result
         
-        # ── 训练失败 → 进入自纠错内循环! ──
+        # ── 训练失败 → 进入统一自纠错内循环! ──
         print(f"\n  ╔══════════════════════════════════════╗")
         print(f"  ║  🔁 进入自纠错内循环                  ║")
-        print(f"  ║  训练失败 → 提取错误 → 修复 → 重试    ║")
+        print(f"  ║  统一诊断 → 复合修复 → 重试           ║")
         print(f"  ║  最多 {max_rounds} 轮自纠错              ║")
         print(f"  ╚══════════════════════════════════════╝")
         
-        error_category = train_result.get("error_category", "UNKNOWN")
         fixable = train_result.get("fixable", True)
-        
-        # ── 如果 train_runner 未做分类 (error_category="UNKNOWN")，让 LLM 判断 ──
-        if error_category == "UNKNOWN":
-            print(f"  🔍 错误分类由 LLM 判断 (不再使用硬编码规则)")
-            error_category = self._classify_error_with_llm(train_result)
-            train_result["error_category"] = error_category
-            print(f"  LLM 判断的错误分类: {error_category}")
-        else:
-            print(f"  错误分类: {error_category}")
-        
         print(f"  是否可修复: {fixable}")
         print(f"  错误摘要: {train_result.get('error', '')[:150]}")
         
@@ -1206,31 +1197,26 @@ class RecSelfEvolveAgent:
         
         if not fixable:
             # 不可修复 → 直接返回失败结果
-            print(f"  ⏭ 错误不可自动修复 (SYSTEM_ERROR), 跳过自纠错")
+            print(f"  ⏭ 错误不可自动修复, 跳过自纠错")
             train_result["fix_attempts"] = 0
             return train_result
         
-        # ── 自纠错内循环 ──
-        # ── BUG FIX #6: 添加策略适应机制 ──
-        # 当连续多轮使用同一种修复方式都失败时, 自动切换策略:
-        # - 连续 3 轮 code_fix_failed → 切换到 replace_class 策略
-        # - 连续 5 轮同一种方式失败 → 尝试整文件重写
+        # ── 统一自纠错内循环 ──
+        # 不再按 CODE_ERROR / CONFIG_ERROR / DATA_ERROR 分支!
+        # 每轮都让 LLM 诊断根因并给出复合修复方案 (可以同时修源码+调参数)
+        # 策略适应仍然保留, 但基于连续失败次数而非错误分类
         consecutive_fix_failures = 0  # 连续修复失败计数
         last_fix_action = None        # 上次的修复 action
+        diagnosis_tags = ["unknown"]  # 初始化诊断标签 (用于循环结束后记录)
 
         for round_idx in range(1, max_rounds + 1):
             print(f"\n  ── 自纠错第 {round_idx}/{max_rounds} 轮 ──")
 
-            # ── 如果 error_category 仍为 UNKNOWN，让 LLM 重新分类 ──
-            if error_category == "UNKNOWN":
-                print(f"  🔍 错误分类仍为 UNKNOWN, 让 LLM 重新判断")
-                error_category = self._classify_error_with_llm(train_result)
-                train_result["error_category"] = error_category
-                print(f"  LLM 重新分类: {error_category}")
-
-            # ── BUG FIX #6: 策略适应 — 连续失败时切换修复方式 ──
-            if consecutive_fix_failures >= 3 and error_category == "CODE_ERROR":
-                print(f"  🔄 策略适应: 连续 {consecutive_fix_failures} 轮 code_fix_failed → 尝试 replace_class 策略")
+            # ── 策略适应: 连续失败时切换修复方式 ──
+            # 注意: 这些策略不再依赖 error_category 判断,
+            # 因为连续失败本身就说明当前方法不够用
+            if consecutive_fix_failures >= 3:
+                print(f"  🔄 策略适应: 连续 {consecutive_fix_failures} 轮失败 → 尝试 replace_class 策略")
                 fix_result = self._fix_code_error_with_class_replacement(
                     iteration=iteration,
                     train_error=train_result,
@@ -1245,14 +1231,13 @@ class RecSelfEvolveAgent:
                         fix_result["fix_attempts"] = round_idx
                         return fix_result
                     train_result = fix_result
-                    error_category = fix_result.get("error_category", error_category)
                     continue
                 else:
                     consecutive_fix_failures += 1
                     print(f"  ✗ replace_class 策略也失败")
                     # 继续下一轮, 但会尝试更激进的策略
 
-            if consecutive_fix_failures >= 5 and error_category == "CODE_ERROR":
+            if consecutive_fix_failures >= 5:
                 print(f"  🔄 策略适应: 连续 {consecutive_fix_failures} 轮都失败 → 尝试整文件重写策略")
                 fix_result = self._fix_code_error_whole_file(
                     iteration=iteration,
@@ -1268,18 +1253,26 @@ class RecSelfEvolveAgent:
                         fix_result["fix_attempts"] = round_idx
                         return fix_result
                     train_result = fix_result
-                    error_category = fix_result.get("error_category", error_category)
                     continue
                 else:
                     consecutive_fix_failures += 1
 
-            # ── 根据错误类型选择修复策略 ──
-            if error_category == "CODE_ERROR":
-                # ════════════════════════════════════
-                # CODE_ERROR: 源码有 bug → 让 LLM 修复源码!
-                # ════════════════════════════════════
-                print(f"  🔧 修复策略: 修改源码中的代码 bug")
+            # ══════════════════════════════════════════════════════
+            # 统一诊断+修复: 让 LLM 直接诊断根因并给出复合修复方案
+            # ══════════════════════════════════════════════════════
+            print(f"  🧠 LLM 诊断错误根因并给出修复方案...")
 
+            fix_proposal = self._diagnose_and_propose_fix_with_llm(train_result)
+            
+            # ── 如果 LLM 判断为不可修复 → 直接退出 ──
+            if fix_proposal.get("not_fixable"):
+                print(f"  ⏭ LLM 判断为不可修复: {fix_proposal.get('explanation', '')[:150]}")
+                train_result["fix_attempts"] = round_idx
+                return train_result
+            
+            # ── 如果诊断回退到 _fallback_to_code_fix → 用传统 _fix_code_error 重新修复 ──
+            if fix_proposal.get("_fallback_to_code_fix"):
+                print(f"  🔧 诊断回退: 使用传统 _fix_code_error 修复流程")
                 fix_result = self._fix_code_error(
                     iteration=iteration,
                     train_error=train_result,
@@ -1287,8 +1280,8 @@ class RecSelfEvolveAgent:
                     round_idx=round_idx,
                     param_overrides=param_overrides,
                 )
-
-                # ── BUG FIX #6: 跟踪连续失败 ──
+                
+                # 跟踪连续失败
                 if fix_result["action"] == "code_fix_failed":
                     if last_fix_action == "code_fix_failed":
                         consecutive_fix_failures += 1
@@ -1297,94 +1290,175 @@ class RecSelfEvolveAgent:
                 elif fix_result["action"] in ("code_fixed_and_retrained", "code_fixed_but_retrain_failed"):
                     consecutive_fix_failures = 0
                 last_fix_action = fix_result["action"]
-
+                
                 if fix_result["action"] == "code_fixed_and_retrained":
-                    # 源码修复成功 + 重新训练成功!
                     print(f"  ✓✓ 自纠错成功! 代码bug修复 + 重训通过!")
                     fix_result["fix_attempts"] = round_idx
                     return fix_result
-
                 elif fix_result["action"] == "code_fixed_but_retrain_failed":
-                    # 源码修复成功, 但重新训练仍然失败 → 用新错误信息继续自纠错
                     print(f"  ✓ 代码bug已修复, 但重训仍失败")
-                    print(f"     新错误: {fix_result.get('error', '')[:100]}")
                     train_result = fix_result
-                    error_category = fix_result.get("error_category", error_category)
                     continue
-
                 elif fix_result["action"] == "code_fix_failed":
-                    # LLM 修复源码失败 → 回滚, 继续自纠错
-                    print(f"  ✗ 代码bug修复失败 (连续失败 {consecutive_fix_failures} 次)")
+                    print(f"  ✗ 代码修复失败 (连续失败 {consecutive_fix_failures} 次)")
                     continue
-
                 elif fix_result["action"] == "skip":
-                    # 无法修复 → 退出自纠错
                     print(f"  ⏭ 无法修复此错误")
                     train_result["fix_attempts"] = round_idx
                     return train_result
-
-            elif error_category == "CONFIG_ERROR":
-                # ════════════════════════════════════
-                # CONFIG_ERROR: 参数配置有问题 → 让 LLM 调参!
-                # ════════════════════════════════════
-                print(f"  🔧 修复策略: 调整训练参数配置")
-
-                fix_result = self._fix_config_error(
-                    iteration=iteration,
-                    train_error=train_result,
-                    phase_name=phase_name,
-                    param_overrides=param_overrides,
-                    round_idx=round_idx,
-                )
-
-                if fix_result["action"] == "config_fixed_and_retrained":
-                    print(f"  ✓✓ 自纠错成功! 参数调整 + 重训通过!")
-                    fix_result["fix_attempts"] = round_idx
-                    return fix_result
-
-                elif fix_result["action"] == "config_fixed_but_retrain_failed":
-                    print(f"  ✓ 参数已调整, 但重训仍失败")
-                    train_result = fix_result
-                    error_category = fix_result.get("error_category", error_category)
-                    continue
-
-                elif fix_result["action"] == "config_fix_failed":
-                    print(f"  ✗ 参数调整失败")
-                    continue
-
-            elif error_category == "DATA_ERROR":
-                # ════════════════════════════════════
-                # DATA_ERROR: 数据路径有问题 → 让 LLM 修正路径!
-                # ════════════════════════════════════
-                print(f"  🔧 修复策略: 修正数据路径/配置")
-
-                fix_result = self._fix_data_error(
-                    iteration=iteration,
-                    train_error=train_result,
-                    phase_name=phase_name,
-                    round_idx=round_idx,
-                )
-
-                if fix_result["action"] == "data_fixed_and_retrained":
-                    print(f"  ✓✓ 自纠错成功! 数据路径修复 + 重训通过!")
-                    fix_result["fix_attempts"] = round_idx
-                    return fix_result
-
-                elif fix_result["action"] == "data_fixed_but_retrain_failed":
-                    print(f"  ✓ 数据路径已修复, 但重训仍失败")
-                    train_result = fix_result
-                    error_category = fix_result.get("error_category", error_category)
-                    continue
-
                 else:
-                    print(f"  ✗ 数据路径修复失败")
+                    # 其他未知 action → 继续下一轮
+                    print(f"  ? 未知修复结果: {fix_result.get('action', 'unknown')}")
                     continue
-
+            
+            # ── 正常流程: 应用 LLM 给出的复合修复方案 ──
+            structural_fixes = fix_proposal.get("structural_changes", [])
+            param_fixes = fix_proposal.get("param_changes", {})
+            fix_explanation = fix_proposal.get("explanation", "")
+            diagnosis_tags = fix_proposal.get("diagnosis_tags", [])
+            
+            print(f"     💡 诊断: {fix_explanation[:200]}")
+            if diagnosis_tags:
+                print(f"     🏷️ 根因标签: {', '.join(diagnosis_tags)}")
+            if structural_fixes:
+                print(f"     🏗️ 源码修复: {len(structural_fixes)} 处修改")
+                for sc in structural_fixes:
+                    print(f"       → [{sc.get('target_file', '?')}] "
+                          f"{sc.get('target_class_or_function', '?')}: "
+                          f"{sc.get('description', '?')[:60]}")
+            if param_fixes:
+                print(f"     🔧 参数修复: {json.dumps(param_fixes, ensure_ascii=False)[:200]}")
+            
+            if not structural_fixes and not param_fixes:
+                print(f"     ⚠ LLM 没有给出任何修复方案")
+                consecutive_fix_failures += 1
+                continue
+            
+            # ── 应用源码修复 ──
+            apply_diagnostics = []
+            structural_applied = False
+            
+            if structural_fixes:
+                apply_result = self.struct_applier.apply_structural_changes(structural_fixes)
+                
+                # 收集诊断信息
+                for applied_entry in apply_result.get("applied_changes", []):
+                    diag = applied_entry.get("result", {}).get("diagnostics", {})
+                    if diag:
+                        apply_diagnostics.append(diag)
+                for failed_entry in apply_result.get("failed_changes", []):
+                    diag = failed_entry.get("error", "")
+                    apply_diagnostics.append({"failure": diag})
+                
+                if apply_result["status"] == "ROLLBACK":
+                    rollback_reason = apply_result.get("rollback_reason", "")
+                    validation_errors = apply_result.get("validation_results", {}).get("errors", [])
+                    
+                    detailed_reason = f"Fix round {round_idx} rolled back: {rollback_reason}"
+                    if apply_diagnostics:
+                        diag_summary = " | ".join([
+                            f"{d.get('target_name', '?')}: method={d.get('replacement_method', '?')}, "
+                            f"reason={d.get('failure_reason', d.get('failure', '?'))}"
+                            for d in apply_diagnostics[:3]
+                        ])
+                        detailed_reason += f" | Diagnostics: {diag_summary}"
+                    if validation_errors:
+                        detailed_reason += f" | Validation errors: {'; '.join(validation_errors)}"
+                    
+                    print(f"     ↩ 源码修复被回滚: {rollback_reason}")
+                    self.iter_memory.record_rollback(
+                        iteration=iteration,
+                        reason=detailed_reason,
+                    )
+                    # 回滚不算完全失败 — 如果有参数修复可以继续
+                    if not param_fixes:
+                        consecutive_fix_failures += 1
+                        continue
+                    
+                elif apply_result["status"] in ("SUCCESS", "PARTIAL_SUCCESS"):
+                    print(f"     ✓ 源码修复已应用!")
+                    structural_applied = True
+                    self.iter_memory.record_modification(
+                        iteration=iteration,
+                        structural_changes=structural_fixes,
+                        apply_result=apply_result,
+                        metrics_before=None,
+                        metrics_after=None,
+                        note=f"Unified fix round {round_idx} for {phase_name}",
+                    )
+                    
+                elif apply_result["status"] == "ALL_FAILED":
+                    print(f"     ✗ 所有源码修复都失败")
+                    if not param_fixes:
+                        consecutive_fix_failures += 1
+                        continue
+            
+            # ── 合并参数修复 ──
+            combined_params = {}
+            if param_overrides:
+                combined_params.update(param_overrides)
+            if param_fixes:
+                validated_fixes = self._validate_param_changes(param_fixes)
+                if validated_fixes:
+                    print(f"     ✓ 参数修复已验证: {json.dumps(validated_fixes, ensure_ascii=False)[:200]}")
+                    combined_params.update(validated_fixes)
+                else:
+                    print(f"     ⚠ 参数修复验证失败, 仅使用原有参数覆盖")
+            
+            # ── 重新训练验证 ──
+            print(f"     🔄 修复后重新训练验证...")
+            
+            retrain_result = self.trainer.run(
+                param_overrides=combined_params if combined_params else None,
+            )
+            
+            if retrain_result["status"] == "SUCCESS":
+                # 修复成功!
+                print(f"  ✓✓ 自纠错成功! 修复 + 重训通过!")
+                retrain_result["fix_attempts"] = round_idx
+                retrain_result["fix_explanation"] = fix_explanation
+                retrain_result["diagnosis_tags"] = diagnosis_tags
+                if structural_fixes:
+                    retrain_result["structural_fixes"] = structural_fixes
+                if param_fixes:
+                    retrain_result["param_fixes"] = param_fixes
+                
+                self.journal.record({
+                    "iteration": iteration,
+                    "status": f"UNIFIED_FIX_SUCCESS_{phase_name}",
+                    "self_correction_round": round_idx,
+                    "fix_explanation": fix_explanation,
+                    "diagnosis_tags": diagnosis_tags,
+                    "structural_fixes_summary": json.dumps(structural_fixes, ensure_ascii=False) if structural_fixes else "",
+                    "param_fixes_summary": json.dumps(param_fixes, ensure_ascii=False) if param_fixes else "",
+                    "retrain_metrics": retrain_result.get("metrics", {}),
+                })
+                
+                return retrain_result
+            
             else:
-                # UNKNOWN / SYSTEM_ERROR → 无法自动修复
-                print(f"  ⏭ 错误类型无法自动修复: {error_category}")
-                train_result["fix_attempts"] = round_idx
-                return train_result
+                # 修复后训练仍然失败 → 用新错误信息继续自纠错
+                print(f"     ✗ 修复后重训仍失败: {retrain_result.get('error', '')[:100]}")
+                
+                # 跟踪连续失败
+                consecutive_fix_failures += 1
+                last_fix_action = "fix_but_retrain_failed"
+                
+                # 如果源码修复已应用但重训失败 → 需要回滚源码修改吗?
+                # 不回滚! 下一轮 LLM 会基于新错误信息重新诊断
+                # 只有在所有轮次都失败后才回滚 (见下面的结束处理)
+                
+                self.journal.record({
+                    "iteration": iteration,
+                    "status": f"UNIFIED_FIX_BUT_RETRAIN_FAILED_{phase_name}",
+                    "self_correction_round": round_idx,
+                    "fix_explanation": fix_explanation,
+                    "diagnosis_tags": diagnosis_tags,
+                    "retrain_error": retrain_result.get("error", ""),
+                })
+                
+                train_result = retrain_result
+                continue
         
         # ── 所有自纠错轮次都失败了 ──
         print(f"\n  ✗ 自纠错内循环: 所有 {max_rounds} 轮均失败")
@@ -1400,11 +1474,13 @@ class RecSelfEvolveAgent:
                 reason=f"All {max_rounds} self-correction rounds failed in retrain",
             )
         
+        # 用诊断标签代替单一的 error_category 来记录最终状态
+        final_tags = diagnosis_tags if diagnosis_tags else ["unknown"]
         self.journal.record({
             "iteration": iteration,
             "status": f"RUN_VERIFY_FIX_RETRY_ALL_FAILED_{phase_name}",
             "max_rounds": max_rounds,
-            "final_error_category": error_category,
+            "final_diagnosis_tags": final_tags,
             "final_error": train_result.get("error", "")[:500],
         })
         
@@ -4553,26 +4629,31 @@ class RecSelfEvolveAgent:
         
         return text
 
-    def _classify_error_with_llm(self, train_result: dict) -> str:
+    def _diagnose_and_propose_fix_with_llm(self, train_result: dict) -> dict:
         """
-        让 LLM 判断错误分类 (替代硬编码的字符串匹配)
+        让 LLM 直接诊断错误根因并提出修复方案 (替代先分类再分支的模式)
         
-        返回: "CODE_ERROR" | "CONFIG_ERROR" | "DATA_ERROR" | "SYSTEM_ERROR"
+        返回: 修复提案字典, 格式与 _parse_proposal_response 一致:
+            {
+                "structural_changes": [...],  # 源码修改 (可选)
+                "param_changes": {...},       # 参数修改 (可选)
+                "explanation": "...",          # 诊断说明
+                "diagnosis_tags": ["code_bug", "param_issue", "data_path", "system_env"],  # 根因标签 (可选)
+                "_error_category_hint": "...", # 给上层日志用的分类标签 (可选, 仅用于记录)
+            }
+            如果 LLM 认为不可修复: {"structural_changes": [], "param_changes": {}, "explanation": "...", "not_fixable": True}
         
-        这是最关键的改变: 不再用 if/elif 级联做字符串匹配来分类,
-        而是把完整的错误信息交给 LLM, 让它推理判断。
-        
-        原因: 硬编码分类经常不准确, 比如:
-        - RuntimeError: shape '[256, 1, -1]' 是维度不匹配(CODE_ERROR), 但硬编码会匹配为 "RuntimeError" → 可能被误标为 CONFIG_ERROR
-        - CUDA error 可能是显存不足(CONFIG_ERROR), 也可能是代码中的内存访问错误(CODE_ERROR)
-        - FileNotFoundError 可能是数据路径(DATA_ERROR), 也可能是项目源码缺失(CODE_ERROR)
-        
-        LLM 能看到完整的 traceback, 理解上下文, 给出更准确的分类。
+        关键改进:
+        - 不再强制把错误归入单一分类, LLM 可以同时建议修代码+调参数
+        - NaN Loss 不再硬性归为 CONFIG_ERROR, LLM 可以判断是代码 bug (如 log(0)) 还是参数问题 (如 lr 过大)
+        - 修复方案由 LLM 根据完整 traceback 上下文自由给出, 不受分类约束
         """
         error_msg = train_result.get("error", "")
         traceback_details = train_result.get("traceback_details", {})
         tb_text = traceback_details.get("traceback_text", "")
         returncode = train_result.get("returncode")
+        metrics = train_result.get("metrics", {})
+        training_health = metrics.get("training_health", {})
         
         # 构建 traceback 展示
         tb_display = ""
@@ -4580,14 +4661,49 @@ class RecSelfEvolveAgent:
             tb_display += f"\n### 完整 Traceback:\n```\n{tb_text[:2000]}\n```"
         files = traceback_details.get("files", [])
         line_numbers = traceback_details.get("line_numbers", [])
+        offending_snippets = traceback_details.get("offending_code_snippets", [])
         if files:
             tb_display += f"\n### 出错文件和行号:"
             for f, l in zip(files, line_numbers):
                 tb_display += f"\n- **文件**: `{f}` @ **行 {l}**"
+        if offending_snippets:
+            tb_display += f"\n### 出错代码片段:"
+            for snippet in offending_snippets[:3]:
+                tb_display += f"\n```python\n{snippet[:500]}\n```"
         if not tb_display:
             tb_display = f"\n### 错误信息:\n```\n{error_msg[:1500]}\n```"
         
-        prompt = f"""训练运行失败，需要你判断错误的分类类别。
+        # 构建训练健康状态信息 (NaN/Inf 等)
+        health_display = ""
+        if training_health and training_health.get("status") != "healthy":
+            health_display = (
+                f"\n### 训练健康状态\n"
+                f"- 状态: {training_health.get('status', 'unknown')}\n"
+                f"- NaN loss 次数: {training_health.get('nan_loss_count', 0)}\n"
+                f"- Inf loss 次数: {training_health.get('inf_loss_count', 0)}\n"
+                f"- 近期 loss 值: {training_health.get('loss_values', [])}\n"
+            )
+        
+        # 构建当前配置信息
+        project_config = json.dumps(self.adapter.base_args, indent=2, ensure_ascii=False)
+        
+        # 构建源码上下文 (供 LLM 判断是否需要修源码)
+        source_code_ctx = self.adapter.build_source_code_context(
+            include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
+            max_total_chars=8000,  # 诊断阶段用较少源码, 留空间给修复阶段
+        )
+        
+        # ── 根据是否启用查询模式, 选择不同的诊断流程 ──
+        if self._code_query_enabled:
+            return self._diagnose_with_query_mode(
+                train_result=train_result,
+                tb_display=tb_display,
+                health_display=health_display,
+                project_config=project_config,
+            )
+        
+        # ── 传统模式: 一次性给出诊断 + 修复方案 ──
+        prompt = f"""训练运行失败, 需要你诊断根因并提出修复方案。
 
 ## 错误信息
 ```
@@ -4596,34 +4712,66 @@ class RecSelfEvolveAgent:
 
 {tb_display}
 
+{health_display}
+
 ## 进程退出码: {returncode}
 
-## 四种错误分类
+## 当前训练配置
+```json
+{project_config}
+```
 
-请根据完整的错误信息 (包括 traceback 上下文), 判断这个错误属于哪一类:
+## 模型源码摘要
+{source_code_ctx[:6000]}
 
-- **CODE_ERROR**: 源码代码有问题 (语法错误、维度不匹配、变量名错误、运行时错误等)
-  → 需要修改模型源码文件来修复
-  → 判断依据: traceback 中的出错文件属于项目内部代码, 错误类型是语法/维度/变量等代码级问题
-  
-- **CONFIG_ERROR**: 参数配置有问题 (OOM显存溢出、NaN Loss、超时、指标格式不匹配等)
-  → 需要调整超参数 (batch_size, lr, hidden_size 等) 或配置来修复
-  → 判断依据: 错误与训练资源/参数有关, 如显存不足、训练发散、命令格式问题
-  
-- **DATA_ERROR**: 数据路径或格式有问题 (找不到数据文件、路径错误、格式不兼容等)
-  → 需要修正数据路径或配置来修复
-  → 判断依据: FileNotFoundError 且涉及 /data/ 路径, 或数据格式/编码问题
-  
-- **SYSTEM_ERROR**: 系统环境问题 (缺少外部包、GPU不可用、权限问题等)
-  → 无法通过自纠错修复, 需要人工干预
-  → 判断依据: 外部包缺失 (ModuleNotFoundError)、GPU不可用、权限被拒
+## 诊断要求
+
+请根据完整的错误信息 (包括 traceback 上下文), 判断错误的**真正根因**并提出修复方案。
+
+⚠️ **重要**: 不要把错误强行归入单一分类! 同一个错误可能需要同时修代码和调参数。例如:
+- NaN Loss 可能是代码 bug (如 log(0)、除零、缺少 eps 保护) → 需要修源码
+- NaN Loss 也可能是参数问题 (如 lr 过大) → 需要调参数  
+- NaN Loss 甚至可能两者都需要 → 同时修源码 + 调参数
+
+### 诊断思路
+
+1. 先看 traceback: 出错的是项目内部代码还是系统/环境问题?
+2. 如果是项目代码出错: 是语法/逻辑/维度 bug, 还是参数配置导致运行异常?
+3. 如果是参数/资源问题: 需要调哪些参数? 是否需要同时修代码来增加数值保护?
+4. 如果是数据路径问题: 需要改哪个路径参数?
+5. 如果是系统环境问题: 是否可以通过自纠错修复?
 
 ### 输出格式
 
-只输出一个 JSON, 格式如下:
+输出一个 JSON, 格式如下:
 ```json
-{{"error_category": "CODE_ERROR", "reason": "简短说明为什么是这个分类"}}
+{{{{
+  "explanation": "诊断说明: 为什么出错, 根因是什么",
+  "structural_changes": [
+    {{{{
+      "target_file": "modules.py",
+      "target_class_or_function": "SelfAttention.forward",
+      "description": "在 log 操作前加 clamp 保护防止 log(0)",
+      "insert_position": "replace_function",
+      "new_code": "修复后的完整函数代码..."
+    }}}}
+  ],
+  "param_changes": {{{{
+    "lr": 0.0005,
+    "batch_size": 256
+  }}}},
+  "diagnosis_tags": ["code_bug", "param_issue"],
+  "not_fixable": false
+}}}}
 ```
+
+字段说明:
+- `structural_changes`: 需要修改的源码 (如果不需要修源码则为空列表 [])
+- `param_changes`: 需要调整的参数 (如果不需要调参数则为空字典 {{{{}}}})
+- `diagnosis_tags`: 根因标签列表, 可选值: "code_bug", "param_issue", "data_path", "system_env"
+  (可以同时有多个标签, 表示复合根因)
+- `not_fixable`: 如果认为是无法自动修复的系统问题, 设为 true
+- 两者可以同时给出! 比如 NaN Loss 可能同时需要修代码(加数值保护)和调参数(降lr)
 
 注意: 只输出这一个 JSON, 不要输出其他内容。"""
 
@@ -4631,68 +4779,211 @@ class RecSelfEvolveAgent:
             response = self.llm.chat(
                 messages=[
                     {"role": "system", "content": (
-                        "你是一位深度学习训练诊断专家, 擅长从错误信息中判断根因类别。"
-                        "你需要根据完整的 traceback 上下文来判断错误分类, 不要只看错误类型名称。"
-                        "例如: RuntimeError 可能是 CODE_ERROR (维度不匹配) 或 CONFIG_ERROR (OOM), "
-                        "需要看 traceback 的具体内容和出错文件来判断。"
+                        "你是一位深度学习训练诊断与修复专家。"
+                        "你需要根据完整的 traceback 上下文诊断错误根因, 并提出修复方案。"
+                        "⚠ 关键原则: 不要把错误强行归入单一分类! "
+                        "同一个错误可能同时需要修源码和调参数。"
+                        "例如 NaN Loss: 如果 traceback 指向项目代码中的数值计算错误 "
+                        "(如 log(0)、除零、维度不匹配导致溢出), 应建议修源码; "
+                        "如果只是 lr 过大导致梯度爆炸, 应建议调参数; "
+                        "如果两者都有问题, 同时给出源码修复和参数调整。"
                     )},
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.1,  # 分类判断用极低温度, 确保确定性
-                max_tokens=150,   # 只需要输出分类, 不需要长回复
+                temperature=0.2,
+                max_tokens=self.config.llm_max_tokens,
             )
             
             if response is None:
-                logger.warning("LLM classification call failed, falling back to heuristic")
-                return self._classify_error_heuristic(train_result)
+                logger.warning("LLM diagnosis call failed, falling back to minimal fix proposal")
+                return self._build_minimal_fix_proposal(train_result)
             
-            # 解析 LLM 回复
+            # ── 解析 LLM 回复 ──
+            # 尝试 _parse_proposal_response (支持多种格式)
+            fix_proposal = self._parse_proposal_response(response)
+            
+            if fix_proposal and (fix_proposal.get("structural_changes") or fix_proposal.get("param_changes") or fix_proposal.get("not_fixable")):
+                # 补充诊断标签 (从原始回复中提取)
+                diagnosis_tags = self._extract_diagnosis_tags(response)
+                if diagnosis_tags:
+                    fix_proposal["diagnosis_tags"] = diagnosis_tags
+                logger.info(f"LLM diagnosis: {fix_proposal.get('explanation', '')[:150]}")
+                if fix_proposal.get("structural_changes"):
+                    logger.info(f"  → 源码修复: {len(fix_proposal['structural_changes'])} 处")
+                if fix_proposal.get("param_changes"):
+                    logger.info(f"  → 参数修复: {list(fix_proposal['param_changes'].keys())}")
+                return fix_proposal
+            
+            # ── _parse_proposal_response 解析失败 → 尝试直接从文本提取 ──
+            logger.warning(f"_parse_proposal_response failed, trying direct JSON extraction")
+            
             # 尝试提取 JSON
-            json_match = re.search(r'\{[^{}]+\}', response)
+            json_match = re.search(r'\{[^{}]*\}', response, re.DOTALL)
+            if not json_match:
+                json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            
             if json_match:
                 try:
                     result = json.loads(json_match.group())
-                    category = result.get("error_category", "")
-                    reason = result.get("reason", "")
+                    structural_changes = result.get("structural_changes", [])
+                    param_changes = result.get("param_changes", {})
+                    explanation = result.get("explanation", "")
+                    diagnosis_tags = result.get("diagnosis_tags", [])
+                    not_fixable = result.get("not_fixable", False)
                     
-                    # 验证分类是合法的
-                    valid_categories = ("CODE_ERROR", "CONFIG_ERROR", "DATA_ERROR", "SYSTEM_ERROR")
-                    if category in valid_categories:
-                        logger.info(f"LLM classified error as {category}: {reason}")
-                        return category
-                    else:
-                        logger.warning(f"LLM returned invalid category '{category}', falling back to heuristic")
-                        return self._classify_error_heuristic(train_result)
+                    if structural_changes or param_changes or not_fixable:
+                        logger.info(f"LLM diagnosis (direct JSON): {explanation[:150]}")
+                        return {
+                            "structural_changes": structural_changes,
+                            "param_changes": param_changes,
+                            "explanation": explanation,
+                            "diagnosis_tags": diagnosis_tags,
+                            "not_fixable": not_fixable,
+                        }
                 except json.JSONDecodeError:
-                    logger.warning(f"Failed to parse LLM classification JSON: {response[:200]}")
+                    logger.warning(f"Failed to parse diagnosis JSON: {response[:200]}")
             
-            # 尝试从文本中提取分类
-            for cat in ("CODE_ERROR", "CONFIG_ERROR", "DATA_ERROR", "SYSTEM_ERROR"):
-                if cat in response:
-                    logger.info(f"LLM classification extracted from text: {cat}")
-                    return cat
-            
-            # 所有尝试都失败 → 回退到启发式
-            logger.warning("Could not extract classification from LLM response, falling back to heuristic")
-            return self._classify_error_heuristic(train_result)
+            # 所有尝试都失败 → 回退到最小修复提案
+            logger.warning("Could not extract diagnosis from LLM response, falling back to minimal fix proposal")
+            return self._build_minimal_fix_proposal(train_result)
             
         except Exception as e:
-            logger.error(f"Error during LLM classification: {e}")
-            return self._classify_error_heuristic(train_result)
+            logger.error(f"Error during LLM diagnosis: {e}")
+            return self._build_minimal_fix_proposal(train_result)
+
+    def _diagnose_with_query_mode(self, train_result: dict, 
+                                   tb_display: str, health_display: str,
+                                   project_config: str) -> dict:
+        """
+        查询模式下的诊断: LLM 先诊断根因, 然后按需查询代码后给出修复方案
+        
+        使用已有的 _fix_with_query_mode 机制, 但 prompt 侧重于诊断+复合修复
+        """
+        error_msg = train_result.get("error", "")
+        tb_details = train_result.get("traceback_details", {})
+        error_type = tb_details.get("error_type", "UNKNOWN")
+        error_message = tb_details.get("error_message", error_msg)
+        
+        fix_proposal = self._fix_with_query_mode(
+            phase1_prompt_template=QUERY_BASED_FIX_PHASE1_PROMPT,
+            phase2_prompt_template=QUERY_BASED_FIX_PHASE2_PROMPT,
+            final_prompt_template=QUERY_BASED_FIX_FINAL_PROMPT,
+            phase1_prompt_kwargs={
+                "_error_type": error_type,
+                "_error_category": train_result.get("error_category", "UNKNOWN"),
+                "_error_message": error_message[:2000],
+                "_traceback_details": tb_display + health_display,
+                "code_index": self._code_query_tool.build_code_index(),
+                "queried_code": "(暂无 — 这是第一轮, 请提出你想查询的代码)",
+                "rollback_warning": self.iter_memory.build_rollback_aware_context(),
+                "current_hidden_size": self.adapter.base_args.get("hidden_size", 64),
+            },
+            phase2_extra_kwargs={
+                "_error_type": error_type,
+                "_error_message": error_message[:500],
+            },
+            final_extra_kwargs={
+                "_error_type": error_type,
+                "_error_message": error_message[:500],
+            },
+            system_prompt=(
+                "你是一位深度学习训练诊断与修复专家。"
+                "你需要根据 traceback 诊断错误根因, 并按需查询代码来提出修复方案。"
+                "⚠ 关键原则: 不要把错误强行归入单一分类! "
+                "同一个错误可能同时需要修源码和调参数。"
+                "例如 NaN Loss: 如果是代码中的数值计算错误 (log(0)、除零等), 需要修源码; "
+                "如果只是 lr 过大导致梯度爆炸, 需要调参数; "
+                "如果两者都有问题, 同时给出源码修复和参数调整。"
+                "你可以通过代码查询工具按需获取源码详情, 然后基于精确的代码提出修复方案。"
+            ),
+            temperature=0.2,
+            max_query_rounds=3,
+        )
+        
+        if fix_proposal is None:
+            logger.warning("Query mode diagnosis failed, falling back to minimal fix proposal")
+            return self._build_minimal_fix_proposal(train_result)
+        
+        # 补充诊断标签
+        diagnosis_tags = self._extract_diagnosis_tags_from_proposal(fix_proposal, train_result)
+        if diagnosis_tags:
+            fix_proposal["diagnosis_tags"] = diagnosis_tags
+        
+        # 检查是否有有效修复
+        if not fix_proposal.get("structural_changes") and not fix_proposal.get("param_changes"):
+            logger.warning("Query mode returned no fixes")
+            # 尝试格式修复回退
+            raw_response = fix_proposal.get("_raw_response", "")
+            if raw_response:
+                fallback_proposal = self._parse_proposal_response(raw_response)
+                if fallback_proposal and (fallback_proposal.get("structural_changes") or fallback_proposal.get("param_changes")):
+                    fix_proposal = fallback_proposal
+                    diagnosis_tags = self._extract_diagnosis_tags_from_proposal(fix_proposal, train_result)
+                    if diagnosis_tags:
+                        fix_proposal["diagnosis_tags"] = diagnosis_tags
+        
+        return fix_proposal
 
     @staticmethod
-    def _classify_error_heuristic(train_result: dict) -> str:
+    def _extract_diagnosis_tags(response: str) -> list:
+        """从 LLM 回复文本中提取诊断标签"""
+        tags = []
+        tag_keywords = {
+            "code_bug": ["code_bug", "代码错误", "源码bug", "CODE_ERROR", "维度不匹配", "log(0)", "除零"],
+            "param_issue": ["param_issue", "参数问题", "CONFIG_ERROR", "lr过大", "显存不足", "OOM", "梯度爆炸"],
+            "data_path": ["data_path", "数据路径", "DATA_ERROR", "FileNotFoundError", "找不到数据"],
+            "system_env": ["system_env", "环境问题", "SYSTEM_ERROR", "ModuleNotFoundError", "GPU不可用"],
+        }
+        for tag, keywords in tag_keywords.items():
+            for kw in keywords:
+                if kw in response:
+                    tags.append(tag)
+                    break
+        return tags
+
+    @staticmethod
+    def _extract_diagnosis_tags_from_proposal(fix_proposal: dict, train_result: dict) -> list:
+        """从修复提案和错误信息中推断诊断标签"""
+        tags = []
+        if fix_proposal.get("structural_changes"):
+            tags.append("code_bug")
+        if fix_proposal.get("param_changes"):
+            tags.append("param_issue")
+        # 从错误信息推断
+        error_msg = train_result.get("error", "")
+        if "FileNotFoundError" in error_msg or "/data/" in error_msg:
+            tags.append("data_path")
+        if "ModuleNotFoundError" in error_msg or "ImportError" in error_msg:
+            tags.append("system_env")
+        return tags
+
+    @staticmethod
+    def _build_minimal_fix_proposal(train_result: dict) -> dict:
         """
-        启发式回退: 当 LLM 分类失败时的简单兜底
+        最小回退: 当 LLM 诊断失败时的简单兜底
         
-        只做最基本的判断:
-        - 有 traceback → CODE_ERROR (源码问题)
-        - 无 traceback → SYSTEM_ERROR (系统/环境问题)
+        根据是否有 traceback 来决定默认修复方向:
+        - 有 traceback → 假设是代码问题, 让后续 _fix_code_error 处理
+        - 无 traceback → 假设不可修复
         """
         traceback_details = train_result.get("traceback_details", {})
         if traceback_details.get("traceback_text"):
-            return "CODE_ERROR"
-        return "SYSTEM_ERROR"
+            # 有 traceback → 标记为需要代码修复, 让后续流程用 _fix_code_error 处理
+            return {
+                "structural_changes": [],  # 空列表 → 后续流程会用 _fix_code_error 重新让 LLM 修复
+                "param_changes": {},
+                "explanation": "Fallback: 有 traceback, 默认为代码问题",
+                "diagnosis_tags": ["code_bug"],
+                "not_fixable": False,
+                "_fallback_to_code_fix": True,  # 标记: 需要用 _fix_code_error 重新修复
+            }
+        return {
+            "structural_changes": [],
+            "param_changes": {},
+            "explanation": "Fallback: 无 traceback, 默认为不可修复的系统问题",
+            "diagnosis_tags": ["system_env"],
+            "not_fixable": True,
+        }
 
     def _phase_train_diagnosis_and_retry(
         self,
