@@ -148,8 +148,8 @@ with open("result.json", "w") as f:
 def test_data_inventory():
     """测试数据发现和盘点"""
     with tempfile.TemporaryDirectory() as tmpdir:
-        # 创建测试数据
-        data_dir = os.path.join(tmpdir, "Recmodel", "data")
+        # 创建测试数据 — 放在 project_root/data 下（与实际用法一致）
+        data_dir = os.path.join(tmpdir, "data")
         os.makedirs(data_dir)
         
         with open(os.path.join(data_dir, "train.txt"), "w") as f:
@@ -161,7 +161,7 @@ def test_data_inventory():
         infra = DataInfrastructure(project_root=tmpdir)
         discovered = infra.discover_data()
         
-        assert len(discovered["data_files"]) >= 2  # train.txt + test.txt
+        assert len(discovered["data_files"]) == 2  # train.txt + test.txt
 
 
 def test_agent_initialization():
@@ -438,12 +438,60 @@ def test_data_infrastructure_init():
 def test_data_infrastructure_discover_model_info():
     """测试 DataInfrastructure 发现模型信息"""
     with tempfile.TemporaryDirectory() as tmpdir:
+        # 测试不带 model_args
         infra = DataInfrastructure(project_root=tmpdir)
-        
         info = infra.discover_model_info()
         
         assert "project_root" in info
         assert "recmodel_dir" in info
+        assert "model_args" in info
+        assert "checkpoint_shapes" in info
+        
+        # 测试带 model_args
+        infra_with_args = DataInfrastructure(
+            project_root=tmpdir,
+            model_args={"hidden_size": 64, "num_hidden_layers": 2, "item_size": 12702}
+        )
+        info_with_args = infra_with_args.discover_model_info()
+        
+        assert "model_args" in info_with_args
+        assert info_with_args["model_args"]["hidden_size"] == 64
+        assert info_with_args["model_args"]["item_size"] == 12702
+
+
+def test_format_model_info_for_prompt():
+    """测试 _format_model_info_for_prompt 优先输出关键参数，源码可截断"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        log_dir = os.path.join(tmpdir, "logs")
+        os.makedirs(log_dir)
+        
+        agent = HypothesisVerificationAgent(
+            project_root=tmpdir,
+            log_dir=log_dir,
+            llm_client=_make_mock_llm(),
+            model_args={"hidden_size": 64, "num_hidden_layers": 2, "item_size": 12702}
+        )
+        
+        model_info = {
+            "model_args": {"hidden_size": 64, "num_hidden_layers": 2, "item_size": 12702, "backbone": "SASRec"},
+            "checkpoint_shapes": {"item_embeddings.weight": [12702, 64], "position_embeddings.weight": [50, 64]},
+            "project_root": tmpdir,
+            "checkpoint": "/some/path/model.pt",
+            "model_code": "class SASRec(nn.Module):\n    pass\n" + "#" * 10000,  # 很长的源码
+            "modules_code": "class LayerNorm:\n    pass\n",
+        }
+        
+        formatted = agent._format_model_info_for_prompt(model_info, max_chars=2000)
+        
+        # 关键参数必须在输出中
+        assert "hidden_size" in formatted
+        assert "64" in formatted
+        assert "item_size" in formatted
+        assert "12702" in formatted
+        assert "[12702, 64]" in formatted
+        # checkpoint 形状必须在输出中
+        assert "item_embeddings.weight" in formatted
+        assert "position_embeddings.weight" in formatted
 
 
 def test_inject_data_loading_truncated_variable_alias():

@@ -32,11 +32,13 @@ class DataInfrastructure:
 
     DEFAULT_SCRIPT_TIMEOUT = 1200  # 脚本执行超时 (秒)
 
-    def __init__(self, project_root: str, data_dir: str = None, log_dir: str = None, llm_client=None):
+    def __init__(self, project_root: str, data_dir: str = None, log_dir: str = None,
+                 llm_client=None, model_args: Dict[str, Any] = None):
         self.project_root = Path(project_root)
-        self.data_dir = Path(data_dir) if data_dir else self.project_root / "Recmodel" / "data"
+        self.data_dir = Path(data_dir) if data_dir else self.project_root / "data"
         self.log_dir = Path(log_dir) if log_dir else self.project_root / "logs"
         self.llm_client = llm_client
+        self.model_args = model_args or {}  # 模型运行参数 (hidden_size, num_hidden_layers, item_size 等)
 
         # 缓存目录
         self._cache_dir = self.project_root / ".data_cache"
@@ -72,11 +74,10 @@ class DataInfrastructure:
             "logs": []
         }
 
-        # 探索数据目录
+        # 探索数据目录 — 使用构造函数传入的路径
         scan_dirs = [
-            self.project_root / "Recmodel" / "data",
-            self.project_root / "data",
-            self.project_root / "logs"
+            self.data_dir,
+            self.log_dir
         ]
 
         for scan_dir in scan_dirs:
@@ -85,7 +86,11 @@ class DataInfrastructure:
             for root, dirs, files in os.walk(scan_dir):
                 for f in files:
                     fpath = Path(root) / f
-                    rel_path = fpath.relative_to(self.project_root)
+                    try:
+                        rel_path = fpath.relative_to(self.project_root)
+                    except ValueError:
+                        # log_dir 等目录可能在 project_root 外部，直接用绝对路径
+                        rel_path = fpath
                     fsize = fpath.stat().st_size
 
                     if f.endswith(".txt"):
@@ -135,10 +140,15 @@ class DataInfrastructure:
 
     def discover_model_info(self) -> Dict[str, Any]:
         """
-        发现模型信息（checkpoint 路径、模型源码位置等）
+        发现模型信息（checkpoint 路径、模型源码位置、运行参数、checkpoint 实际维度等）
+
+        ⚠ 关键改进: 除了文件路径和源码，现在还会包含:
+          1. model_args — 模型运行时参数 (hidden_size, num_hidden_layers, item_size 等)
+          2. checkpoint_shapes — 从 checkpoint 中探测到的实际 tensor 形状
+             (这确保了 LLM 生成的代码构建模型时维度与 checkpoint 完全一致)
 
         Returns:
-            包含模型目录、checkpoint 路径、源码文件路径等信息的字典
+            包含模型目录、checkpoint 路径、源码文件路径、运行参数、checkpoint 维度等信息的字典
         """
         recmodel_dir = self._find_recmodel_dir()
         checkpoint = self._find_latest_checkpoint()
@@ -157,7 +167,17 @@ class DataInfrastructure:
             with open(modules_file, 'r') as f:
                 modules_code = f.read()
 
+        # ── 新增: 模型运行参数 ──
+        # model_args 可能包含 hidden_size, num_hidden_layers, item_size 等关键参数
+        # 这些参数决定了模型的维度结构，必须与 checkpoint 一致才能正确 load_state_dict
+        effective_model_args = self._resolve_model_args(checkpoint)
+
+        # ── 新增: checkpoint tensor 形状探测 ──
+        # 从 checkpoint 文件中读取实际的 tensor 形状，作为模型参数的最终验证
+        checkpoint_shapes = self._probe_checkpoint_shapes(checkpoint)
+
         return {
+            # 路径信息
             "project_root": str(self.project_root),
             "recmodel_dir": recmodel_dir,
             "data_dir": str(self.data_dir),
@@ -165,9 +185,122 @@ class DataInfrastructure:
             "model_file": str(model_file),
             "modules_file": str(modules_file),
             "trainer_file": str(trainer_file),
+            # 模型运行参数 (最关键! 决定模型维度结构)
+            "model_args": effective_model_args,
+            # checkpoint 实际 tensor 形状 (用于验证参数是否与 checkpoint 一致)
+            "checkpoint_shapes": checkpoint_shapes,
+            # 模型源码 (供 LLM 参考模型定义)
             "model_code": model_code,
             "modules_code": modules_code,
         }
+
+    def _resolve_model_args(self, checkpoint: Optional[str] = None) -> Dict[str, Any]:
+        """
+        合并所有来源的模型运行参数，确保完整且与 checkpoint 一致
+
+        参数来源优先级:
+          1. checkpoint_shapes — checkpoint 中实际的 tensor 维度 (最权威)
+          2. model_args — 构造时传入的参数 (来自 project_adapter.base_args)
+          3. 默认值 — 最基本的 fallback
+
+        Returns:
+            合并后的模型参数字典，包含所有模型构造所需的参数
+        """
+        # 基础: 从构造函数传入的 model_args
+        merged = dict(self.model_args)
+
+        # 尝试从 checkpoint 探测来补充/修正参数
+        if checkpoint:
+            try:
+                import torch
+                ckpt_data = torch.load(checkpoint, map_location='cpu')
+                # 从 checkpoint 的 item_embeddings 权重推断 item_size 和 hidden_size
+                if 'item_embeddings.weight' in ckpt_data:
+                    emb_shape = ckpt_data['item_embeddings.weight'].shape
+                    # item_embeddings: [item_size, hidden_size]
+                    merged['item_size'] = emb_shape[0]
+                    merged['hidden_size'] = emb_shape[1]
+                elif 'item_embeddings.weight' not in ckpt_data:
+                    # 有些 checkpoint 可能只保存了部分权重，遍历所有 key 找 embedding
+                    for key, tensor in ckpt_data.items():
+                        if 'item_embedding' in key.lower() or 'embed' in key.lower():
+                            if hasattr(tensor, 'shape') and len(tensor.shape) == 2:
+                                # 推断 hidden_size 从 embedding 的第二维
+                                if 'hidden_size' not in merged or merged.get('hidden_size') is None:
+                                    merged['hidden_size'] = tensor.shape[1]
+                                break
+                # 从 position_embeddings 推断 max_seq_length
+                if 'position_embeddings.weight' in ckpt_data:
+                    pos_shape = ckpt_data['position_embeddings.weight'].shape
+                    # position_embeddings: [max_seq_length, hidden_size]
+                    merged['max_seq_length'] = pos_shape[0]
+                    if 'hidden_size' not in merged:
+                        merged['hidden_size'] = pos_shape[1]
+            except Exception as e:
+                logger.warning(f"Failed to probe model args from checkpoint: {e}")
+
+        # 尝试从数据文件推断 item_size (item_size = max_item + 2)
+        if 'item_size' not in merged:
+            item_size = self._infer_item_size_from_data()
+            if item_size is not None:
+                merged['item_size'] = item_size
+
+        return merged
+
+    def _probe_checkpoint_shapes(self, checkpoint: Optional[str] = None) -> Dict[str, list]:
+        """
+        从 checkpoint 中提取所有 tensor 的名称和形状
+
+        这让 LLM 可以知道 checkpoint 中实际的维度，确保构建模型时维度完全匹配。
+
+        Returns:
+            {"tensor_name": [shape_dimensions]} 的字典，例如:
+            {
+                "item_embeddings.weight": [12702, 64],
+                "position_embeddings.weight": [50, 64],
+                "item_encoder.layers.0.attention.query.weight": [64, 64],
+                ...
+            }
+        """
+        if not checkpoint:
+            return {}
+
+        try:
+            import torch
+            ckpt_data = torch.load(checkpoint, map_location='cpu')
+            shapes = {}
+            for key, tensor in ckpt_data.items():
+                if hasattr(tensor, 'shape'):
+                    shapes[key] = list(tensor.shape)
+            return shapes
+        except Exception as e:
+            logger.warning(f"Failed to probe checkpoint shapes: {e}")
+            return {}
+
+    def _infer_item_size_from_data(self) -> Optional[int]:
+        """
+        从训练数据文件中推断 item_size (最大 item ID + 2)
+
+        模型构造需要 item_size，但它来自数据而非 argparse。
+        这确保 LLM 生成的代码能正确设置 item_size。
+        """
+        max_item = 0
+        data_patterns = ["*_train.txt", "*_val.txt", "*_test.txt"]
+
+        for pattern in data_patterns:
+            for data_file in self.data_dir.glob(pattern):
+                try:
+                    with open(data_file, 'r') as f:
+                        for line in f:
+                            items = [int(x) for x in line.strip().split()]
+                            if items:
+                                max_item = max(max_item, max(items))
+                except Exception:
+                    continue
+
+        if max_item > 0:
+            return max_item + 2  # 与 run_finetune_full.py 一致
+        return None
 
     def format_inventory_for_prompt(self, preloaded_data: Optional[Dict] = None) -> str:
         """
@@ -332,15 +465,8 @@ class DataInfrastructure:
     # ─── 内部辅助 ───────────────────────────────────────────────
 
     def _find_recmodel_dir(self) -> str:
-        """找到 Recmodel 目录"""
-        recmodel_dir = self.project_root
-        if recmodel_dir.exists():
-            return str(recmodel_dir)
-        for parent in self.project_root.parents:
-            candidate = parent / "Recmodel"
-            if candidate.exists():
-                return str(candidate)
-        return str(recmodel_dir)
+        """找到 Recmodel 目录（直接返回 project_root）"""
+        return str(self.project_root)
 
     def _find_latest_checkpoint(self) -> Optional[str]:
         """查找最新的模型 checkpoint"""

@@ -126,8 +126,9 @@ class RecSelfEvolveAgent:
         self.hypothesis_verifier = HypothesisVerificationAgent(
             self.llm, self.item_text_map,
             project_root=self.config.project_root,
-            data_dir=os.path.join(self.config.project_root, "Recmodel", "data"),
+            data_dir=os.path.join(self.config.project_root, "data"),
             log_dir=self.config.log_dir,
+            model_args=self.adapter.base_args,  # 传入模型运行参数，确保 LLM 生成正确维度
         )
 
         # ---- 代码查询工具 (核心新增!) ----

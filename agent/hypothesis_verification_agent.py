@@ -104,7 +104,7 @@ class HypothesisVerificationAgent:
     
     def __init__(self, llm_client, item_text_map: Dict = None,
                  project_root: str = None, data_dir: str = None,
-                 log_dir: str = None):
+                 log_dir: str = None, model_args: Dict = None):
         """
         Args:
             llm_client: LLMClient 实例
@@ -112,11 +112,14 @@ class HypothesisVerificationAgent:
             project_root: 项目根目录路径
             data_dir: 数据目录路径
             log_dir: 日志目录路径
+            model_args: 模型运行参数 (hidden_size, num_hidden_layers, item_size 等)
+                        来自 project_adapter.base_args，确保 LLM 生成的代码能构建正确维度
         """
         self.llm = llm_client
         self.item_text_map = item_text_map or {}
         self.project_root = project_root or os.getcwd()
         self.log_dir = log_dir or os.path.join(self.project_root, "logs")
+        self.model_args = model_args or {}
         
         # 数据基础设施
         self.data_infra = DataInfrastructure(
@@ -124,6 +127,7 @@ class HypothesisVerificationAgent:
             data_dir=data_dir,
             log_dir=self.log_dir,
             llm_client=self.llm,
+            model_args=self.model_args,  # 传入模型运行参数
         )
         
         # 共享工具实例
@@ -976,6 +980,121 @@ class HypothesisVerificationAgent:
         
         return "\n".join(lines)
     
+    def _format_model_info_for_prompt(self, model_info: Dict, max_chars: int = 6000) -> str:
+        """
+        格式化模型信息为 prompt 可用文本
+        
+        关键设计: 
+        - 模型运行参数 (model_args) 和 checkpoint 维度 (checkpoint_shapes) 永远不被截断
+        - 源码 (model_code, modules_code) 可以被截断，但保留开头和关键类定义
+        
+        这确保了 LLM 生成的代码能构建与 checkpoint 维度完全匹配的模型，
+        避免 load_state_dict() 因维度不匹配而报错。
+        """
+        if not model_info:
+            return "无模型信息"
+        
+        lines = []
+        
+        # ── 1. 模型运行参数 (最关键，永远完整输出) ──
+        model_args = model_info.get("model_args", {})
+        if model_args:
+            lines.append("### 模型运行参数 (⚠ 构建模型时必须使用这些参数，不可修改)")
+            # 架构关键参数 (决定维度结构)
+            arch_keys = ["item_size", "hidden_size", "num_hidden_layers", "num_attention_heads",
+                         "max_seq_length", "embedding_dim", "num_layers", "hidden_dropout_prob",
+                         "attention_probs_dropout_prob", "hidden_act", "initializer_range", "backbone"]
+            lines.append("**架构参数 (决定模型维度，必须与 checkpoint 一致)**:")
+            for k in arch_keys:
+                if k in model_args:
+                    lines.append(f"  - {k}: {model_args[k]}")
+            # 其他参数
+            other_keys = [k for k in model_args if k not in arch_keys]
+            if other_keys:
+                lines.append("**其他参数**:")
+                for k in other_keys:
+                    v = model_args[k]
+                    if isinstance(v, (str, int, float, bool)):
+                        lines.append(f"  - {k}: {v}")
+                    else:
+                        lines.append(f"  - {k}: {json.dumps(v, ensure_ascii=False)[:100]}")
+            lines.append("")
+        
+        # ── 2. checkpoint tensor 形状 (最关键，永远完整输出) ──
+        checkpoint_shapes = model_info.get("checkpoint_shapes", {})
+        if checkpoint_shapes:
+            lines.append("### checkpoint 实际 tensor 形状 (⚠ 必须 match 才能 load_state_dict)")
+            # 优先展示关键的 embedding 和 encoder 层的形状
+            priority_keys = [k for k in checkpoint_shapes 
+                            if 'embedding' in k.lower() or 'encoder' in k.lower() or 'layernorm' in k.lower()]
+            other_keys = [k for k in checkpoint_shapes if k not in priority_keys]
+            
+            if priority_keys:
+                lines.append("**关键层形状**:")
+                for k in priority_keys:
+                    lines.append(f"  - {k}: {checkpoint_shapes[k]}")
+            if other_keys:
+                lines.append("**其他层形状** (只列前20个):")
+                for k in other_keys[:20]:
+                    lines.append(f"  - {k}: {checkpoint_shapes[k]}")
+                if len(other_keys) > 20:
+                    lines.append(f"  ... 共 {len(other_keys)} 个其他层")
+            lines.append("")
+        
+        # ── 3. 路径信息 (永远完整) ──
+        lines.append("### 文件路径")
+        for k in ["project_root", "recmodel_dir", "data_dir", "checkpoint",
+                   "model_file", "modules_file", "trainer_file"]:
+            if k in model_info and model_info[k]:
+                lines.append(f"  - {k}: {model_info[k]}")
+        lines.append("")
+        
+        # ── 4. 模型源码 (可以截断，但保留关键类定义) ──
+        # 计算剩余可用的字符空间
+        current_len = len("\n".join(lines))
+        remaining = max_chars - current_len
+        
+        model_code = model_info.get("model_code", "")
+        modules_code = model_info.get("modules_code", "")
+        
+        if remaining > 200 and model_code:
+            # 源码部分: 截断但保留关键部分
+            code_budget = min(remaining // 2, len(model_code))
+            if code_budget < len(model_code):
+                truncated_code = model_code[:code_budget]
+                # 尝试在最后一个类定义边界截断
+                last_class = truncated_code.rfind("class ")
+                if last_class > code_budget * 0.5:
+                    # 找到该类定义的结束位置（下一个 class 或文件末尾）
+                    next_class = model_code.find("\nclass ", last_class + 1)
+                    if next_class > 0 and next_class < code_budget + 500:
+                        truncated_code = model_code[:next_class]
+                lines.append("### 模型源码 (models.py, 可能截断)")
+                lines.append(f"```python\n{truncated_code}\n```")
+                if len(model_code) > code_budget:
+                    lines.append(f"\n(源码共 {len(model_code)} 字符, 截断到 {code_budget})")
+            else:
+                lines.append("### 模型源码 (models.py)")
+                lines.append(f"```python\n{model_code}\n```")
+            lines.append("")
+        
+        if remaining > 200 and modules_code:
+            # modules 预算更少，因为架构参数已经覆盖了关键信息
+            modules_budget = min(remaining // 4, len(modules_code))
+            truncated_modules = modules_code[:modules_budget]
+            lines.append("### 模块源码 (modules.py, 可能截断)")
+            lines.append(f"```python\n{truncated_modules}\n```")
+            if len(modules_code) > modules_budget:
+                lines.append(f"\n(源码共 {len(modules_code)} 字符, 截断到 {modules_budget})")
+            lines.append("")
+        
+        result = "\n".join(lines)
+        # 最终安全截断 (只在极端情况下)
+        if len(result) > max_chars:
+            result = result[:max_chars] + "\n\n(⚠ 模型信息被截断，但运行参数和 checkpoint 形状已完整输出)"
+        
+        return result
+    
     # ════════════════════════════════════════
     # Step 3a: 数据需求分析 (新增)
     # ════════════════════════════════════════
@@ -1113,18 +1232,22 @@ class HypothesisVerificationAgent:
         failed_reasons = {}      # 记录失败原因
         
         for strat_idx, strat in enumerate(ordered_strategies):
-            data_name = strat.get("data_name", f"data_{strat_idx}")
+            # Sanitize data_name: LLM may generate path-like names (e.g. "data/Beauty_test.txt")
+            # which create unintended subdirectories when used in os.path.join
+            raw_data_name = strat.get("data_name", f"data_{strat_idx}")
+            safe_data_name = raw_data_name.replace("/", "_").replace("\\", "_")
             data_type = strat.get("data_type", "unknown")
             difficulty = strat.get("difficulty", "medium")
             total_steps = strat.get("total_steps", len(strat.get("acquisition_steps", [])))
             
-            print(f"    📥 [Step 2.{strat_idx+1}] 获取数据 '{data_name}' "
+            print(f"    📥 [Step 2.{strat_idx+1}] 获取数据 '{raw_data_name}' "
                   f"(类型: {data_type}, 难度: {difficulty}, "
                   f"策略含 {total_steps} 个子步骤 → 合并为单脚本)")
             
             # ── 为整个策略生成一个连贯脚本 ──
-            script_file = os.path.join(acquire_dir, f"acquire_{data_name}.py")
-            output_file = os.path.join(acquire_dir, f"acquired_{data_name}.json")
+            # Use safe_data_name (path separators replaced) for filenames
+            script_file = os.path.join(acquire_dir, f"acquire_{safe_data_name}.py")
+            output_file = os.path.join(acquire_dir, f"acquired_{safe_data_name}.json")
             
             code = self._generate_acquisition_script(
                 strategy=strat,
@@ -1133,10 +1256,11 @@ class HypothesisVerificationAgent:
             )
             
             if not code:
-                print(f"    ❌ 获取脚本生成失败: {data_name}")
+                print(f"    ❌ 获取脚本生成失败: {raw_data_name}")
                 continue
             
             # ── 保存脚本到文件 ──
+            os.makedirs(os.path.dirname(script_file), exist_ok=True)
             with open(script_file, 'w', encoding='utf-8') as f:
                 f.write(code)
             logger.info(f"Saved acquisition script: {script_file}")
@@ -1159,7 +1283,7 @@ class HypothesisVerificationAgent:
                 print(f"    🔄 修正获取脚本 (第 {fix_round+1} 次)...")
                 
                 fix_prompt = DATA_ACQUISITION_FIX_PROMPT.format(
-                    step_name=data_name,
+                    step_name=raw_data_name,
                     original_code=self.injector.extract_core_code(code),
                     error_output=error[:1500],
                     available_data_description=self._format_available_data_for_code(updated_data),
@@ -1213,11 +1337,11 @@ class HypothesisVerificationAgent:
                 if not explicitly_failed:
                     # ── 数据质量校验 ──
                     validation_issues = self._validate_acquired_data(
-                        data_name, step_data, data_type
+                        raw_data_name, step_data, data_type
                     )
                     
                     if validation_issues:
-                        print(f"    ⚠️ 数据 '{data_name}' 获取成功但质量有问题:")
+                        print(f"    ⚠️ 数据 '{raw_data_name}' 获取成功但质量有问题:")
                         for issue in validation_issues:
                             print(f"      - {issue}")
                         # 仍然接受数据，但标记问题
@@ -1227,28 +1351,28 @@ class HypothesisVerificationAgent:
                     
                     if acquired_ok:
                         # 尝试提取策略预期的 output 名称
-                        expected_output = data_name
+                        expected_output = raw_data_name
                         acquisition_steps = strat.get("acquisition_steps", [])
                         if acquisition_steps:
-                            expected_output = acquisition_steps[-1].get("output", data_name)
+                            expected_output = acquisition_steps[-1].get("output", raw_data_name)
                         
                         updated_data[expected_output] = step_data
                         
                         # 保存到 DataInfrastructure 缓存
-                        self.data_infra.save_to_cache(data_name, step_data)
+                        self.data_infra.save_to_cache(safe_data_name, step_data)
                         
                         print(f"    ✅ 成功获取数据 '{expected_output}'")
                 else:
                     # 脚本明确标记 success=False
                     error_msg = step_data.get("error", "未知原因") if isinstance(step_data, dict) else "数据格式错误"
-                    print(f"    ❌ 数据 '{data_name}' 获取失败 (脚本返回 success=False): {error_msg}")
-                    failed_data_names.append(data_name)
-                    failed_reasons[data_name] = error_msg
+                    print(f"    ❌ 数据 '{raw_data_name}' 获取失败 (脚本返回 success=False): {error_msg}")
+                    failed_data_names.append(raw_data_name)
+                    failed_reasons[raw_data_name] = error_msg
             else:
                 # 脚本执行本身就失败了 (subprocess 返回非零)
                 print(f"    ❌ 获取脚本执行失败: {(error or '')[:100]}")
-                failed_data_names.append(data_name)
-                failed_reasons[data_name] = (error or "执行失败")[:200]
+                failed_data_names.append(raw_data_name)
+                failed_reasons[raw_data_name] = (error or "执行失败")[:200]
         
         # ── Step 3: 失败数据的重规划 ──
         if failed_data_names:
@@ -1260,15 +1384,17 @@ class HypothesisVerificationAgent:
             if replan_strategy:
                 replan_strategies = replan_strategy.get("strategies", [])
                 for strat in replan_strategies:
-                    data_name = strat.get("data_name", "")
-                    if data_name in updated_data:
+                    # Sanitize data_name in replan loop too
+                    raw_data_name = strat.get("data_name", "")
+                    safe_data_name = raw_data_name.replace("/", "_").replace("\\", "_")
+                    if raw_data_name in updated_data:
                         # 已经获取成功，跳过
                         continue
                     
-                    print(f"    📥 [Step 3-重试] 用替代策略获取 '{data_name}'...")
+                    print(f"    📥 [Step 3-重试] 用替代策略获取 '{raw_data_name}'...")
                     
-                    script_file = os.path.join(acquire_dir, f"acquire_{data_name}_replan.py")
-                    output_file = os.path.join(acquire_dir, f"acquired_{data_name}_replan.json")
+                    script_file = os.path.join(acquire_dir, f"acquire_{safe_data_name}_replan.py")
+                    output_file = os.path.join(acquire_dir, f"acquired_{safe_data_name}_replan.json")
                     
                     code = self._generate_acquisition_script(
                         strategy=strat,
@@ -1279,6 +1405,7 @@ class HypothesisVerificationAgent:
                     if not code:
                         continue
                     
+                    os.makedirs(os.path.dirname(script_file), exist_ok=True)
                     with open(script_file, 'w', encoding='utf-8') as f:
                         f.write(code)
                     
@@ -1289,7 +1416,7 @@ class HypothesisVerificationAgent:
                     # 修正循环 (1次)
                     if not success and error:
                         fix_prompt = DATA_ACQUISITION_FIX_PROMPT.format(
-                            step_name=data_name,
+                            step_name=raw_data_name,
                             original_code=self.injector.extract_core_code(code),
                             error_output=error[:1500],
                             available_data_description=self._format_available_data_for_code(updated_data),
@@ -1320,14 +1447,14 @@ class HypothesisVerificationAgent:
                         explicitly_failed = isinstance(step_data, dict) and step_data.get("success") is False
                         if not explicitly_failed:
                             validation_issues = self._validate_acquired_data(
-                                data_name, step_data, strat.get("data_type", "unknown")
+                                raw_data_name, step_data, strat.get("data_type", "unknown")
                             )
-                            updated_data[data_name] = step_data
-                            self.data_infra.save_to_cache(data_name, step_data)
-                            print(f"    ✅ 重规划成功获取 '{data_name}'")
+                            updated_data[raw_data_name] = step_data
+                            self.data_infra.save_to_cache(safe_data_name, step_data)
+                            print(f"    ✅ 重规划成功获取 '{raw_data_name}'")
                         else:
                             error_msg = step_data.get("error", "重规划也失败")
-                            print(f"    ❌ 重规划获取 '{data_name}' 也失败: {error_msg}")
+                            print(f"    ❌ 重规划获取 '{raw_data_name}' 也失败: {error_msg}")
         
         # ── 检查获取结果 ──
         acquired_count = sum(1 for d in missing_data if d in updated_data 
@@ -1376,7 +1503,7 @@ class HypothesisVerificationAgent:
             hypothesis_claim=claim,
             missing_data_description=missing_desc,
             data_inventory=data_inventory,
-            model_info=json.dumps(model_info, ensure_ascii=False)[:2000],
+            model_info=self._format_model_info_for_prompt(model_info, max_chars=6000),
             available_data_description=available_data_desc,
         )
         
@@ -1443,7 +1570,7 @@ class HypothesisVerificationAgent:
             difficulty=difficulty,
             strategy_context=json.dumps(strategy, ensure_ascii=False),
             data_inventory=data_inventory,
-            model_info=json.dumps(model_info, ensure_ascii=False)[:2000],
+            model_info=self._format_model_info_for_prompt(model_info, max_chars=8000),
             available_data_description=available_data_desc,
         )
         
