@@ -1315,3 +1315,480 @@ QUERY_BASED_PREFLIGHT_FIX_PROMPT = """在训练前对模型源码进行语法检
 - **选择 A (query) 是推荐的!** 先查看有语法错误的文件代码, 确保修复的 search 文本匹配!
 - **edits 的 search 文本必须与源码完全匹配!** 如果你还没看过出错文件, 先查询获取精确文本!
 """
+
+
+# ════════════════════════════════════════
+# 假设验证 Agent Prompt 模板
+# ════════════════════════════════════════
+
+HYPOTHESIS_EXTRACTION_PROMPT_V2 = """你是一位严谨的数据科学家，正在从推荐系统分析报告中提取**可验证的假设**。
+
+## 背景
+LLM 分析了推荐模型 (SASRec) 的错误案例，给出了错误模式、模型瓶颈和改进建议。
+但 LLM 的分析可能包含幻觉或主观臆断。我们需要提取其中的**可验证假设**，
+用数据来确认或反驳这些结论。
+
+## LLM 分析结论
+```json
+{llm_analysis_json}
+```
+
+## 可用数据资源
+以下是我们项目中可用的数据资源:
+{data_inventory}
+
+## 任务
+从上面的分析结论中，提取所有**可以用数据验证的假设**。
+
+一个假设是可验证的，意味着:
+- 我们有 (或能计算得到) 验证所需的数据
+- 可以通过统计分析、对比实验、分布检验等方式量化验证
+- 验证结果能给出明确的"成立/不成立/部分成立"判断
+
+**不要局限于固定验证类型!** 任何可以用数据回答的问题都是可验证假设。
+例如:
+- "冷门物品误推率更高" → 对比误推案例中冷门物品占比与全量占比
+- "模型对长序列用户的注意力衰减" → 分析不同序列长度下的注意力分布
+- "训练数据中类别分布不均衡导致偏差" → 检查类别分布与误推类别分布的相关性
+- "模型倾向于推荐近期交互的物品" → 计算预测物品与最近交互物品的时间距离
+
+对于每个假设:
+- 用精确的描述说明假设内容 (不要模糊)
+- 说明验证思路 (如何用数据验证这个假设)
+- 说明需要什么数据 (具体到数据文件或计算方式)
+- 期望的数据现象 (如果假设成立, 应观察到什么?)
+- 反驳的数据现象 (如果假设不成立, 应观察到什么?)
+
+### 输出格式 (严格遵守)
+
+```json
+{{
+  "hypotheses": [
+    {{
+      "id": "H1",
+      "claim": "精确描述假设内容",
+      "source_field": "error_patterns | model_bottleneck | surprise_failure_reasons | improvement_suggestions",
+      "verification_thought": "验证思路: 如何用数据来验证这个假设 (自由描述, 不受限于固定类型)",
+      "data_needed": ["需要的数据列表, 如: 训练数据交互序列, 物品元数据, 误推案例物品ID, ..."],
+      "expected_if_true": "如果假设成立, 应观察到的数据现象",
+      "expected_if_false": "如果假设不成立, 应观察到的数据现象",
+      "confidence_in_llm": "high | medium | low (LLM 对此结论的置信度估计)",
+      "priority": 1-5 (验证优先级, 5=最高)
+    }}
+  ],
+  "summary": "哪些 LLM 结论最可能是幻觉/臆断, 哪些最可能有数据支撑"
+}}
+```"""
+
+VERIFICATION_PLAN_PROMPT = """你是一位数据科学家，正在为以下假设设计详细的验证方案。
+
+## 假设
+- ID: {hypothesis_id}
+- Claim: {hypothesis_claim}
+- 验证思路: {verification_thought}
+- 需要的数据: {data_needed}
+- 如果成立应观察到的现象: {expected_if_true}
+- 如果不成立应观察到的现象: {expected_if_false}
+
+## 可用数据资源
+{data_inventory}
+
+## 已加载的数据摘要
+{loaded_data_summary}
+
+## 任务
+设计一个**具体的、可执行的验证方案**。方案必须:
+1. 明确指定使用哪些数据
+2. 明确具体的统计分析方法 (如: 比率对比, t-test, 相关性分析, 分布对比, ...)
+3. 给出具体的验证代码思路 (不需要完整代码, 但需要清晰的算法描述)
+4. 定义确认/反驳的判断标准 (什么样的数据结果算是确认? 什么样的算是反驳?)
+
+### 输出格式
+
+```json
+{{
+  "hypothesis_id": "{hypothesis_id}",
+  "verification_plan": {{
+    "method_name": "验证方法名称 (自由命名)",
+    "method_description": "验证方法的详细描述",
+    "data_sources": ["使用的具体数据源"],
+    "analysis_steps": [
+      "Step 1: ...",
+      "Step 2: ...",
+      "Step 3: ..."
+    ],
+    "statistical_method": "使用的统计方法 (如: proportion_comparison, chi_square, t_test, correlation, etc.)",
+    "code_outline": "验证代码的核心算法描述 (伪代码或步骤)",
+    "confirm_criteria": "什么统计结果算确认假设",
+    "refute_criteria": "什么统计结果算反驳假设",
+    "partial_criteria": "什么统计结果算部分确认",
+    "expected_output_format": "验证代码应输出的 JSON 结果格式"
+  }}
+}}
+```"""
+
+VERIFICATION_CODE_PROMPT = """你是一位 Python 数据科学家，正在编写一个验证脚本来检验假设。
+
+## 假设
+- Claim: {hypothesis_claim}
+
+## 验证方案
+```json
+{verification_plan_json}
+```
+
+## 可用数据
+以下数据已序列化为 JSON 文件, 你的脚本可以加载使用:
+{available_data_description}
+
+## ⚠️ 关键约束 — 数据使用方式
+**数据已序列化为 JSON 文件, 路径由 DATA_FILE 常量指定。**
+- 使用 `_data = json.load(open(DATA_FILE))` 加载所有数据
+- 从 `_data` 中按 key 提取你需要的变量, 例如: `wrong_text_cases = _data.get("wrong_text_cases")`
+- 如果大列表被截断为 _sample, 使用样本数据: `wrong_text_cases = _data.get("wrong_text_cases_sample", [])`
+- 不要自行构造数据文件路径, 直接使用 DATA_FILE 常量
+- 如果你需要的数据不在 _data 中, 用 None 表示
+
+## 重要约束
+1. 代码必须是**独立的 Python 脚本**, 不依赖任何外部 API 或特殊库 (只用 numpy, json, collections, os, math, scipy.stats)
+2. 代码开头必须有 import 语句和数据加载逻辑
+3. 使用 `save_result()` 函数将结果写入 JSON 文件 (OUTPUT_FILE 常量已定义)
+4. JSON 输出格式必须包含以下字段:
+```json
+{{
+  "hypothesis_id": "{hypothesis_id}",
+  "statistics": {{
+    // 具体的统计量 (自由定义, 但要包含验证方案中提到的所有指标)
+  }},
+  "interpretation": "对统计结果的简要文字解读",
+  "raw_data_sample": "一小段原始数据样本 (用于辅助分析)"
+}}
+```
+5. 如果某些数据不可用, 在 statistics 中用 null 表示, 不要让脚本崩溃
+6. 代码中不要使用 print() 输出中间结果 (只写最终 JSON)
+7. 代码中必须处理异常 — 如果数据加载失败, 写一个带 error 字段的 JSON 而不是崩溃
+
+## 输出
+只输出完整的 Python 脚本代码 (不要任何解释文字, 不要 markdown code block 标记, 直接写代码)"""
+
+# ── 新增: 数据需求分析 Prompt ──
+DATA_ANALYSIS_PROMPT = """你是一位 Python 数据科学家，正在分析验证假设需要哪些数据。
+
+## 假设
+- Claim: {hypothesis_claim}
+
+## 验证方案
+```json
+{verification_plan_json}
+```
+
+## 可用数据
+以下数据已经可用:
+{available_data_description}
+
+## 数据盘点信息
+{data_inventory}
+
+## 任务
+请分析验证这个假设需要哪些数据，并检查这些数据是否已经可用。
+
+### 分析要求
+1. 列出验证方案中提到的所有数据需求
+2. 对每个数据需求，检查它是否在可用数据中
+3. 如果数据不可用，标记为 "需要获取"
+4. 识别数据之间的依赖关系
+
+### 输出格式
+```json
+{{
+  "data_requirements": [
+    {{
+      "data_name": "数据名称",
+      "description": "这个数据用来做什么",
+      "available": true/false,
+      "source": "可用数据中的来源 / 需要获取的方式",
+      "priority": "高/中/低"
+    }}
+  ],
+  "missing_data": ["需要获取的数据名称列表"],
+  "can_proceed": true/false,
+  "reason": "是否可以继续生成验证代码的原因"
+}}
+```
+
+只输出 JSON，不要其他文字。"""
+
+# ── 新增: 数据获取策略规划 Prompt (Step 1: 先规划，不直接生成代码) ──
+DATA_ACQUISITION_STRATEGY_PROMPT = """你是一位 Python 数据工程师，正在规划如何获取验证所需的缺失数据。
+
+## 假设
+- Claim: {hypothesis_claim}
+
+## 缺失数据清单
+以下数据不可用，需要获取:
+{missing_data_description}
+
+## 数据盘点
+{data_inventory}
+
+## 模型信息
+{model_info}
+
+## 可用数据
+{available_data_description}
+
+## 任务
+请为每项缺失数据制定获取策略。不要直接写代码，而是先规划获取步骤。
+
+### 策略规划要求
+对于每项缺失数据，你需要思考:
+1. **数据来源**: 这个数据从哪里来？是文件数据、模型内部数据、还是需要计算？
+2. **获取步骤**: 需要哪些具体步骤来获取这个数据？
+   - 对于文件数据: 文件路径是什么？用什么格式读取？
+   - 对于模型内部数据: 模型代码结构是什么？需要 hook 哪个层？用什么方式提取？
+   - 对于计算数据: 需要什么计算公式？依赖哪些已有数据？
+3. **前置依赖**: 获取这个数据前，是否需要先获取其他数据？
+4. **难度评估**: 获取这个数据的难度（简单/中等/复杂/极复杂）
+5. **分步计划**: 如果是复杂任务，拆分为多个步骤
+
+### 输出格式
+```json
+{{
+  "strategies": [
+    {{
+      "data_name": "数据名称",
+      "data_type": "file_data / model_internal / computed / mixed",
+      "difficulty": "simple / medium / complex / very_complex",
+      "acquisition_steps": [
+        {{
+          "step_name": "步骤名称",
+          "description": "这一步要做什么",
+          "output": "这一步会产生什么输出",
+          "dependencies": ["前置依赖的数据或步骤"]
+        }}
+      ],
+      "total_steps": 1,
+      "priority": "高/中/低"
+    }}
+  ],
+  "execution_order": ["按执行顺序排列的数据名称"],
+  "estimated_total_steps": 0
+}}
+```
+
+只输出 JSON，不要其他文字。"""
+
+# ── 新增: 数据获取脚本生成 Prompt (整个策略生成单脚本，取代旧版 per-step 模式) ──
+DATA_ACQUISITION_SCRIPT_PROMPT = """你是一位 Python 数据工程师，需要编写一个**完整的、可独立运行的**数据获取脚本。
+
+## 数据目标
+- 数据名称: {data_name}
+- 数据类型: {data_type}
+- 隼度: {difficulty}
+
+## 获取策略 (分步蓝图)
+以下是获取该数据的策略规划，包含多个步骤。你需要将这些步骤合并为**一个连贯的 Python 脚本**，让步骤之间通过 Python 变量自然传递数据，而不是分成多个独立脚本。
+
+{strategy_context}
+
+## 数据盘点
+{data_inventory}
+
+## 模型信息
+{model_info}
+
+## 可用数据 (已获取)
+{available_data_description}
+
+## 关键设计要求
+
+### 1. 单脚本连贯执行
+- 所有步骤在**同一个脚本**中顺序执行
+- 步骤之间通过 Python 变量传递中间结果 (如 model_instance, test_dataset, dataloader)
+- **不要**为每个步骤单独写 save_result() — 只在脚本最后输出最终结果
+- 变量自然流转: 加载配置 → 构建模型(model_instance) → 加载权重到 model_instance → 准备数据(test_dataset) → 构建loader(dataloader) → 注册hook → 运行推理(prediction_scores)
+
+### 2. 示例: 获取模型预测得分 (model_internal 类型)
+**注意: 这只是一个具体案例，展示"单脚本连贯执行"的思路，不是你必须照搬的模板。** 你的数据类型和获取方式可能完全不同，请根据策略蓝图自行设计脚本结构。
+
+此案例的变量流转路径: 加载配置 → 构建模型(model_instance) → 加载权重到 model_instance → 准备数据(test_dataset) → 构建loader(dataloader) → 注册hook → 运行推理(prediction_scores)
+
+```python
+# ── Step 1: 加载模型配置 ──
+# (代码...)
+
+# ── Step 2: 构建模型实例 ──
+model_instance = ...
+
+# ── Step 3: 加载模型权重 ──
+# checkpoint → model_instance.load_state_dict()
+
+# ── Step 4: 准备测试数据 ──
+test_dataset = ...
+
+# ── Step 5: 构建数据加载器 ──
+dataloader = DataLoader(test_dataset, ...)
+
+# ── Step 6: 注册前向传播 hook ──
+captured_outputs = {{}}
+def hook_fn(module, input, output):
+    captured_outputs["item_scores"] = output
+model_instance.item_scores.register_forward_hook(hook_fn)
+
+# ── Step 7: 运行推理 ──
+model_instance.eval()
+all_predictions = []
+for batch in dataloader:
+    with torch.no_grad():
+        model_instance(batch)
+    all_predictions.append(captured_outputs["item_scores"])
+
+# ── 输出最终结果 ──
+result = {{
+    "step_name": "{data_name} (完整pipeline)",
+    "success": True,
+    "data": {{
+        "prediction_scores": ...,  # 最终获取的数据
+        "model_loaded": True,
+        "dataset_size": len(test_dataset),
+        "batch_count": len(dataloader),
+    }},
+    "error": None
+}}
+save_result(result)
+```
+
+### 3. 其他约束
+1. 脚本开头必须有完整的 import 语句
+2. 使用 `save_result()` 函数将最终结果保存到 JSON (OUTPUT_FILE 常量已定义)
+3. **绝对不要模拟或假设数据** — 如果无法获取真实数据，设置 success=false 并说明原因
+4. 对于模型内部数据: 使用 `torch.load()` 加载 checkpoint，使用 PyTorch hooks 提取中间层输出
+5. 处理所有异常 — 用 try/except 包裹可能失败的步骤，失败时设置 success=false
+6. 如果某一步失败但后续步骤可以继续 (如 hook 注册失败但可以尝试其他方式)，记录警告继续执行
+
+只输出完整的 Python 脚本代码 (不要解释文字, 不要 markdown code block 标记, 直接写代码)"""
+
+# ── 旧版: 数据获取脚本生成 Prompt (per-step 模式) ──
+# 已弃用 — 现在改为整个策略生成单脚本 (DATA_ACQUISITION_SCRIPT_PROMPT)
+# 保留此常量名称以兼容旧 import，但内容与新版一致、不再使用 per-step 参数
+DATA_ACQUISITION_STEP_PROMPT = DATA_ACQUISITION_SCRIPT_PROMPT
+
+# ── 新增: 数据获取脚本修正 Prompt ──
+DATA_ACQUISITION_FIX_PROMPT = """数据获取脚本执行失败，请修正代码。
+
+## 当前步骤
+- 步骤名称: {step_name}
+
+## 原始脚本
+```python
+{original_code}
+```
+
+## 执行错误
+```
+{error_output}
+```
+
+## 可用数据
+{available_data_description}
+
+## 修正要求
+1. 分析错误原因，修正代码
+2. 保持相同的获取逻辑，只修正导致错误的代码
+3. 使用 save_result() 函数保存结果
+4. 如果数据无法获取，设置 success=false 并说明原因
+5. 不要模拟数据 — 失败就标记失败
+
+只输出修正后的完整 Python 脚本代码 (不要解释文字, 不要 markdown 标记)"""
+
+VERIFICATION_CODE_FIX_PROMPT = """验证脚本执行失败, 请修正代码。
+
+## 原始脚本
+```python
+{original_code}
+```
+
+## 执行错误
+```
+{error_output}
+```
+
+## 修正要求
+1. 分析错误原因, 修正代码
+2. 保持相同的数据加载和统计逻辑
+3. 使用 save_result() 函数将结果写入 JSON 文件 (OUTPUT_FILE 常量已定义)
+4. 数据文件路径由 DATA_FILE 常量指定, 使用 json.load(open(DATA_FILE)) 加载
+5. 如果数据文件不存在或加载失败, 用 try/except 处理并写入 error 信息到 JSON
+6. 不要使用 print() 输出中间结果
+
+只输出修正后的完整 Python 脚本代码 (不要解释文字, 不要 markdown 标记)"""
+
+RESULT_ANALYSIS_PROMPT = """你是一位严谨的数据科学家, 正在分析验证结果以判断假设是否成立。
+
+## 假设
+- ID: {hypothesis_id}
+- Claim: {hypothesis_claim}
+- 如果成立应观察到的现象: {expected_if_true}
+- 如果不成立应观察到的现象: {expected_if_false}
+
+## 验证方案
+```json
+{verification_plan_json}
+```
+
+## 验证代码执行结果
+```json
+{execution_result_json}
+```
+
+## 判断标准
+- **CONFIRMED**: 数据结果与"假设成立应观察到的现象"高度吻合
+- **PARTIALLY_CONFIRMED**: 数据结果部分吻合, 但差异不够显著或存在混杂因素
+- **REFUTED**: 数据结果与"假设不成立应观察到的现象"吻合, 或与假设方向相反
+- **UNVERIFIABLE**: 数据缺失或统计方法无法得出有效结论
+
+## 任务
+根据验证结果, 给出你的判断。必须:
+1. 解释数据结果的具体含义 (用通俗语言)
+2. 对比数据结果与期望现象
+3. 给出明确的判断 (不能模棱两可)
+4. 如果判断为 PARTIALLY_CONFIRMED, 说明哪些方面吻合、哪些不吻合
+
+### 输出格式
+
+```json
+{{
+  "hypothesis_id": "{hypothesis_id}",
+  "status": "CONFIRMED | PARTIALLY_CONFIRMED | REFUTED | UNVERIFIABLE",
+  "brief": "简洁的判断摘要 (一句话)",
+  "detailed_reasoning": "详细的推理过程 (为什么做出这个判断)",
+  "evidence_summary": {{
+    "key_statistic": "最关键的统计量及其数值",
+    "comparison": "数据结果与期望现象的对比",
+    "confidence": "判断的置信度 (0.0-1.0)"
+  }},
+  "limitations": "验证的局限性或混杂因素 (如有)"
+}}
+```"""
+
+HYPOTHESIS_JSON_FIX_PROMPT = """你之前提取的假设 JSON 格式有误, 请根据以下**原始输出**和**解析错误**信息, 重新输出**正确的 JSON**。
+
+## 你之前的原始输出 (RAW)
+```
+{raw_response_truncated}
+```
+
+## 解析错误
+{parse_error}
+
+## 修正要求
+1. 保持假设内容不变, 只修复 JSON 格式
+2. 确保是**严格合法的 JSON** (双引号, 无结尾逗号, 无注释)
+3. 保持 {{
+  "hypotheses": [...],
+  "summary": "..."
+}} 格式
+4. **只输出 JSON**, 不要解释文字, 不要 markdown 标记
+
+## 部分有效假设 (如果 JSON 中有部分解析成功的假设, 保留它们)
+{partial_hypotheses_text}"""

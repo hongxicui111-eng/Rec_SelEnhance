@@ -43,6 +43,7 @@ from .llm_analyzer import LLMCaseAnalyzer
 from .hypothesis_verification_agent import HypothesisVerificationAgent
 from .structure_applier import StructureApplier
 from .iterative_memory import IterativeMemory
+from .llm_utils import parse_json_from_response, clean_markdown_wrapper as llm_clean_markdown_wrapper
 from .context_compressor import LLMContextCompressor
 from .code_query_tool import CodeQueryTool
 
@@ -1068,6 +1069,7 @@ class RecSelfEvolveAgent:
                     ],
                     temperature=0.2,
                     max_tokens=self.config.llm_max_tokens,
+                    suppress_response_log=True,  # 代码响应不输出到日志
                 )
                 
                 if response is None:
@@ -1577,6 +1579,7 @@ class RecSelfEvolveAgent:
                 ],
                 temperature=0.2,  # 代码修复用极低温度
                 max_tokens=self.config.llm_max_tokens,
+                suppress_response_log=True,  # 代码响应不输出到日志
             )
             
             if response is None:
@@ -1823,6 +1826,7 @@ class RecSelfEvolveAgent:
                 ],
                 temperature=0.2,
                 max_tokens=self.config.llm_max_tokens,
+                suppress_response_log=True,  # 代码响应不输出到日志
             )
             
             if response is None:
@@ -1977,6 +1981,7 @@ class RecSelfEvolveAgent:
             ],
             temperature=0.2,
             max_tokens=self.config.llm_max_tokens,
+            suppress_response_log=True,  # 代码响应不输出到日志
         )
         
         if response is None:
@@ -2475,6 +2480,7 @@ class RecSelfEvolveAgent:
                 item_popularity=item_popularity,
                 overall_metrics=overall_metrics,
                 surprise_metrics=surprise_metrics,
+                iteration_number=self.current_iteration,  # 主流程迭代轮次，用于数据隔离
             )
             
             # --- Step 4: 生成验证报告 ---
@@ -3376,23 +3382,20 @@ class RecSelfEvolveAgent:
         """
         尝试从 LLM 输出中解析 JSON
         
-        适用于 Planner/Researcher/Reflection/Debugger 等角色的输出
+        使用 llm_utils 共享模块, 增加回退逻辑保留旧版兼容
         """
+        result = parse_json_from_response(response)
+        if result is not None:
+            return result
+        
+        # 回退: 旧版 regex 匹配 (覆盖 llm_utils 不处理的格式)
         if not response:
             return None
-        
-        # 提取 JSON 块
-        json_patterns = [
-            r'```json\s*\n(.*?)```',  # ```json ... ```
-            r'```(.*?)```',            # ``` ... ```
-            r'\{.*\}',                  # 裸 JSON 对象
-        ]
-        
-        for pattern in json_patterns:
+        for pattern in [r'```json\s*\n(.*?)```', r'```(.*?)```']:
             match = re.search(pattern, response, re.DOTALL)
             if match:
                 try:
-                    return json.loads(match.group(1) if '```' in pattern else match.group(0))
+                    return json.loads(match.group(1))
                 except json.JSONDecodeError:
                     continue
         
@@ -3833,25 +3836,11 @@ class RecSelfEvolveAgent:
     @staticmethod
     def _clean_markdown_wrapper(text: str) -> str:
         """
-        只清理 markdown 代码块标记 (```python ... ```) 和多余空白,
-        不做"移除解释性前缀"处理 — 这是 SEARCH/REPLACE 格式的安全清理.
-
-        与 clean_new_code 的区别:
-        - clean_new_code 会删除不以 def/class/import 开头的行 (如 parser.add_argument)
-        - _clean_markdown_wrapper 只去掉 markdown 包裹, 保留所有代码内容
+        只清理 markdown 代码块标记和多余空白, 不做"移除解释性前缀"处理
+        
+        使用 llm_utils 共享模块的 clean_markdown_wrapper
         """
-        if not text:
-            return text
-        # 移除 markdown 代码块标记
-        text = re.sub(r'^```(?:python)?\s*\n?', '', text)
-        text = re.sub(r'\n?```\s*$', '', text)
-        # 去除首尾多余空行 (但保留代码内部的空行!)
-        lines = text.split('\n')
-        while lines and not lines[0].strip():
-            lines.pop(0)
-        while lines and not lines[-1].strip():
-            lines.pop()
-        return '\n'.join(lines)
+        return llm_clean_markdown_wrapper(text)
 
     def _normalize_change_format(self, change: dict) -> Optional[dict]:
         """
@@ -4243,6 +4232,7 @@ class RecSelfEvolveAgent:
                 ],
                 temperature=0.3,  # 自纠错时使用低温度，确保精确性
                 max_tokens=self.config.llm_max_tokens,
+                suppress_response_log=True,  # 代码响应不输出到日志
             )
             
             if response is None:
@@ -4462,6 +4452,7 @@ class RecSelfEvolveAgent:
                 ],
                 temperature=0.2,  # 代码修正使用极低温度，确保精确性
                 max_tokens=self.config.llm_max_tokens,
+                suppress_response_log=True,  # 代码响应不输出到日志
             )
             
             if response is None:

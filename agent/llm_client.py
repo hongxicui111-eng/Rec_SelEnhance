@@ -143,10 +143,13 @@ class LLMClient:
         return fitted
 
     def chat(self, messages: list, temperature: float = 0.7,
-             max_tokens: int = 4096) -> Optional[str]:
+             max_tokens: int = 4096, suppress_response_log: bool = False) -> Optional[str]:
         """
         调用 LLM 聊天接口, 带完整重试逻辑
         返回: 模型回复文本, 或 None (所有重试均失败)
+        
+        Args:
+            suppress_response_log: 如果为 True, 不输出响应日志 (用于代码生成等场景)
         """
         last_error = None
         messages = self._fit_messages_to_context(messages, max_tokens=max_tokens)
@@ -182,34 +185,18 @@ class LLMClient:
                 )
                 content = resp.choices[0].message.content
                 
-                # ── 输出 LLM 完整响应内容 (让用户能看到 LLM 到底说了什么!) ──
-                if content:
-                    # 输出到控制台 (用户可见)
-                    print(f"\n{'━'*60}")
-                    print(f"  [LLM Response] model={self.model}, {len(content)} chars")
-                    print(f"{'━'*60}")
-                    # 如果内容太长, 截断显示前 2000 字符 + 末尾摘要
-                    if len(content) > 2000:
-                        print(content[:2000])
-                        print(f"\n  ... (省略 {len(content) - 2000} 字符) ...\n")
-                        print(content[-500:])
-                    else:
-                        print(content)
-                    print(f"{'━'*60}\n")
-                    
-                    # 输出到日志文件 (完整内容, 不截断)
+                # ── 输出 LLM 响应到日志 (完整内容, 不截断) ──
+                # 如果 suppress_response_log=True, 则跳过日志输出 (用于代码生成等场景)
+                if not suppress_response_log:
                     logger.info(f"LLM raw response ({len(content)} chars):\n{content}")
+                else:
+                    logger.info(f"LLM response ({len(content)} chars) [suppressed]")
                 
                 if content and len(content.strip()) > 0:
                     logger.info(f"LLM response OK ({len(content)} chars)")
                     return content
                 else:
-                    # 即使内容太短也输出, 让用户看到 LLM 返回了什么
-                    print(f"\n{'━'*60}")
-                    print(f"  [LLM Response — EMPTY/TOO SHORT] model={self.model}, {len(content) if content else 0} chars")
-                    print(f"{'━'*60}")
-                    print(content if content else "(empty)")
-                    print(f"{'━'*60}\n")
+                    # 空响应输出到日志
                     logger.warning(f"LLM response empty or too short: '{content}'")
                     # 对空回复重试, 但短回复(有内容)直接返回
                     if not content or len(content.strip()) == 0:

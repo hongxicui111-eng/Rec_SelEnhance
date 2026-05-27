@@ -23,4 +23,13 @@ from .code_query_tool import CodeQueryTool
 
 from .hypothesis_verification_agent import HypothesisVerificationAgent
 
-__version__ = "0.7.0"
+from .llm_utils import (
+    extract_json_block, robust_json_parse, diagnose_json_error,
+    parse_json_from_response, clean_code_response, clean_markdown_wrapper,
+    LLMRetryHelper,
+)
+from .script_executor import (
+    extract_output_path, DataInjector, ScriptExecutor,
+)
+
+__version__ = "0.8.0"
