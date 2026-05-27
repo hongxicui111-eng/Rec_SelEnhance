@@ -1202,10 +1202,10 @@ class RecSelfEvolveAgent:
             return train_result
         
         # ── 训练失败 → 进入自纠错内循环! ──
-        print(f"\n  ╔══════════════════════════════════════╗")
-        print(f"  ║  🔁 进入自纠错内循环                  ║")
-        print(f"  ║  训练失败 → 提取错误 → 修复 → 重试    ║")
-        print(f"  ║  最多 {max_rounds} 轮自纠错              ║")
+        print(f"\n╔══════════════════════════════════════╗")
+        print(f"  ║  🔁 进入自纠错内循环                    ║")
+        print(f"  ║  训练失败 → 提取错误 → 修复 → 重试       ║")
+        print(f"  ║  最多 {max_rounds} 轮自纠错            ║")
         print(f"  ╚══════════════════════════════════════╝")
         
         error_category = train_result.get("error_category", "UNKNOWN")
@@ -1232,7 +1232,7 @@ class RecSelfEvolveAgent:
         if tb_details.get("offending_code_snippets"):
             print(f"  出错代码:")
             for snippet in tb_details.get("offending_code_snippets", []):
-                print(f"    {snippet[:200]}")
+                print(f"    {snippet}")
         
         if not fixable:
             # 不可修复 → 直接返回失败结果
@@ -3533,26 +3533,50 @@ class RecSelfEvolveAgent:
         """
         从代码片段中推断目标文件和函数/类名
         
+        三级推断策略:
+        1. 类定义匹配 — 在源码文件中查找唯一包含该类名的文件
+        2. 函数定义匹配 — 在源码文件中查找包含该函数名的文件
+           * 对于常见函数名 (__init__, forward, train 等)，逐文件验证
+           * 先尝试精确匹配 search text 行, 再退到函数名匹配
+        3. 内容逐行匹配 — 将 search text 的每一行在所有源码文件中搜索,
+           选匹配行最多的文件 (解决 "betas=..." "elif..." 等无定义的片段)
+        
         Returns:
             (target_file, target_class_or_function)
         """
-        # 尝试匹配类定义
+        # ── Level 1: 类定义匹配 ──
         class_match = re.search(r'class\s+(\w+)', code_snippet)
         if class_match:
             class_name = class_match.group(1)
-            # 查找该类在哪个源码文件中
             target_file = self._find_file_containing_class(class_name)
             return (target_file, class_name)
         
-        # 尝试匹配函数定义
+        # ── Level 2: 函数定义匹配 (改进: 验证多文件冲突) ──
         func_match = re.search(r'def\s+(\w+)', code_snippet)
         if func_match:
             func_name = func_match.group(1)
+            # 先尝试用 search text 的行内容精确定位文件
+            content_match_file = self._find_best_file_by_content_match(code_snippet)
+            if content_match_file:
+                logger.info(f"_identify_target: content match → {content_match_file} "
+                            f"(func_name={func_name} found in multiple files)")
+                return (content_match_file, func_name)
+            # 退到函数名查找
             target_file = self._find_file_containing_function(func_name)
             return (target_file, func_name)
         
-        # 默认: 使用主要模型文件
+        # ── Level 3: 内容逐行匹配 (无 class/def 时的关键策略) ──
+        # 例如 "betas = ...", "elif self.args...", "self.criterion = ..."
+        content_match_file = self._find_best_file_by_content_match(code_snippet)
+        if content_match_file:
+            logger.info(f"_identify_target: content match → {content_match_file} "
+                        f"(no class/def in snippet)")
+            return (content_match_file, "unknown")
+        
+        # ── 最终兜底 ──
         default_file = list(self.adapter.SOURCE_FILE_MAP.keys())[0] if self.adapter.SOURCE_FILE_MAP else "unknown"
+        logger.warning(f"_identify_target: could not determine target file, "
+                       f"falling back to default: {default_file}")
         return (default_file, "unknown")
 
     def _find_file_containing_class(self, class_name: str) -> str:
@@ -3580,6 +3604,53 @@ class RecSelfEvolveAgent:
                 except Exception:
                     continue
         return list(self.adapter.SOURCE_FILE_MAP.keys())[0] if self.adapter.SOURCE_FILE_MAP else "unknown"
+
+    def _find_best_file_by_content_match(self, code_snippet: str) -> Optional[str]:
+        """
+        用逐行内容匹配来确定 search text 最可能属于哪个文件
+        
+        算法:
+        1. 取 search text 的所有非空行 (strip 后)
+        2. 对每个源码文件, 计算有多少行的 stripped 版本出现在文件内容中
+        3. 选匹配行数最多的文件 (至少 >= 1 行才算匹配)
+        
+        这解决了两个关键问题:
+        - "betas = (self.args.adam_beta1, ...)" 这类无 def/class 的代码片段
+        - "def __init__" 这类多个文件都有的函数名
+        
+        Returns:
+            target_file (如 "trainers.py") 或 None (无任何匹配)
+        """
+        # 取 search text 的非空行 (stripped, 用于匹配)
+        snippet_lines = [l.strip() for l in code_snippet.split('\n') if l.strip()]
+        if not snippet_lines:
+            return None
+        
+        best_file = None
+        best_match_count = 0
+        
+        for file_path in self.adapter.SOURCE_FILE_MAP.keys():
+            full_path = os.path.join(self.config.project_root, file_path)
+            if not os.path.exists(full_path):
+                continue
+            try:
+                content = open(full_path).read()
+                # 统计该文件中有多少行匹配 search text 的行
+                content_lines_stripped = [l.strip() for l in content.split('\n') if l.strip()]
+                match_count = sum(1 for sl in snippet_lines if sl in content_lines_stripped)
+                if match_count > best_match_count:
+                    best_match_count = match_count
+                    best_file = file_path
+            except Exception:
+                continue
+        
+        # 至少需要 1 行匹配才算有效 (避免完全无关的文件)
+        if best_match_count >= 1 and best_file:
+            logger.info(f"_find_best_file_by_content_match: {best_file} "
+                        f"matched {best_match_count}/{len(snippet_lines)} lines")
+            return best_file
+        
+        return None
 
     def _strip_evolve_markers(self, code: str) -> str:
         """从代码中移除 Self_EvolveRec-BLOCK-START/END 标记行"""

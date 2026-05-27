@@ -1054,35 +1054,147 @@ class HypothesisVerifier:
         return ""
     
     def _parse_hypothesis_response(self, response: str) -> Optional[Dict]:
-        """解析 LLM 假设提取回复"""
+        """解析 LLM 假设提取回复 (增强版 — 多策略健壮解析 + 结构验证)"""
         import re
         
-        # 尝试提取 JSON code block
+        # 提取 JSON block
+        json_str = self._extract_json_block(response)
+        if json_str is None:
+            logger.warning("Cannot extract JSON from hypothesis extraction response")
+            return None
+        
+        # 健壮解析
+        parsed = self._robust_json_parse(json_str)
+        if parsed is not None:
+            validated = self._validate_hypotheses_structure(parsed)
+            if validated is not None:
+                return validated
+            logger.warning("JSON parsed but structure validation failed")
+        else:
+            logger.warning("All JSON parsing strategies failed")
+        
+        return None
+    
+    @staticmethod
+    def _extract_json_block(response: str) -> Optional[str]:
+        """从 LLM 回复中提取 JSON block"""
+        import re
+        
         json_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', response, re.DOTALL)
         if json_match:
-            json_str = json_match.group(1)
-        else:
-            start = response.find('{')
-            end = response.rfind('}')
-            if start >= 0 and end > start:
-                json_str = response[start:end + 1]
-            else:
-                logger.warning("Cannot extract JSON from hypothesis extraction response")
-                return None
+            return json_match.group(1)
+        
+        start = response.find('{')
+        end = response.rfind('}')
+        if start >= 0 and end > start:
+            return response[start:end + 1]
+        
+        return None
+    
+    @staticmethod
+    def _robust_json_parse(json_str: str) -> Optional[Dict]:
+        """
+        多策略 JSON 解析, 带模糊修复
+        
+        Strategy 1: 标准 json.loads
+        Strategy 2: ast.literal_eval
+        Strategy 3: 修复常见格式问题后重试
+        Strategy 4: 修复缺失引号的键
+        """
+        # --- Strategy 1: 标准解析 ---
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+        
+        # --- Strategy 2: Python literal ---
+        try:
+            import ast
+            parsed = ast.literal_eval(json_str)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        
+        # --- Strategy 3: 修复常见 JSON 格式问题 ---
+        fixed = json_str
+        
+        # 移除注释
+        fixed = re.sub(r'//[^\n]*', '', fixed)
+        fixed = re.sub(r'/\*.*?\*/', '', fixed, flags=re.DOTALL)
+        
+        # 移除尾随逗号
+        fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
+        
+        # Python 字面量 → JSON 字面量
+        fixed = fixed.replace(': None', ': null')
+        fixed = fixed.replace(': True', ': true')
+        fixed = fixed.replace(': False', ': false')
         
         try:
-            parsed = json.loads(json_str)
-            return parsed
-        except json.JSONDecodeError as e:
-            logger.warning(f"JSON parse error in hypothesis extraction: {e}")
-            try:
-                import ast
-                parsed = ast.literal_eval(json_str)
-                if isinstance(parsed, dict):
-                    return parsed
-            except Exception:
-                pass
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            pass
+        
+        # --- Strategy 4: 修复缺失引号的键 ---
+        fixed2 = re.sub(
+            r'(?<![:"\w])([a-zA-Z_][a-zA-Z0-9_]*)\s*:',
+            r'"\1":',
+            fixed
+        )
+        try:
+            return json.loads(fixed2)
+        except json.JSONDecodeError:
+            pass
+        
+        # --- Strategy 5: 单引号 → 双引号 ---
+        fixed3 = fixed2.replace("'", '"')
+        try:
+            return json.loads(fixed3)
+        except json.JSONDecodeError:
+            pass
+        
+        return None
+    
+    @staticmethod
+    def _validate_hypotheses_structure(parsed: Dict) -> Optional[Dict]:
+        """验证和补全假设结构"""
+        if not isinstance(parsed, dict):
             return None
+        
+        hypotheses = parsed.get("hypotheses")
+        if hypotheses is None:
+            return None
+        
+        if not isinstance(hypotheses, list) or len(hypotheses) == 0:
+            return None
+        
+        required_fields = ["id", "claim"]
+        optional_fields = {
+            "verification_method": "custom",
+            "expected_if_true": "",
+            "expected_if_false": "",
+            "confidence_in_llm": "medium",
+            "priority": 3,
+            "source_field": "unknown",
+        }
+        
+        validated = []
+        for h in hypotheses:
+            if not isinstance(h, dict):
+                continue
+            missing = [f for f in required_fields if f not in h or not h[f]]
+            if missing:
+                continue
+            for key, default in optional_fields.items():
+                if key not in h:
+                    h[key] = default
+            validated.append(h)
+        
+        if not validated:
+            return None
+        
+        return {"hypotheses": validated, "summary": parsed.get("summary", "")}
     
     def compute_item_popularity_from_data(self, train_data) -> Dict:
         """

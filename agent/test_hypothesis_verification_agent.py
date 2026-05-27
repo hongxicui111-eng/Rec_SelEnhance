@@ -21,12 +21,16 @@ import shutil
 
 # 直接测试 Agent 的数据处理方法 (不需要 LLM 调用)
 from agent.hypothesis_verification_agent import (
-    HypothesisVerificationAgent, DataInventory,
+    HypothesisVerificationAgent, DataInventory, DataComputationEngine,
+    ModelProbingEngine,
     HYPOTHESIS_EXTRACTION_PROMPT_V2,
     VERIFICATION_PLAN_PROMPT,
     VERIFICATION_CODE_PROMPT,
     VERIFICATION_CODE_FIX_PROMPT,
     RESULT_ANALYSIS_PROMPT,
+    DATA_COMPUTATION_PROMPT,
+    MODEL_PROBING_ANALYSIS_PROMPT,
+    MODEL_PROBING_SCRIPT_PROMPT,
 )
 
 
@@ -912,7 +916,980 @@ def test_interface_compatibility():
     print("✅ test_interface_compatibility PASSED")
 
 
-if __name__ == "__main__":
+# ════════════════════════════════════════
+# 测试 DataComputationEngine
+# ════════════════════════════════════════
+
+def test_data_computation_engine_init():
+    """测试 DataComputationEngine 初始化"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = os.path.join(tmpdir, "Recmodel", "data")
+        log_dir = os.path.join(tmpdir, "logs")
+        os.makedirs(data_dir, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
+        
+        engine = DataComputationEngine(
+            project_root=tmpdir,
+            data_dir=data_dir,
+            log_dir=log_dir,
+        )
+        
+        assert engine.project_root == tmpdir
+        assert engine.llm is None  # no LLM by default
+        assert engine.MAX_COMPUTE_TIMEOUT == 120
+        assert engine.MAX_COMPUTE_FIX_ROUNDS == 2
+        
+        # Check cache dir exists
+        assert os.path.exists(engine.cache_dir)
+        
+        print("✅ test_data_computation_engine_init PASSED")
+
+
+def test_compute_item_interaction_freq():
+    """测试内置方法: 物品交互频率计算"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = os.path.join(tmpdir, "Recmodel", "data")
+        log_dir = os.path.join(tmpdir, "logs")
+        os.makedirs(data_dir, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # 创建训练数据文件
+        train_file = os.path.join(data_dir, "Beauty_train.txt")
+        with open(train_file, 'w') as f:
+            f.write("1 2 3 4 5\n6 7 8\n1 2 3\n")
+        
+        engine = DataComputationEngine(
+            project_root=tmpdir,
+            data_dir=data_dir,
+            log_dir=log_dir,
+        )
+        
+        # 计算物品交互频率
+        preloaded = {"train_data_path": train_file}
+        result = engine._compute_item_interaction_freq(preloaded)
+        
+        assert result is not None
+        assert "freq_dict" in result
+        assert "statistics" in result
+        
+        # 检查统计值
+        freq = result["freq_dict"]
+        assert freq["1"] == 2  # item 1 appears in lines 1 and 3
+        assert freq["2"] == 2  # item 2 appears in lines 1 and 3
+        assert freq["5"] == 1  # item 5 appears in line 1
+        
+        stats = result["statistics"]
+        assert stats["total_items"] == 8  # 8 unique items
+        assert stats["total_sequences"] == 3
+        
+        print(f"  Item freq: {result['statistics']['total_items']} unique items, "
+              f"{result['statistics']['total_sequences']} sequences")
+        print("✅ test_compute_item_interaction_freq PASSED")
+
+
+def test_compute_category_overlap_stats():
+    """测试内置方法: 类别重叠统计"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        log_dir = os.path.join(tmpdir, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        
+        engine = DataComputationEngine(
+            project_root=tmpdir,
+            log_dir=log_dir,
+        )
+        
+        # 使用 mock 数据
+        wrong_cases = _make_mock_wrong_cases()
+        item_map = _make_mock_item_text_map()
+        
+        preloaded = {
+            "wrong_text_cases": wrong_cases,
+            "item_text_map": item_map,
+        }
+        
+        result = engine._compute_category_overlap_stats(
+            {"id": "H1", "claim": "跨类别跳跃"}, preloaded
+        )
+        
+        assert result is not None
+        assert "per_case_overlap" in result
+        assert "statistics" in result
+        assert "sample" in result
+        
+        stats = result["statistics"]
+        assert "total_wrong_cases" in stats
+        assert "no_category_overlap_pct" in stats
+        
+        # 检查样本有正确的结构
+        if result["sample"]:
+            sample_entry = result["sample"][0]
+            assert "target_id" in sample_entry
+            assert "overlap_size" in sample_entry
+        
+        print(f"  Category overlap stats: total={stats['total_wrong_cases']}, "
+              f"no_overlap_pct={stats['no_category_overlap_pct']}%")
+        print("✅ test_compute_category_overlap_stats PASSED")
+
+
+def test_compute_category_distribution():
+    """测试内置方法: 类别分布统计"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = os.path.join(tmpdir, "Recmodel", "data")
+        log_dir = os.path.join(tmpdir, "logs")
+        os.makedirs(data_dir, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # 创建元数据文件
+        meta_file = os.path.join(data_dir, "id_meta_data.json")
+        meta_data = {
+            "1": {"title": "Laptop", "categories": "Electronics > Computers > Laptops"},
+            "2": {"title": "Phone", "categories": "Electronics > Phones > Smartphones"},
+            "3": {"title": "Book", "categories": "Books > Fiction > Sci-Fi"},
+            "4": {"title": "Shirt", "categories": "Clothing > Men > T-Shirts"},
+            "5": {"title": "Coffee", "categories": "Food > Drinks > Coffee"},
+        }
+        with open(meta_file, 'w') as f:
+            json.dump(meta_data, f)
+        
+        engine = DataComputationEngine(
+            project_root=tmpdir,
+            data_dir=data_dir,
+            log_dir=log_dir,
+        )
+        
+        result = engine._compute_category_distribution({"item_metadata": meta_data})
+        
+        assert result is not None
+        assert "statistics" in result
+        
+        stats = result["statistics"]
+        assert stats["total_items"] == 5
+        assert stats["unique_categories"] == 4  # Electronics, Books, Clothing, Food
+        
+        # Electronics should be the top category (2 items)
+        assert stats["top_category"] == "Electronics"
+        
+        print(f"  Category distribution: {stats['unique_categories']} categories, "
+              f"top={stats['top_category']} ({stats['top_category_pct']}%)")
+        print("✅ test_compute_category_distribution PASSED")
+
+
+def test_compute_recommendation_frequency():
+    """测试内置方法: 推荐频率统计"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        log_dir = os.path.join(tmpdir, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        
+        engine = DataComputationEngine(
+            project_root=tmpdir,
+            log_dir=log_dir,
+        )
+        
+        wrong_cases = _make_mock_wrong_cases()
+        result = engine._compute_recommendation_frequency({"wrong_text_cases": wrong_cases})
+        
+        assert result is not None
+        assert "frequency_dict" in result
+        assert "statistics" in result
+        
+        stats = result["statistics"]
+        assert "total_prediction_slots" in stats
+        assert "top_20_recommendations" in stats
+        
+        print(f"  Rec frequency: {stats['unique_items_in_predictions']} unique items in predictions")
+        print("✅ test_compute_recommendation_frequency PASSED")
+
+
+def test_compute_sequence_target_mapping():
+    """测试内置方法: 序列-目标关联数据"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        log_dir = os.path.join(tmpdir, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        
+        engine = DataComputationEngine(
+            project_root=tmpdir,
+            log_dir=log_dir,
+        )
+        
+        wrong_cases = _make_mock_wrong_cases()
+        result = engine._compute_sequence_target_mapping({"wrong_text_cases": wrong_cases})
+        
+        assert result is not None
+        assert "per_case_mapping" in result
+        assert "statistics" in result
+        
+        stats = result["statistics"]
+        assert "total_cases" in stats
+        assert "avg_sequence_length" in stats
+        
+        print(f"  Sequence-target mapping: {stats['total_cases']} cases, "
+              f"avg_seq_len={stats['avg_sequence_length']}")
+        print("✅ test_compute_sequence_target_mapping PASSED")
+
+
+def test_identify_missing_data():
+    """测试缺失数据识别"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = os.path.join(tmpdir, "Recmodel", "data")
+        log_dir = os.path.join(tmpdir, "logs")
+        os.makedirs(data_dir, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
+        
+        inventory = DataInventory(project_root=tmpdir, data_dir=data_dir, log_dir=log_dir)
+        
+        # 测试 1: 所有数据都已加载 → 无缺失
+        loaded_all = {
+            "category_overlap_stats": {"some": "data"},
+            "item_popularity": {"1": 100},
+            "wrong_text_cases": [{"target_id": 1}],
+        }
+        missing = inventory.identify_missing_data(
+            ["类别重叠统计", "物品热度分布"], loaded_all
+        )
+        assert len(missing) == 0
+        
+        # 测试 2: 类别重叠缺失
+        loaded_partial = {"item_popularity": {"1": 100}}
+        missing = inventory.identify_missing_data(
+            ["类别重叠统计", "跨类别跳跃分析"], loaded_partial
+        )
+        assert len(missing) > 0
+        assert any("category_overlap_stats" in m for m in missing)
+        
+        # 测试 3: 推荐频率缺失
+        loaded_empty = {}
+        missing = inventory.identify_missing_data(
+            ["模型推荐频率", "推荐频次对比"], loaded_empty
+        )
+        assert len(missing) > 0
+        assert any("recommendation_frequency" in m for m in missing)
+        
+        print("✅ test_identify_missing_data PASSED")
+
+
+def test_compute_needed_data_integration():
+    """测试 compute_needed_data 完整流程"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = os.path.join(tmpdir, "Recmodel", "data")
+        log_dir = os.path.join(tmpdir, "logs")
+        os.makedirs(data_dir, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # 创建训练数据
+        train_file = os.path.join(data_dir, "Beauty_train.txt")
+        with open(train_file, 'w') as f:
+            f.write("1 2 3 4 5\n6 7 8\n1 2 3\n")
+        
+        # 创建元数据
+        meta_file = os.path.join(data_dir, "id_meta_data.json")
+        with open(meta_file, 'w') as f:
+            json.dump(_make_mock_item_text_map(), f)
+        
+        engine = DataComputationEngine(
+            project_root=tmpdir,
+            data_dir=data_dir,
+            log_dir=log_dir,
+        )
+        
+        wrong_cases = _make_mock_wrong_cases()
+        item_map = _make_mock_item_text_map()
+        
+        preloaded = {
+            "wrong_text_cases": wrong_cases,
+            "item_text_map": item_map,
+        }
+        
+        # 模拟缺失数据列表
+        missing = [
+            "category_overlap_stats: 目标物品与用户历史序列的类别重叠统计",
+            "recommendation_frequency: 模型推荐结果中各物品的推荐频次",
+        ]
+        
+        hypothesis = {"id": "H1", "claim": "跨类别跳跃"}
+        
+        computed = engine.compute_needed_data(missing, hypothesis, preloaded)
+        
+        # 应至少计算成功一部分
+        assert len(computed) > 0
+        
+        # category_overlap_stats 应被计算
+        if "category_overlap_stats" in computed:
+            assert "per_case_overlap" in computed["category_overlap_stats"]
+            assert "statistics" in computed["category_overlap_stats"]
+        
+        # recommendation_frequency 应被计算
+        if "recommendation_frequency" in computed:
+            assert "frequency_dict" in computed["recommendation_frequency"]
+            assert "statistics" in computed["recommendation_frequency"]
+        
+        print(f"  Computed {len(computed)} data items: {list(computed.keys())}")
+        print("✅ test_compute_needed_data_integration PASSED")
+
+
+def test_data_computation_prompt():
+    """测试 DATA_COMPUTATION_PROMPT 模板"""
+    # 检查关键占位符
+    assert "{missing_data_description}" in DATA_COMPUTATION_PROMPT
+    assert "{raw_data_sources}" in DATA_COMPUTATION_PROMPT
+    assert "{hypothesis_id}" in DATA_COMPUTATION_PROMPT
+    assert "{hypothesis_claim}" in DATA_COMPUTATION_PROMPT
+    assert "{verification_thought}" in DATA_COMPUTATION_PROMPT
+    assert "{data_needed}" in DATA_COMPUTATION_PROMPT
+    assert "{output_file_path}" in DATA_COMPUTATION_PROMPT
+    
+    # 检查提示了数据格式 (英文 keywords)
+    assert "categories" in DATA_COMPUTATION_PROMPT
+    assert "训练数据格式" in DATA_COMPUTATION_PROMPT
+    
+    print("✅ test_data_computation_prompt PASSED")
+
+
+def test_data_inventory_get_computation_engine():
+    """测试 DataInventory 获取计算引擎"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = os.path.join(tmpdir, "Recmodel", "data")
+        log_dir = os.path.join(tmpdir, "logs")
+        os.makedirs(data_dir, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
+        
+        inventory = DataInventory(project_root=tmpdir, data_dir=data_dir, log_dir=log_dir)
+        
+        # 获取引擎 (无 LLM)
+        engine = inventory.get_computation_engine()
+        assert engine is not None
+        assert engine.llm is None
+        
+        # 再次获取 → 应返回相同实例
+        engine2 = inventory.get_computation_engine()
+        assert engine2 is engine
+        
+        # 传入 LLM → 应更新
+        mock_llm = _make_mock_llm()
+        engine3 = inventory.get_computation_engine(llm_client=mock_llm)
+        assert engine3.llm is mock_llm
+        
+        print("✅ test_data_inventory_get_computation_engine PASSED")
+
+
+def test_prepare_verification_data_with_computation():
+    """测试 _prepare_verification_data 自动计算缺失数据"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = os.path.join(tmpdir, "Recmodel", "data")
+        log_dir = os.path.join(tmpdir, "logs")
+        os.makedirs(data_dir, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # 创建训练数据
+        train_file = os.path.join(data_dir, "Beauty_train.txt")
+        with open(train_file, 'w') as f:
+            f.write("1 2 3 4 5\n6 7 8\n1 2 3\n")
+        
+        # 创建元数据
+        meta_file = os.path.join(data_dir, "id_meta_data.json")
+        with open(meta_file, 'w') as f:
+            json.dump(_make_mock_item_text_map(), f)
+        
+        mock_llm = _make_mock_llm()
+        agent = HypothesisVerificationAgent(
+            llm_client=mock_llm,
+            item_text_map=_make_mock_item_text_map(),
+            project_root=tmpdir,
+            data_dir=data_dir,
+            log_dir=log_dir,
+        )
+        
+        wrong_cases = _make_mock_wrong_cases()
+        
+        # 假设需要类别重叠数据
+        hypothesis = {
+            "id": "H1",
+            "claim": "目标物品与用户历史序列在类别上完全不相关",
+            "verification_thought": "统计误推案例中目标物品与历史序列的类别交集",
+            "data_needed": ["误推案例列表", "物品元数据", "类别重叠统计"],
+            "expected_if_true": "误推中无类别重叠的比例显著高于正确推荐",
+            "expected_if_false": "误推与正确推荐在类别重叠比例上无显著差异",
+        }
+        
+        verification_plan = {
+            "verification_plan": {
+                "data_sources": ["wrong_text_cases", "item_metadata", "category_overlap_stats"],
+            }
+        }
+        
+        preloaded = agent._prepare_preloaded_data(
+            wrong_cases, None, _make_mock_item_popularity(),
+            {"NDCG@10": 0.3}, {"NDCG@10": 0.15}
+        )
+        
+        # 调用 _prepare_verification_data
+        verification_data = agent._prepare_verification_data(
+            hypothesis, verification_plan, preloaded
+        )
+        
+        # 应包含 wrong_text_cases (原始传入)
+        assert "wrong_text_cases" in verification_data
+        
+        # 应包含 item_text_map
+        assert "item_text_map" in verification_data
+        
+        # 检查是否有计算生成的数据 (可能不会完全成功, 但流程应该运行不崩溃)
+        # 关键: 不会因为缺失数据而崩溃
+        assert verification_data is not None
+        
+        print(f"  Verification data keys: {list(verification_data.keys())}")
+        print("✅ test_prepare_verification_data_with_computation PASSED")
+
+
+def test_format_computed_data_for_prompt():
+    """测试格式化计算数据为 LLM prompt"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        log_dir = os.path.join(tmpdir, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        
+        engine = DataComputationEngine(project_root=tmpdir, log_dir=log_dir)
+        
+        computed_data = {
+            "category_overlap_stats": {
+                "statistics": {
+                    "total_wrong_cases": 50,
+                    "no_category_overlap_pct": 65.0,
+                    "avg_overlap_ratio": 0.12,
+                },
+                "sample": {"1": "Electronics"},
+                "computation_method": "builtin: category overlap",
+            },
+            "recommendation_frequency": {
+                "frequency_dict": {"1": 100, "2": 80},
+                "statistics": {
+                    "total_prediction_slots": 1000,
+                    "unique_items_in_predictions": 20,
+                },
+                "sample": {"1": 100},
+            },
+        }
+        
+        formatted = engine.format_computed_data_for_prompt(computed_data)
+        
+        assert "category_overlap_stats" in formatted
+        assert "recommendation_frequency" in formatted
+        assert "65.0" in formatted  # no_overlap_pct
+        # Check for the known description from KNOWN_COMPUTED_DATA
+        assert "目标物品与用户历史序列的类别重叠统计" in formatted
+        
+        print(f"  Formatted prompt text length: {len(formatted)} chars")
+        print("✅ test_format_computed_data_for_prompt PASSED")
+
+
+def test_inject_data_loading_truncated_variable_alias():
+    """验证 _inject_data_loading 在大列表截断时, 原始变量名仍可用"""
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        agent = HypothesisVerificationAgent.__new__(HypothesisVerificationAgent)
+        agent.log_dir = tmp_dir
+        
+        # 构造超过100项的列表, 模拟 wrong_text_cases 被截断的情况
+        big_list = [{"user_id": f"u{i}", "item": f"item{i}"} for i in range(200)]
+        small_dict = {"metric1": 0.5, "metric2": 0.3}
+        
+        verification_data = {
+            "wrong_text_cases": big_list,   # >100, 会被截断为 wrong_text_cases_sample
+            "overall_metrics": small_dict,  # dict, 不会被截断
+        }
+        
+        output_file = os.path.join(tmp_dir, "verification_scripts", "result_H2.json")
+        dummy_code = "# dummy verification code\npass"
+        
+        result_code = agent._inject_data_loading(dummy_code, verification_data, output_file)
+        
+        # 验证: 原始变量名 wrong_text_cases 必须出现在注入代码中
+        assert "wrong_text_cases = " in result_code, \
+            "原始变量名 wrong_text_cases 必须被注入, 否则 LLM 生成的代码引用该变量时会报 NameError"
+        
+        # 验证: wrong_text_cases 应指向 wrong_text_cases_sample (截断数据)
+        assert "wrong_text_cases = wrong_text_cases_sample" in result_code, \
+            "截断后, 原始变量名应指向样本数据"
+        
+        # 验证: wrong_text_cases_sample 和 wrong_text_cases_count 也要存在
+        assert "wrong_text_cases_sample = " in result_code
+        assert "wrong_text_cases_count = " in result_code
+        
+        # 验证: 小字典保持原始变量名直接映射
+        assert "overall_metrics = _preloaded.get" in result_code
+        
+        # 验证: JSON 数据文件已创建且包含截断后的数据
+        data_file = os.path.join(tmp_dir, "verification_scripts", "data", "preloaded_data.json")
+        assert os.path.exists(data_file)
+        with open(data_file, 'r') as f:
+            saved_data = json.load(f)
+        assert "wrong_text_cases_sample" in saved_data
+        assert len(saved_data["wrong_text_cases_sample"]) == 50  # 前50条样本
+        assert saved_data["wrong_text_cases_count"] == 200
+        assert "wrong_text_cases" not in saved_data  # 原始key不在JSON中(已截断)
+        assert "overall_metrics" in saved_data
+        
+        # 验证: 生成的代码可以正确加载变量 (模拟执行)
+        # 提取注入部分 (不含 dummy_code), 验证变量赋值语法正确
+        injection_only = result_code.split("# dummy verification code")[0]
+        # 确保没有语法错误 — 变量赋值顺序正确 (sample 在 alias 之前)
+        lines = [l.strip() for l in injection_only.split('\n') if l.strip() and '=' in l and not l.strip().startswith('#')]
+        sample_line_idx = next(i for i, l in enumerate(lines) if 'wrong_text_cases_sample = _preloaded' in l)
+        alias_line_idx = next(i for i, l in enumerate(lines) if 'wrong_text_cases = wrong_text_cases_sample' in l)
+        assert alias_line_idx > sample_line_idx, \
+            "别名赋值必须在样本赋值之后, 否会 NameError"
+        
+        print("✅ test_inject_data_loading_truncated_variable_alias PASSED")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_execute_script_detects_error_result_in_output_file():
+    """验证 _execute_script 能检测结果文件中的 'error' 字段, 不将其误判为成功
+    
+    这是关键 Bug 修复的测试:
+    - LLM 生成的验证脚本用 try/except 捕获异常后写入 {"error": "..."} 
+    - 脚本退出码为 0, _execute_script 读到文件后返回 True — BUG!
+    - 修复后应返回 False + error 信息, 让修正循环生效
+    """
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        agent = HypothesisVerificationAgent.__new__(HypothesisVerificationAgent)
+        agent.log_dir = tmp_dir
+        agent.project_root = tmp_dir
+        agent.MAX_EXECUTION_TIMEOUT = 30
+        
+        # 创建一个脚本: 退出码为 0, 但结果文件包含 error 字段
+        script_dir = os.path.join(tmp_dir, "verification_scripts")
+        os.makedirs(script_dir, exist_ok=True)
+        result_path = os.path.join(script_dir, "result_H2.json")
+        script_path = os.path.join(script_dir, "verify_H2.py")
+        
+        # 脚本内容: 退出码0, 写入 {"hypothesis_id": "H2", "error": "Missing required variable: wrong_text_cases"}
+        error_result = {"hypothesis_id": "H2", "error": "Missing required variable: wrong_text_cases"}
+        error_script = (
+            "import json, os\n"
+            f"result = {json.dumps(error_result)}\n"
+            f"os.makedirs(os.path.dirname('{result_path}'), exist_ok=True)\n"
+            f"with open('{result_path}', 'w') as f:\n"
+            "    json.dump(result, f)\n"
+        )
+        with open(script_path, 'w') as f:
+            f.write(error_script)
+        
+        # 执行并检查结果
+        success, result, error = agent._execute_script(script_path)
+        
+        # 关键: 应返回 False, 不应误判为成功
+        assert success is False, \
+            "包含 'error' 字段的结果应返回 False, 否则会跳过 LLM 修正循环"
+        assert result is None, \
+            "error-result 不应作为 result_dict 返回"
+        assert error is not None, \
+            "error 信息应被返回, 用于 LLM 修正"
+        assert "Missing required variable" in error, \
+            f"错误信息应包含原始错误描述, got: {error}"
+        assert "Script error-result" in error, \
+            f"应标注为 error-result 类型, got: {error}"
+        
+        print("✅ test_execute_script_detects_error_result_in_output_file PASSED")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_execute_script_detects_error_result_in_stdout():
+    """验证 _execute_script 能检测 stdout 中的 error-result"""
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        agent = HypothesisVerificationAgent.__new__(HypothesisVerificationAgent)
+        agent.log_dir = tmp_dir
+        agent.project_root = tmp_dir
+        agent.MAX_EXECUTION_TIMEOUT = 30
+        
+        script_dir = os.path.join(tmp_dir, "verification_scripts")
+        os.makedirs(script_dir, exist_ok=True)
+        script_path = os.path.join(script_dir, "verify_H3.py")
+        
+        # 脚本内容: 退出码0, 无输出文件, 但 stdout 输出 error JSON
+        stdout_error_script = '''
+import json
+result = {"hypothesis_id": "H3", "error": "Script execution failed: division by zero"}
+print(json.dumps(result))
+'''
+        with open(script_path, 'w') as f:
+            f.write(stdout_error_script)
+        
+        success, result, error = agent._execute_script(script_path)
+        
+        assert success is False, "stdout 中的 error-result 也应返回 False"
+        assert result is None
+        assert error is not None
+        assert "division by zero" in error
+        
+        print("✅ test_execute_script_detects_error_result_in_stdout PASSED")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_execute_script_normal_result_still_succeeds():
+    """验证正常结果 (无 error 字段) 仍然返回 True — 防止误杀"""
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        agent = HypothesisVerificationAgent.__new__(HypothesisVerificationAgent)
+        agent.log_dir = tmp_dir
+        agent.project_root = tmp_dir
+        agent.MAX_EXECUTION_TIMEOUT = 30
+        
+        script_dir = os.path.join(tmp_dir, "verification_scripts")
+        os.makedirs(script_dir, exist_ok=True)
+        result_path = os.path.join(script_dir, "result_H1.json")
+        script_path = os.path.join(script_dir, "verify_H1.py")
+        
+        # 正常结果: 包含 statistics 和 interpretation, 没有 error 字段
+        normal_result = {
+            "hypothesis_id": "H1",
+            "statistics": {"mean": 0.5, "p_value": 0.03},
+            "interpretation": "假设被确认"
+        }
+        normal_script = (
+            "import json, os\n"
+            f"result = {json.dumps(normal_result)}\n"
+            f"os.makedirs(os.path.dirname('{result_path}'), exist_ok=True)\n"
+            f"with open('{result_path}', 'w') as f:\n"
+            "    json.dump(result, f)\n"
+        )
+        with open(script_path, 'w') as f:
+            f.write(normal_script)
+        
+        success, result, error = agent._execute_script(script_path)
+        
+        assert success is True, "正常结果应返回 True"
+        assert result is not None
+        assert result["hypothesis_id"] == "H1"
+        assert "statistics" in result
+        assert error is None
+        
+        print("✅ test_execute_script_normal_result_still_succeeds PASSED")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ════════════════════════════════════════
+# ModelProbingEngine Tests (v3 新增)
+# ════════════════════════════════════════
+
+def test_model_probing_engine_init():
+    """测试 ModelProbingEngine 初始化"""
+    from agent.hypothesis_verification_agent import ModelProbingEngine
+    
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        engine = ModelProbingEngine(project_root=tmp_dir)
+        assert engine.project_root == tmp_dir
+        assert engine.recmodel_dir == tmp_dir  # 因为没有 models.py
+        assert engine.MAX_PROBE_TIMEOUT == 180
+        assert engine.MAX_PROBE_FIX_ROUNDS == 3
+        assert engine.MAX_PROBE_SAMPLES == 50
+        assert engine.llm is None
+        
+        # KNOWN_MODEL_DATA_TYPES 应包含关键字映射
+        assert "attention_weights" in engine.KNOWN_MODEL_DATA_TYPES
+        assert "hidden_states" in engine.KNOWN_MODEL_DATA_TYPES
+        assert "item_embeddings" in engine.KNOWN_MODEL_DATA_TYPES
+        assert "model_predictions" in engine.KNOWN_MODEL_DATA_TYPES
+        
+        print("  ✅ ModelProbingEngine init")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_model_probing_engine_known_data_types():
+    """测试 ModelProbingEngine 的已知数据类型关键词检测"""
+    from agent.hypothesis_verification_agent import ModelProbingEngine
+    
+    engine = ModelProbingEngine(project_root=tempfile.mkdtemp())
+    
+    # 测试注意力权重关键词
+    assert engine.is_model_internal_data("注意力权重矩阵")
+    assert engine.is_model_internal_data("attention weights output")
+    assert engine.is_model_internal_data("注意力坍缩现象")
+    assert engine.is_model_internal_data("attention entropy")
+    assert engine.is_model_internal_data("attention_probs")
+    
+    # 测试隐藏状态关键词
+    assert engine.is_model_internal_data("hidden states of encoder")
+    assert engine.is_model_internal_data("编码器中间表示")
+    
+    # 测试嵌入关键词
+    assert engine.is_model_internal_data("item embeddings")
+    assert engine.is_model_internal_data("嵌入向量")
+    
+    # 测试模型预测关键词
+    assert engine.is_model_internal_data("模型预测分数")
+    assert engine.is_model_internal_data("prediction scores")
+    
+    # 测试非模型内部数据 (不应匹配)
+    assert not engine.is_model_internal_data("类别重叠统计")
+    assert not engine.is_model_internal_data("item popularity distribution")
+    assert not engine.is_model_internal_data("用户交互频率")
+    
+    shutil.rmtree(engine.project_root, ignore_errors=True)
+    print("  ✅ ModelProbingEngine known data types")
+
+
+def test_identify_model_internal_data():
+    """测试 DataInventory.identify_model_internal_data 方法"""
+    from agent.hypothesis_verification_agent import DataInventory
+    
+    tmp_dir = tempfile.mkdtemp()
+    inv = DataInventory(project_root=tmp_dir)
+    
+    missing_data = [
+        "category_overlap_stats: 目标物品与用户历史序列的类别重叠统计",
+        "attention_weights: 模型自注意力权重矩阵 (需通过模型探测提取)",
+        "item_interaction_freq: 训练数据中各物品的交互频率统计",
+        "hidden_states: Transformer编码器各层的隐藏状态输出 (需通过模型探测提取)",
+    ]
+    
+    model_internal = inv.identify_model_internal_data(missing_data)
+    assert len(model_internal) == 2
+    assert "attention_weights: 模型自注意力权重矩阵 (需通过模型探测提取)" in model_internal
+    assert "hidden_states: Transformer编码器各层的隐藏状态输出 (需通过模型探测提取)" in model_internal
+    
+    print("  ✅ identify_model_internal_data")
+
+
+def test_identify_computable_data():
+    """测试 DataInventory.identify_computable_data 方法"""
+    from agent.hypothesis_verification_agent import DataInventory
+    
+    tmp_dir = tempfile.mkdtemp()
+    inv = DataInventory(project_root=tmp_dir)
+    
+    missing_data = [
+        "category_overlap_stats: 目标物品与用户历史序列的类别重叠统计",
+        "attention_weights: 模型自注意力权重矩阵 (需通过模型探测提取)",
+        "item_interaction_freq: 训练数据中各物品的交互频率统计",
+    ]
+    
+    computable = inv.identify_computable_data(missing_data)
+    assert len(computable) == 2
+    assert "category_overlap_stats: 目标物品与用户历史序列的类别重叠统计" in computable
+    assert "item_interaction_freq: 训练数据中各物品的交互频率统计" in computable
+    assert "attention_weights" not in [c.split(":")[0].strip() for c in computable]
+    
+    print("  ✅ identify_computable_data")
+
+
+def test_data_inventory_get_model_probing_engine():
+    """测试 DataInventory.get_model_probing_engine lazy init"""
+    from agent.hypothesis_verification_agent import DataInventory
+    
+    tmp_dir = tempfile.mkdtemp()
+    inv = DataInventory(project_root=tmp_dir)
+    
+    # 第一次调用 — 创建引擎
+    engine = inv.get_model_probing_engine()
+    assert engine is not None
+    assert engine.project_root == tmp_dir
+    assert engine.llm is None
+    
+    # 第二次调用 — 返回相同引擎
+    engine2 = inv.get_model_probing_engine()
+    assert engine2 is engine
+    
+    # 传入 llm_client — 更新引擎
+    mock_llm = _make_mock_llm()
+    engine3 = inv.get_model_probing_engine(llm_client=mock_llm)
+    assert engine3.llm is mock_llm
+    
+    print("  ✅ DataInventory.get_model_probing_engine")
+
+
+def test_model_probing_engine_discover_model_info():
+    """测试 ModelProbingEngine._discover_model_info"""
+    from agent.hypothesis_verification_agent import ModelProbingEngine
+    
+    # 使用真实的 Recmodel 目录
+    recmodel_dir = os.path.join(os.path.dirname(__file__), "..", "Recmodel")
+    if os.path.exists(os.path.join(recmodel_dir, "models.py")):
+        engine = ModelProbingEngine(project_root=os.path.dirname(recmodel_dir))
+        model_info = engine._discover_model_info()
+        
+        assert "model_source_files" in model_info
+        assert "models.py" in model_info["model_source_files"]
+        assert "modules.py" in model_info["model_source_files"]
+        assert "model_args" in model_info
+        assert model_info["model_args"]["hidden_size"] == 64
+        assert model_info["model_args"]["num_attention_heads"] == 2
+        
+        # checkpoint 可能不存在 (如果未训练)
+        # 但信息结构应该正确
+        assert "checkpoint_path" in model_info
+        
+        print("  ✅ ModelProbingEngine._discover_model_info (with real Recmodel)")
+    else:
+        # 创建临时目录模拟
+        tmp_dir = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp_dir, "data"), exist_ok=True)
+        
+        # 创建假的 models.py 和 modules.py
+        with open(os.path.join(tmp_dir, "models.py"), 'w') as f:
+            f.write("class SASRec: pass\n")
+        with open(os.path.join(tmp_dir, "modules.py"), 'w') as f:
+            f.write("class SelfAttention: pass\n")
+        
+        # 创建假的训练数据
+        with open(os.path.join(tmp_dir, "data", "Beauty_train.txt"), 'w') as f:
+            f.write("1 2 3 4 5\n6 7 8\n")
+        
+        engine = ModelProbingEngine(project_root=tmp_dir)
+        model_info = engine._discover_model_info()
+        
+        assert "model_source_files" in model_info
+        assert "models.py" in model_info["model_source_files"]
+        assert model_info["checkpoint_path"] is None  # 没有 .pt 文件
+        
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        print("  ✅ ModelProbingEngine._discover_model_info (mock)")
+
+
+def test_model_probing_engine_is_model_internal_data():
+    """测试 ModelProbingEngine.is_model_internal_data"""
+    from agent.hypothesis_verification_agent import ModelProbingEngine
+    
+    engine = ModelProbingEngine(project_root=tempfile.mkdtemp())
+    
+    # 测试各种关键词
+    test_cases = [
+        ("SASRec模型在长序列中注意力权重集中在最近几个物品上", True),
+        ("导致远距离但语义相关的惊喜物品被忽略（注意力坍缩现象）", True),
+        ("从模型推理过程中提取自注意力权重矩阵", True),
+        ("分析每个预测样本中注意力分布的集中程度", True),
+        ("物品热度分布", False),
+        ("类别重叠统计", False),
+    ]
+    
+    for desc, expected in test_cases:
+        result = engine.is_model_internal_data(desc)
+        assert result == expected, f"Failed for '{desc}': got {result}, expected {expected}"
+    
+    shutil.rmtree(engine.project_root, ignore_errors=True)
+    print("  ✅ ModelProbingEngine.is_model_internal_data")
+
+
+def test_prepare_verification_data_with_model_probing():
+    """测试 _prepare_verification_data 中的模型探测流程"""
+    from agent.hypothesis_verification_agent import HypothesisVerificationAgent, DataInventory
+    
+    tmp_dir = tempfile.mkdtemp()
+    os.makedirs(os.path.join(tmp_dir, "data"), exist_ok=True)
+    
+    # 创建假的训练数据文件
+    train_file = os.path.join(tmp_dir, "data", "Beauty_train.txt")
+    with open(train_file, 'w') as f:
+        f.write("1 2 3 4 5\n6 7 8\n")
+    
+    # 创建假设 — 包含注意力权重需求
+    hypothesis = {
+        "id": "H1",
+        "claim": "SASRec模型在长序列中注意力权重集中在最近几个物品上",
+        "verification_thought": "从模型推理过程中提取自注意力权重矩阵",
+        "data_needed": [
+            "模型推理时的自注意力权重输出",
+            "用户交互序列",
+            "真实下一个物品标签",
+        ],
+    }
+    
+    # 创建 mock LLM
+    mock_llm = _make_mock_llm()
+    
+    # 创建 Agent
+    agent = HypothesisVerificationAgent(
+        llm_client=mock_llm,
+        project_root=tmp_dir,
+    )
+    
+    # 测试 identify_missing_data — 应识别出注意力权重需求
+    missing = agent.data_inventory.identify_missing_data(
+        hypothesis["data_needed"], {}
+    )
+    
+    # 应包含 attention_weights
+    has_attention = any("attention" in m.lower() or "注意力" in m for m in missing)
+    assert has_attention, f"Missing data should include attention_weights, got: {missing}"
+    
+    # 测试 identify_model_internal_data
+    model_internal = agent.data_inventory.identify_model_internal_data(missing)
+    assert len(model_internal) > 0, "Should have model-internal data"
+    
+    # 测试 identify_computable_data
+    computable = agent.data_inventory.identify_computable_data(missing)
+    # 注意力权重不应在可计算数据中
+    assert not any("attention" in c.lower() or "注意力" in c for c in computable)
+    
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    print("  ✅ _prepare_verification_data with model probing detection")
+
+
+def test_model_probing_analysis_prompt():
+    """测试模型探测分析 Prompt 模板"""
+    from agent.hypothesis_verification_agent import MODEL_PROBING_ANALYSIS_PROMPT, MODEL_PROBING_SCRIPT_PROMPT
+    
+    # 检查 Prompt 模板存在且包含必要字段
+    assert "{missing_data_description}" in MODEL_PROBING_ANALYSIS_PROMPT
+    assert "{hypothesis_id}" in MODEL_PROBING_ANALYSIS_PROMPT
+    assert "{models_source}" in MODEL_PROBING_ANALYSIS_PROMPT
+    assert "{modules_source}" in MODEL_PROBING_ANALYSIS_PROMPT
+    
+    assert "{missing_data_description}" in MODEL_PROBING_SCRIPT_PROMPT
+    assert "{checkpoint_path}" in MODEL_PROBING_SCRIPT_PROMPT
+    assert "{recmodel_dir}" in MODEL_PROBING_SCRIPT_PROMPT
+    assert "{modules_source}" in MODEL_PROBING_SCRIPT_PROMPT
+    assert "{model_analysis_json}" in MODEL_PROBING_SCRIPT_PROMPT
+    
+    print("  ✅ Model probing prompts")
+
+
+def test_identify_missing_data_with_attention_keywords():
+    """测试 identify_missing_data 新增的模型内部数据关键词检测"""
+    from agent.hypothesis_verification_agent import DataInventory
+    
+    tmp_dir = tempfile.mkdtemp()
+    inv = DataInventory(project_root=tmp_dir)
+    
+    # 测试注意力权重关键词
+    missing = inv.identify_missing_data(
+        ["模型推理时的自注意力权重输出", "注意力分布"],
+        {}
+    )
+    assert any("attention_weights" in m for m in missing)
+    
+    # 测试隐藏状态关键词
+    missing = inv.identify_missing_data(
+        ["编码器中间表示", "hidden states"],
+        {}
+    )
+    assert any("hidden_states" in m for m in missing)
+    
+    # 测试嵌入向量关键词
+    missing = inv.identify_missing_data(
+        ["物品嵌入向量", "item embeddings"],
+        {}
+    )
+    assert any("item_embeddings" in m for m in missing)
+    
+    # 测试混合 — 既有数据计算又有模型探测需求
+    missing = inv.identify_missing_data(
+        ["类别重叠统计", "注意力权重矩阵", "交互频率"],
+        {}
+    )
+    model_internal = inv.identify_model_internal_data(missing)
+    computable = inv.identify_computable_data(missing)
+    
+    assert len(model_internal) > 0  # 应包含注意力权重
+    assert len(computable) > 0      # 应包含类别重叠和交互频率
+    
+    print("  ✅ identify_missing_data with attention keywords")
     print("\n═══════════ Running HypothesisVerificationAgent Unit Tests ═══════════\n")
     
     test_data_inventory()
@@ -931,5 +1908,34 @@ if __name__ == "__main__":
     test_parse_json_from_response()
     test_full_flow_with_mock_llm()
     test_interface_compatibility()
+    
+    # DataComputationEngine tests
+    test_data_computation_engine_init()
+    test_compute_item_interaction_freq()
+    test_compute_category_overlap_stats()
+    test_compute_category_distribution()
+    test_compute_recommendation_frequency()
+    test_compute_sequence_target_mapping()
+    test_identify_missing_data()
+    test_compute_needed_data_integration()
+    test_data_computation_prompt()
+    test_data_inventory_get_computation_engine()
+    test_prepare_verification_data_with_computation()
+    test_format_computed_data_for_prompt()
+    test_inject_data_loading_truncated_variable_alias()
+    test_execute_script_detects_error_result_in_output_file()
+    test_execute_script_detects_error_result_in_stdout()
+    test_execute_script_normal_result_still_succeeds()
+    
+    # ModelProbingEngine tests (v3)
+    test_model_probing_engine_init()
+    test_model_probing_engine_known_data_types()
+    test_identify_model_internal_data()
+    test_identify_computable_data()
+    test_data_inventory_get_model_probing_engine()
+    test_model_probing_engine_discover_model_info()
+    test_model_probing_engine_is_model_internal_data()
+    test_prepare_verification_data_with_model_probing()
+    test_model_probing_analysis_prompt()
     
     print("\n═══════════ All Tests PASSED ✅ ═══════════\n")
