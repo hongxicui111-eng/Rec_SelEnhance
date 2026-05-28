@@ -164,9 +164,9 @@ class LLMClient:
             role = msg.get("role", "unknown")
             msg_content = msg.get("content", "")
             print(f"  [{role}] ({len(msg_content)} chars)")
-            if len(msg_content) > 500:
-                print(f"    {msg_content[:500]}")
-                print(f"    ... (省略 {len(msg_content) - 500} 字符) ...")
+            if len(msg_content) > 10000:
+                print(f"    {msg_content[:10000]}")
+                print(f"    ... (省略 {len(msg_content) - 10000} 字符) ...")
             else:
                 print(f"    {msg_content}")
         print(f"{'┏'*60}\n")

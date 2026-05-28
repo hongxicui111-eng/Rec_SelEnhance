@@ -38,6 +38,8 @@ from .prompts import (
     QUERY_BASED_FIX_FINAL_PROMPT, QUERY_BASED_PREFLIGHT_FIX_PROMPT,
     # SEARCH/REPLACE 匹配失败重试 prompt
     SEARCH_REPLACE_FIX_PROMPT,
+    # 全部变更被拒绝后的重新提案 prompt
+    REPROPOSAL_AFTER_REJECTION_PROMPT,
 )
 from .llm_analyzer import LLMCaseAnalyzer
 from .hypothesis_verification_agent import HypothesisVerificationAgent
@@ -583,16 +585,55 @@ class RecSelfEvolveAgent:
                 had_changes_in_proposal = bool(proposal_result.get("structural_changes", [])) or bool(proposal_result.get("param_changes", {}))
                 reason = "changes_proposed_but_lost_after_validation" if had_changes_in_proposal else "no_changes_in_proposal"
                 print(f"  ⚠ No valid changes extracted (reason: {reason})")
-                # NO_CHANGES → 代码未修改, 下一轮仍可使用当前指标
-                last_retrain_metrics = metrics
-                print(f"  ⚠ Metrics preserved for next iteration (code unchanged)")
-                self.journal.record({
-                    "iteration": i, "status": "NO_CHANGES",
-                    "metrics": metrics, "proposal_result": proposal_result,
-                    "no_changes_reason": reason,
-                    "struct_result_status": struct_result.get("status") if struct_result else None,
-                })
-                continue
+
+                if had_changes_in_proposal:
+                    # ── 关键改进: 提案有变更但全部被验证拒绝 → 重新提案! ──
+                    # 即使全部验证失败, 本轮仍应有改动, 用原代码训练毫无意义
+                    print(f"  🔁 提案有变更但全部被拒绝 → 触发重新提案 (提出替代方案)")
+                    reproposal_result = self._phase_reproposal_after_all_rejected(
+                        iteration=i,
+                        original_proposal=proposal_result,
+                        struct_result=struct_result,
+                        metrics=metrics,
+                    )
+
+                    if reproposal_result is not None:
+                        # ── 重新提案成功! 用新提案替代原提案 ──
+                        param_changes = reproposal_result["param_changes"]
+                        structural_changes = reproposal_result["structural_changes"]
+                        explanation = reproposal_result.get("explanation", "")
+                        struct_result = reproposal_result.get("struct_result")
+
+                        print(f"  ✓ 重新提案成功 — 使用替代方案继续训练验证")
+                        print(f"  🔧 新 Param changes: {json.dumps(param_changes, ensure_ascii=False)[:200]}")
+                        if structural_changes:
+                            print(f"  🏗️ 新 Structural changes: {len(structural_changes)} modifications")
+                        # 重新提案成功 → 继续到 Phase 6 的训练验证
+                        # 注意: has_any_change 需要重新计算
+                        has_any_change = bool(param_changes) or bool(structural_changes)
+                    else:
+                        # ── 重新提案也失败 → 确实无法产生有效变更 ──
+                        print(f"  ✗ 重新提案也失败 — 本轮确实无法产生有效变更")
+                        last_retrain_metrics = metrics
+                        print(f"  ⚠ Metrics preserved for next iteration (code unchanged)")
+                        self.journal.record({
+                            "iteration": i, "status": "NO_CHANGES_AFTER_REPROPOSAL",
+                            "metrics": metrics, "proposal_result": proposal_result,
+                            "no_changes_reason": "changes_proposed_but_all_rejected_and_reproposal_failed",
+                            "struct_result_status": struct_result.get("status") if struct_result else None,
+                        })
+                        continue
+                else:
+                    # 提案本身就无变更 → 正常的 NO_CHANGES
+                    last_retrain_metrics = metrics
+                    print(f"  ⚠ Metrics preserved for next iteration (code unchanged)")
+                    self.journal.record({
+                        "iteration": i, "status": "NO_CHANGES",
+                        "metrics": metrics, "proposal_result": proposal_result,
+                        "no_changes_reason": reason,
+                        "struct_result_status": struct_result.get("status") if struct_result else None,
+                    })
+                    continue
 
             # ── 使用 run-verify-fix-retry 闭环训练验证! ──
             # 如果有结构修改，训练会使用修改后的模型代码
@@ -2452,6 +2493,34 @@ class RecSelfEvolveAgent:
                 print(f"    {h.get('id', '?')}: {h.get('claim', '')[:60]}... "
                       f"[thought={thought[:40]}]")
             
+            # --- Step 1.5: 如果假设数量超过阈值，先让 LLM 筛选最容易验证的 ---
+            PILOT_VERIFICATION_COUNT = 3  # 先导验证数量
+            if len(hypotheses) > PILOT_VERIFICATION_COUNT:
+                print(f"  🎯 Too many hypotheses ({len(hypotheses)}), "
+                      f"selecting {PILOT_VERIFICATION_COUNT} easiest via LLM assessment...")
+                
+                # 准备预加载数据 (与 verify_hypotheses 相同的数据源)
+                preloaded_for_selection = {
+                    "wrong_text_cases": wrong_text_cases or [],
+                    "item_popularity": {},  # 简化版，不提前加载全部热度数据
+                    "overall_metrics": metrics,
+                }
+                # 加载热度数据
+                popularity_path = os.path.join(
+                    self.config.log_dir,
+                    f"item_popularity_{self.adapter.data_name}.json"
+                )
+                if os.path.exists(popularity_path):
+                    with open(popularity_path, 'r', encoding='utf-8') as f:
+                        preloaded_for_selection["item_popularity"] = json.load(f)
+                
+                hypotheses = self.hypothesis_verifier.select_easiest_hypotheses(
+                    hypotheses=hypotheses,
+                    preloaded_data=preloaded_for_selection,
+                    top_n=PILOT_VERIFICATION_COUNT,
+                )
+                print(f"  📋 After selection: {len(hypotheses)} hypotheses will be verified")
+            
             # --- Step 2: 准备验证所需的数据 ---
             # 物品热度分布 (从训练数据中计算)
             item_popularity = {}
@@ -2661,7 +2730,7 @@ class RecSelfEvolveAgent:
                         if refuted:
                             verification_info += "**❌ 以下结论被数据反驳, 不要基于这些结论提出改进**:\n"
                             for rc in refuted:
-                                verification_info += f"- ❌ {rc[:100]}\n"
+                                verification_info += f"- ❌ {rc}\n"
                             verification_info += "\n"
                         
                         # 逐字段标注验证状态
@@ -4718,6 +4787,266 @@ class RecSelfEvolveAgent:
         })
         
         return None
+
+    def _phase_reproposal_after_all_rejected(
+        self,
+        iteration: int,
+        original_proposal: dict,
+        struct_result: Optional[dict],
+        metrics: dict,
+    ) -> Optional[dict]:
+        """
+        全部变更被验证拒绝后的重新提案
+        
+        当 LLM 提出了改进方案但所有变更在验证/应用环节都被拒绝时,
+        不是直接跳过本轮迭代, 而是重新让 LLM 提出完全不同的、
+        更简单安全的替代方案。
+        
+        关键理念: 即使全部验证失败, 本轮仍应有改动,
+        用原代码训练毫无意义——必须尝试替代方案。
+        
+        Args:
+            iteration: 当前迭代轮次
+            original_proposal: 之前被拒绝的原始提案 (proposal_result)
+            struct_result: 结构修改的应用结果 (包含失败详情)
+            metrics: 当前指标
+            
+        Returns:
+            Dict: 新提案结果, 格式与 proposal_result 一致
+            {
+                "param_changes": {...},
+                "structural_changes": [...],
+                "explanation": "...",
+            }
+            或 None: 重新提案也失败
+        """
+        print(f"\n  🔁 全部变更被拒绝 — 触发重新提案 (提出替代方案)")
+        
+        # ── 1. 构建拒绝原因详情 ──
+        rejection_details = ""
+        
+        # 提案本身的描述
+        rejection_details += "### 原始提案内容:\n"
+        original_param = original_proposal.get("param_changes", {})
+        original_struct = original_proposal.get("structural_changes", [])
+        original_explanation = original_proposal.get("explanation", "")
+        rejection_details += f"- **解释**: {original_explanation[:200]}\n"
+        if original_param:
+            rejection_details += f"- **参数修改**: {json.dumps(original_param, ensure_ascii=False)[:300]}\n"
+        if original_struct:
+            rejection_details += f"- **结构修改**: {len(original_struct)} 项\n"
+            for sc in original_struct:
+                rejection_details += f"  → [{sc.get('target_file', '?')}] "
+                rejection_details += f"{sc.get('target_class_or_function', '?')}: "
+                rejection_details += f"{sc.get('description', '?')[:80]}\n"
+        
+        # 拒绝原因
+        rejection_details += "\n### 拒绝原因:\n"
+        if struct_result:
+            status = struct_result.get("status", "UNKNOWN")
+            rejection_details += f"- **结构修改状态**: {status}\n"
+            
+            if status == "ROLLBACK":
+                rollback_reason = struct_result.get("rollback_reason", "validation failed")
+                rejection_details += f"- **回滚原因**: {rollback_reason[:500]}\n"
+                failed_changes = struct_result.get("failed_changes", [])
+                if failed_changes:
+                    rejection_details += "- **校验失败的修改**:\n"
+                    for fc in failed_changes:
+                        rejection_details += f"  → {fc.get('description', '?')}: "
+                        rejection_details += f"{fc.get('error', '')[:200]}\n"
+                        rejection_details += f"  (错误类型: {fc.get('error_type', 'unknown')})\n"
+            
+            elif status == "ALL_FAILED":
+                rejection_details += f"- **所有修改均无法应用到源码**\n"
+                detailed_failure = struct_result.get("detailed_failure_info", [])
+                for df in detailed_failure:
+                    rejection_details += f"  → [{df.get('target_file', '?')}] "
+                    rejection_details += f"{df.get('description', '?')[:80]}\n"
+                    rejection_details += f"    错误: {df.get('error', 'unknown')[:200]}\n"
+                    for ed in df.get("failed_edit_details", []):
+                        diag = ed.get("match_diagnostic", {})
+                        ratio = diag.get("best_fuzzy_ratio", "N/A")
+                        rejection_details += f"    Edit {ed.get('edit_idx', '?')}: "
+                        rejection_details += f"best_fuzzy_ratio={ratio}\n"
+        else:
+            rejection_details += "- **无结构修改结果** (可能提案中无结构修改)\n"
+        
+        # ── 2. 构建源码上下文 ──
+        source_code_ctx = self.adapter.build_source_code_context(
+            include_files=list(self.adapter.SOURCE_FILE_MAP.keys()),
+            max_total_chars=15000,
+            iterative_memory=self.iter_memory,
+        )
+        
+        # ── 3. 构建指标 ──
+        metrics_str = json.dumps(metrics, indent=2, ensure_ascii=False)
+        metrics_display = self.adapter.format_metrics_for_llm(metrics)
+        
+        # ── 4. 构建 prompt ──
+        prompt = REPROPOSAL_AFTER_REJECTION_PROMPT.format(
+            _original_proposal=json.dumps(original_proposal, indent=2, ensure_ascii=False),
+            _rejection_details=rejection_details,
+            _current_metrics=metrics_str,
+            _current_source_code=source_code_ctx,
+        )
+        
+        # 添加额外上下文
+        if self._last_surprise_report:
+            surprise_info = f"\n\n## 惊喜评估结果\n```json\n{json.dumps(self._last_surprise_report.get('evaluation_report_summary', {}), indent=2, ensure_ascii=False)[:800]}\n```"
+            prompt += surprise_info
+        
+        strategy_instruction = self._get_strategy_instruction()
+        if strategy_instruction:
+            prompt += f"\n\n## 当前探索策略\n{strategy_instruction}"
+        
+        # ── 5. 调用 LLM ──
+        logger.info(f"Reproposal after all rejected: sending to LLM")
+        response = self.llm.chat(
+            messages=[
+                {"role": "system", "content": (
+                    "你是一位经验丰富的推荐系统优化专家。"
+                    "你之前的改进方案在验证环节全部失败，现在需要提出完全不同的替代方案。"
+                    "关键原则: 1) 不要重复之前失败的思路 2) 优先提出参数修改（最安全）"
+                    "3) 如果必须做结构修改，做到最小化 4) SEARCH/REPLACE 的 search 文本必须与实际源码逐字一致"
+                )},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,  # 较高温度鼓励提出不同的方案
+            max_tokens=self.config.llm_max_tokens,
+        )
+        
+        if response is None:
+            logger.error("Reproposal: LLM call failed")
+            print(f"  ✗ 重新提案: LLM 调用失败")
+            return None
+        
+        # ── 6. 解析新的提案 ──
+        new_proposal = self._parse_proposal_response(response)
+        if new_proposal is None:
+            print(f"  ✗ 重新提案: 无法解析 LLM 回复")
+            fixed_response = self.fixer.fix_format(response, "无法从重新提案中提取有效JSON")
+            new_proposal = self._parse_proposal_response(fixed_response)
+            if new_proposal is None:
+                print(f"  ✗ 重新提案: 修复后仍无法解析")
+                return None
+        
+        new_param_changes = new_proposal.get("param_changes", {})
+        new_structural_changes = new_proposal.get("structural_changes", [])
+        new_explanation = new_proposal.get("explanation", "")
+        
+        if not new_param_changes and not new_structural_changes:
+            print(f"  ✗ 重新提案: LLM 未提出任何变更")
+            return None
+        
+        print(f"  💡 重新提案结果:")
+        print(f"    解释: {new_explanation[:120]}...")
+        if new_param_changes:
+            print(f"    参数修改: {json.dumps(new_param_changes, ensure_ascii=False)[:200]}")
+        if new_structural_changes:
+            print(f"    结构修改: {len(new_structural_changes)} 项")
+            for sc in new_structural_changes:
+                print(f"      → [{sc.get('target_file', '?')}] "
+                      f"{sc.get('target_class_or_function', '?')}: "
+                      f"{sc.get('description', '?')[:60]}...")
+        
+        # ── 7. 应用新的结构修改 (如果有) ──
+        new_struct_result = None
+        if new_structural_changes:
+            print(f"  🏗️ 应用重新提案的结构修改 ({len(new_structural_changes)} 项)...")
+            new_struct_result = self.struct_applier.apply_structural_changes(new_structural_changes)
+            
+            if new_struct_result["status"] == "ROLLBACK":
+                print(f"  ↩ 重新提案的结构修改也被回滚: {new_struct_result.get('rollback_reason', '')[:100]}")
+                # 尝试自纠错
+                validation_failures = new_struct_result.get("failed_changes", [])
+                if not validation_failures:
+                    validation_failures = [{
+                        "description": sc.get("description", "unknown"),
+                        "error_type": "validation_error",
+                        "error": new_struct_result.get("rollback_reason", "validation failed"),
+                        "target_class_or_function": sc.get("target_class_or_function", "?"),
+                    } for sc in new_structural_changes]
+                
+                fix_result = self._phase_structure_validation_retry(
+                    iteration=iteration,
+                    original_structural_changes=new_structural_changes,
+                    validation_failures=validation_failures,
+                )
+                if fix_result and fix_result["status"] in ("SUCCESS", "PARTIAL_SUCCESS"):
+                    new_struct_result = fix_result
+                    new_structural_changes = fix_result.get("applied_changes", new_structural_changes)
+                    print(f"  ✓ 重新提案结构修改自纠错成功: {fix_result['status']}")
+                    self._last_structural_changes = fix_result.get("applied_changes", [])
+                else:
+                    print(f"  ✗ 重新提案结构修改自纠错也失败 — 仅保留参数修改")
+                    new_structural_changes = []
+                    new_struct_result = None
+            
+            elif new_struct_result["status"] == "ALL_FAILED":
+                print(f"  ✗ 重新提案的结构修改全部失败 — 触发 SEARCH/REPLACE 重试")
+                detailed_failure = new_struct_result.get("detailed_failure_info", [])
+                fix_result = self._phase_search_replace_retry(
+                    iteration=iteration,
+                    original_structural_changes=new_structural_changes,
+                    detailed_failure_info=detailed_failure,
+                )
+                if fix_result and fix_result["status"] in ("SUCCESS", "PARTIAL_SUCCESS"):
+                    new_struct_result = fix_result
+                    new_structural_changes = fix_result.get("applied_changes", new_structural_changes)
+                    print(f"  ✓ 重新提案 SEARCH/REPLACE 重试成功: {fix_result['status']}")
+                    self._last_structural_changes = fix_result.get("applied_changes", [])
+                else:
+                    print(f"  ✗ 重新提案 SEARCH/REPLACE 重试也失败 — 仅保留参数修改")
+                    new_structural_changes = []
+                    new_struct_result = None
+            
+            elif new_struct_result["status"] in ("SUCCESS", "PARTIAL_SUCCESS"):
+                applied_count = len(new_struct_result.get("applied_changes", []))
+                if applied_count == 0:
+                    print(f"  ✗ 重新提案结构修改报告成功但实际无修改 — 视为失败")
+                    new_structural_changes = []
+                    new_struct_result = None
+                else:
+                    print(f"  ✓ 重新提案结构修改成功: {new_struct_result['status']}")
+                    print(f"    修改文件: {new_struct_result.get('files_modified', [])}")
+                    self._last_structural_changes = new_struct_result.get("applied_changes", [])
+        
+        # ── 8. 检查是否有有效变更 ──
+        has_new_change = bool(new_param_changes) or bool(new_structural_changes)
+        if not has_new_change:
+            print(f"  ✗ 重新提案: 所有替代方案也在验证中失败 — 本轮确实无法产生有效变更")
+            self.journal.record({
+                "iteration": iteration,
+                "status": "REPROPOSAL_ALSO_ALL_REJECTED",
+                "metrics": metrics,
+                "original_proposal": original_proposal,
+                "reproposal": new_proposal,
+                "error": "All alternative proposals also rejected during validation",
+            })
+            return None
+        
+        # ── 9. 重新提案成功 → 返回新提案 ──
+        print(f"  ✓ 重新提案成功! 将替代原提案进入训练验证阶段")
+        self.journal.record({
+            "iteration": iteration,
+            "status": "REPROPOSAL_SUCCESS",
+            "metrics": metrics,
+            "original_proposal": original_proposal,
+            "reproposal": {
+                "param_changes": new_param_changes,
+                "structural_changes": new_structural_changes,
+                "explanation": new_explanation,
+            },
+            "struct_result": new_struct_result,
+        })
+        
+        return {
+            "param_changes": new_param_changes,
+            "structural_changes": new_structural_changes,
+            "explanation": new_explanation,
+            "struct_result": new_struct_result,
+        }
 
     @staticmethod
     def _format_match_failure_diagnostic(detailed_failure_info: list) -> str:

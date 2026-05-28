@@ -9,10 +9,15 @@ CodeQueryTool — LLM 代码查询工具
   1. list_files  — 列出可查询的文件 + 大小 + 简要描述
   2. read_file   — 读取某个文件的完整内容
   3. get_outline — 获取某个文件的 AST 结构概览 (类/函数签名 + 行号)
-  4. search_function — 搜索某个类/函数的定义位置和签名
-  5. search_pattern  — 在所有文件中搜索文本模式 (如变量名、关键字)
+  4. search_function — 搜索某个类/函数的定义位置和签名 (⚡ 支持自动降级到字符串搜索)
+  5. search_pattern  — 在所有文件中搜索文本模式 (如变量名、关键字, 增强上下文展示)
   6. get_signature   — 获取某个类/函数的完整定义 (包括方法体)
   7. get_region      — 获取文件中某个行号范围的代码片段
+
+⚡ 降级机制 (search_function → search_pattern):
+  当 search_function 搜索类名/函数名失败时, 自动降级到 search_pattern 做字符串匹配搜索。
+  这样即使 LLM 搜索 "dropout" (变量名)、"ACT2FN" (常量)、"nn.Linear" (外部引用) 等非类/函数名,
+  也能找到相关代码位置。
 
 使用方式:
   LLM 在分析阶段可以输出查询请求 (JSON 格式), 系统解析并执行查询,
@@ -251,6 +256,10 @@ class CodeQueryTool:
         也自动清洗 LLM 可能添加的格式污染前缀:
         - "SEARCH: class SASRec" → "SASRec"
         - "SEARCH: SASRec.__init__" → "SASRec.__init__"
+        
+        ⚡ 降级机制:
+        当 AST 精确匹配 (类名/函数名) 找不到结果时, 自动降级到 search_pattern
+        做字符串匹配搜索, 这样即使搜 "dropout"、"ACT2FN" 等变量名/常量也能找到。
         """
         # ── 清洗 LLM 格式污染前缀 ──
         # LLM 有时将 SEARCH/REPLACE edit格式 与查询格式混淆,
@@ -271,7 +280,21 @@ class CodeQueryTool:
         # "SASRec.__init__" → class_name="SASRec", method_name="__init__"
         if '.' in name:
             class_name, method_name = name.split('.', 1)
-            return self._search_method_in_class(class_name, method_name)
+            method_result = self._search_method_in_class(class_name, method_name)
+            # 如果类方法搜索失败 (不是 ❌ 开头), 直接返回
+            if not method_result.startswith("❌"):
+                return method_result
+            # 类方法搜不到 → 降级到字符串搜索整个 "ClassName.method" 字符串
+            logger.info(f"search_function: '{name}' not found as class method, falling back to text search")
+            pattern_result = self.search_pattern(name)
+            if not pattern_result.startswith("❌"):
+                return (
+                    f"## 搜索结果: '{name}' (降级: 字符串匹配)\n\n"
+                    f"⚠ 未找到类 '{class_name}' 的方法 '{method_name}', "
+                    f"已自动降级到字符串搜索:\n\n"
+                    f"{pattern_result}"
+                )
+            return method_result  # 两种搜索都失败
         
         # ── 普通搜索: 类名或函数名 ──
         for file_key in self.source_file_map:
@@ -317,11 +340,24 @@ class CodeQueryTool:
                         f"  🔧 def {sig} → {file_key} (L{start}-{end})"
                     )
         
-        if not results:
-            return f"❌ 未找到名为 '{name}' 的类或函数"
+        # ── AST 精确匹配有结果 → 直接返回 ──
+        if results:
+            header = f"## 搜索结果: '{name}'\n\n"
+            return header + '\n'.join(results)
         
-        header = f"## 搜索结果: '{name}'\n\n"
-        return header + '\n'.join(results)
+        # ── ⚡ AST 精确匹配无结果 → 降级到字符串搜索 ──
+        logger.info(f"search_function: '{name}' not found as class/function, falling back to text search")
+        pattern_result = self.search_pattern(name)
+        if not pattern_result.startswith("❌"):
+            return (
+                f"## 搜索结果: '{name}' (降级: 字符串匹配)\n\n"
+                f"⚠ 未找到名为 '{name}' 的类或函数定义, "
+                f"已自动降级到字符串匹配搜索:\n\n"
+                f"{pattern_result}"
+            )
+        
+        # ── 两种搜索都失败 → 返回原始失败信息 ──
+        return f"❌ 未找到名为 '{name}' 的类或函数, 字符串搜索也未找到 '{name}' 的匹配"
 
     def _search_method_in_class(self, class_name: str, method_name: str) -> str:
         """搜索类中的方法定义 (支持 ClassName.method_name 格式)"""
@@ -387,8 +423,14 @@ class CodeQueryTool:
 
     # ── 查询 5: search_pattern ──
 
-    def search_pattern(self, pattern: str, file_key: str = None) -> str:
-        """在所有文件中搜索文本模式 (如变量名、关键字、注释等)"""
+    def search_pattern(self, pattern: str, file_key: str = None, context_lines: int = 3) -> str:
+        """在所有文件中搜索文本模式 (如变量名、关键字、注释等)
+        
+        Args:
+            pattern: 搜索的文本字符串
+            file_key: 限定搜索的文件 (None = 搜索所有文件)
+            context_lines: 每个匹配行展示的上下文行数 (前后各 context_lines 行)
+        """
         results = []
         search_files = [file_key] if file_key else list(self.source_file_map.keys())
         
@@ -398,29 +440,71 @@ class CodeQueryTool:
                 continue
             
             lines = content.split('\n')
-            matches = []
+            match_line_nums = []
             for i, line in enumerate(lines, 1):
                 if pattern in line:
-                    # 上下文: 前后各 1 行
-                    ctx_start = max(0, i - 2)
-                    ctx_end = min(len(lines), i + 1)
-                    context_lines = lines[ctx_start:ctx_end]
-                    context_str = '\n'.join(context_lines)
-                    matches.append(f"  L{i}: {line.strip()[:120]}")
+                    match_line_nums.append(i)
             
-            if matches:
-                results.append(f"  📄 {fk} — {len(matches)} 处匹配:")
-                # 只展示最多 20 个匹配, 防止输出过长
-                for m in matches[:20]:
-                    results.append(m)
-                if len(matches) > 20:
-                    results.append(f"  ... 还有 {len(matches) - 20} 处匹配")
+            if match_line_nums:
+                # ── 智能合并: 将相近的匹配行合并为一个连续区间 ──
+                # 避免重叠的上下文区域重复输出
+                merged_regions = self._merge_nearby_lines(match_line_nums, context_lines, len(lines))
+                
+                results.append(f"  📄 {fk} — {len(match_line_nums)} 处匹配:")
+                for region_start, region_end in merged_regions:
+                    region_lines = []
+                    for ln in range(region_start, region_end + 1):
+                        line_content = lines[ln - 1].rstrip()
+                        marker = "▶" if ln in match_line_nums else " "
+                        region_lines.append(f"    {marker} L{ln:4d} | {line_content[:120]}")
+                    results.append(f"    L{region_start}-{region_end}:")
+                    results.extend(region_lines)
+                
+                # 限制输出: 最多展示 20 个匹配行 (含上下文)
+                total_match_lines = sum(region_end - region_start + 1 
+                                       for region_start, region_end in merged_regions)
+                if total_match_lines > 40:
+                    results.append(f"    ... 展示了前 {len(merged_regions)} 个区域, "
+                                   f"共 {len(match_line_nums)} 处匹配")
         
         if not results:
             return f"❌ 在所有文件中未找到包含 '{pattern}' 的代码"
         
         header = f"## 文本搜索结果: '{pattern}'\n\n"
         return header + '\n'.join(results)
+    
+    def _merge_nearby_lines(self, line_nums: List[int], context: int, 
+                            total_lines: int) -> List[Tuple[int, int]]:
+        """将相近的匹配行号合并为连续区间 (避免重叠上下文)
+        
+        例如: 匹配行 [5, 8, 15], context=2 → [(3,10), (13,17)]
+        
+        Args:
+            line_nums: 匹配的行号列表 (1-indexed)
+            context: 前后扩展的行数
+            total_lines: 文件总行数
+        
+        Returns:
+            List of (start, end) tuples (1-indexed, inclusive)
+        """
+        if not line_nums:
+            return []
+        
+        # 扩展每个匹配行的上下文范围
+        regions = [(max(1, ln - context), min(total_lines, ln + context)) 
+                   for ln in line_nums]
+        
+        # 合并重叠或相邻的区间
+        merged = [regions[0]]
+        for start, end in regions[1:]:
+            prev_start, prev_end = merged[-1]
+            # 如果当前区间与前一区间重叠或只差1行 → 合并
+            if start <= prev_end + 1:
+                merged[-1] = (prev_start, max(prev_end, end))
+            else:
+                merged.append((start, end))
+        
+        return merged
 
     # ── 查询 6: get_signature ──
 

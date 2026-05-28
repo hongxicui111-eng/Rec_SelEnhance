@@ -302,11 +302,25 @@ class DataInfrastructure:
             return max_item + 2  # 与 run_finetune_full.py 一致
         return None
 
+    def _resolve_to_abs_path(self, path_str: str) -> str:
+        """
+        将路径转换为绝对路径
+
+        inventory 中的路径可能是相对路径 (相对于 project_root) 或绝对路径。
+        为了与 DATA_FILE / OUTPUT_FILE 注入的绝对路径风格一致,
+        需要将相对路径转换为绝对路径, 避免 LLM 生成脚本时混用两种路径风格。
+        """
+        p = Path(path_str)
+        if p.is_absolute():
+            return path_str
+        return str(self.project_root / p)
+
     def format_inventory_for_prompt(self, preloaded_data: Optional[Dict] = None) -> str:
         """
         将数据清单格式化为 LLM prompt 可用的文本
 
-        只提供路径信息，不包含任何数据处理逻辑。
+        路径统一使用绝对路径, 与 DATA_FILE / OUTPUT_FILE 注入风格一致,
+        避免 LLM 生成脚本时混用相对路径和绝对路径导致混乱。
         """
         inventory = self.discover_data()
 
@@ -314,33 +328,61 @@ class DataInfrastructure:
 
         if preloaded_data:
             lines.append("\n### 已预加载数据 (可直接使用)")
+            lines.append("数据已序列化到 DATA_FILE, 加载方式: `data = json.load(open(DATA_FILE))`")
+            lines.append("")
             for key, value in preloaded_data.items():
                 if value is not None:
                     if isinstance(value, list):
-                        lines.append(f"- {key}: {len(value)} 项")
+                        if len(value) > 100:
+                            # serialize_data 对超过100项的列表会拆分: key_sample + key_count
+                            lines.append(f"- `{key}`: List, 共 {len(value)} 项")
+                            lines.append(f"  ⚠️ 因数量超过100, JSON 中的键为 `{key}_sample` (前50项样本) + `{key}_count` (总数)")
+                            lines.append(f"  加载: `data = json.load(open(DATA_FILE)); sample = data['{key}_sample']; count = data['{key}_count']`")
+                        else:
+                            lines.append(f"- `{key}`: List, {len(value)} 项")
+                            lines.append(f"  加载: `data['{key}']`")
+                        if value and isinstance(value[0], dict):
+                            sample_keys = list(value[0].keys())[:8]
+                            lines.append(f"  每个元素 keys: {sample_keys}")
                     elif isinstance(value, dict):
-                        lines.append(f"- {key}: {len(value)} 个键")
+                        if len(value) > 2000:
+                            # serialize_data 对超过2000条的字典会截断: key + key_total
+                            top_keys = list(value.keys())[:8]
+                            lines.append(f"- `{key}`: Dict, 共 {len(value)} 条 (截断至2000)")
+                            lines.append(f"  ⚠️ 因条数超过2000, JSON 中的键为 `{key}` (截断数据) + `{key}_total` (总条数)")
+                            lines.append(f"  加载: `data = json.load(open(DATA_FILE)); items = data['{key}']; total = data['{key}_total']`")
+                        else:
+                            top_keys = list(value.keys())[:8]
+                            lines.append(f"- `{key}`: Dict, {len(value)} 个键")
+                            lines.append(f"  加载: `data['{key}']`")
+                        if top_keys:
+                            lines.append(f"  顶层 keys: {top_keys}")
                     else:
-                        lines.append(f"- {key}: {type(value).__name__}")
+                        lines.append(f"- `{key}`: {type(value).__name__}")
+                        lines.append(f"  加载: `data['{key}']`")
 
         lines.append("\n### 数据文件")
         for df in inventory["data_files"]:
-            lines.append(f"- {df['path']} ({df.get('description', '')}, {df['size']/1024:.1f}KB)")
+            abs_path = self._resolve_to_abs_path(df['path'])
+            lines.append(f"- {abs_path} ({df.get('description', '')}, {df['size']/1024:.1f}KB)")
 
         if inventory["metadata_files"]:
             lines.append("\n### 元数据文件")
             for mf in inventory["metadata_files"]:
-                lines.append(f"- {mf['path']} ({mf.get('description', '')})")
+                abs_path = self._resolve_to_abs_path(mf['path'])
+                lines.append(f"- {abs_path} ({mf.get('description', '')})")
 
         if inventory["model_checkpoints"]:
             lines.append("\n### 模型检查点")
             for ckpt in inventory["model_checkpoints"][:5]:
-                lines.append(f"- {ckpt['path']}")
+                abs_path = self._resolve_to_abs_path(ckpt['path'])
+                lines.append(f"- {abs_path}")
 
         if inventory["error_case_files"]:
             lines.append("\n### 错误案例文件")
             for ef in inventory["error_case_files"]:
-                lines.append(f"- {ef['path']}")
+                abs_path = self._resolve_to_abs_path(ef['path'])
+                lines.append(f"- {abs_path}")
 
         return "\n".join(lines)
 

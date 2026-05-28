@@ -38,7 +38,6 @@ from typing import Dict, List, Optional, Tuple, Any
 
 # 导入基础设施模块
 from .data_infrastructure import DataInfrastructure
-from .task_scheduler import TaskScheduler, TaskStep, StepStatus, TaskStatus
 
 # 导入共享工具模块
 from .llm_utils import (
@@ -49,6 +48,7 @@ from .llm_utils import (
 from .script_executor import (
     extract_output_path, DataInjector, ScriptExecutor,
 )
+from .code_query_tool import CodeQueryTool
 
 # 导入 prompts (从 prompts.py, 不再在本文件硬编码)
 from .prompts import (
@@ -62,6 +62,14 @@ from .prompts import (
     DATA_ACQUISITION_STRATEGY_PROMPT,
     DATA_ACQUISITION_SCRIPT_PROMPT,
     DATA_ACQUISITION_FIX_PROMPT,
+    # 假设易验证性筛选 Prompt
+    HYPOTHESIS_EASE_SELECTION_PROMPT,
+    # Query-based 修正 Prompt (复用 CodeQueryTool)
+    QUERY_BASED_SCRIPT_FIX_PHASE1_PROMPT,
+    QUERY_BASED_SCRIPT_FIX_PHASE2_PROMPT,
+    QUERY_BASED_SCRIPT_FIX_FINAL_PROMPT,
+    DATA_ACQ_FIX_CONTEXT,
+    VERIF_FIX_CONTEXT,
 )
 
 logger = logging.getLogger("rec_self_evolve.hypothesis_verification_agent")
@@ -98,9 +106,9 @@ class HypothesisVerificationAgent:
     UNVERIFIABLE = "UNVERIFIABLE"
     
     # Agent 参数
-    MAX_VERIFICATION_ROUNDS = 3  # 验证循环最大轮数
-    MAX_CODE_FIX_ROUNDS = 5     # 代码修正最大轮次
-    MAX_EXECUTION_TIMEOUT = 60  # 验证脚本执行超时 (秒)
+    MAX_VERIFICATION_ROUNDS = 5  # 验证循环最大轮数
+    MAX_CODE_FIX_ROUNDS = 10    # 代码修正最大轮次
+    MAX_EXECUTION_TIMEOUT = 600  # 验证脚本执行超时 (秒)
     
     def __init__(self, llm_client, item_text_map: Dict = None,
                  project_root: str = None, data_dir: str = None,
@@ -137,6 +145,14 @@ class HypothesisVerificationAgent:
             timeout=self.MAX_EXECUTION_TIMEOUT,
         )
         self.injector = DataInjector(log_dir=self.log_dir)
+        
+        # 代码查询工具 (与 core.py 一致, 让 LLM 按需获取模型源码)
+        from .project_adapter import SeqRecAdapter
+        self._code_query_tool = CodeQueryTool(
+            project_root=self.project_root,
+            source_file_map=dict(SeqRecAdapter.SOURCE_FILE_MAP),
+        )
+        logger.info("CodeQueryTool enabled for HypothesisVerificationAgent — LLM will query model code on-demand")
         
         # 旧版 verifier 作为 fallback
         from .hypothesis_verifier import HypothesisVerifier
@@ -415,6 +431,153 @@ class HypothesisVerificationAgent:
         return result
     
     # ════════════════════════════════════════
+    # Phase 1.5: 假设易验证性筛选 (LLM 选择最容易验证的假设)
+    # ════════════════════════════════════════
+    
+    def select_easiest_hypotheses(self,
+                                   hypotheses: List[Dict],
+                                   preloaded_data: Dict,
+                                   top_n: int = 3) -> List[Dict]:
+        """
+        从假设列表中选出最容易验证的 top_n 个。
+        
+        流程:
+        1. 将所有假设 + 数据盘点 + 模型信息 + 已加载数据 给 LLM
+        2. LLM 对每个假设做数据获取难度评估
+        3. LLM 选出最易验证的 top_n 个
+        
+        Args:
+            hypotheses: 假设列表
+            preloaded_data: 预加载数据 (来自 _prepare_preloaded_data)
+            top_n: 要选取的数量
+            
+        Returns:
+            LLM 选出的 top_n 个假设 (按易验证性排序)
+        """
+        if len(hypotheses) <= top_n:
+            logger.info(f"Only {len(hypotheses)} hypotheses, no selection needed")
+            return hypotheses
+        
+        print(f"\n  🎯 [Phase 1.5] Selecting {top_n} easiest hypotheses from {len(hypotheses)}...")
+        
+        # ── 准备 prompt 所需的上下文 ──
+        # 1. 假设 JSON (简化: 只保留核心字段, 防止超 token)
+        simplified_hypotheses = []
+        for h in hypotheses:
+            simplified_hypotheses.append({
+                "id": h.get("id", "H?"),
+                "claim": h.get("claim", ""),
+                "verification_method": h.get("verification_method", "custom"),
+                "verification_thought": h.get("verification_thought", ""),
+                "data_needed": h.get("data_needed", []),
+                "expected_if_true": h.get("expected_if_true", ""),
+                "expected_if_false": h.get("expected_if_false", ""),
+                "priority": h.get("priority", 3),
+                "confidence_in_llm": h.get("confidence_in_llm", "medium"),
+            })
+        hypotheses_json = json.dumps(simplified_hypotheses, indent=2, ensure_ascii=False)
+        
+        # 2. 数据盘点
+        verification_data = dict(preloaded_data)
+        inventory_text = self.data_infra.format_inventory_for_prompt(
+            preloaded_data=verification_data
+        )
+        verification_data["_data_inventory"] = inventory_text
+        
+        # 3. 模型信息
+        model_info = self.data_infra.discover_model_info()
+        verification_data["_model_info"] = model_info
+        model_info_text = self._format_model_info_for_prompt(model_info, max_chars=4000)
+        
+        # 4. 已加载数据描述
+        available_data_desc = self._format_available_data_for_code(verification_data)
+        
+        # ── 构建 prompt ──
+        prompt = HYPOTHESIS_EASE_SELECTION_PROMPT.format(
+            hypotheses_json=hypotheses_json,
+            data_inventory=inventory_text,
+            model_info=model_info_text,
+            available_data_description=available_data_desc,
+        )
+        
+        # ── 调用 LLM ──
+        def _validate_selection(parsed: Dict) -> bool:
+            if not isinstance(parsed, dict):
+                return False
+            if "difficulty_assessment" not in parsed or "recommended_for_pilot" not in parsed:
+                return False
+            return True
+        
+        result = self.llm_retry.call_and_parse_with_retry(
+            prompt=prompt,
+            system_content=(
+                "你是一位数据科学家，擅长评估假设验证的数据获取难度。"
+                "请从数据就绪度、获取复杂度、验证步骤数三个维度评估每个假设的验证难度，"
+                "然后选出最容易验证的假设。"
+            ),
+            temperature=0.3,
+            max_tokens=2048,
+            max_retries=2,
+            validate_func=_validate_selection,
+        )
+        
+        if result is None:
+            logger.warning("LLM ease selection failed, falling back to all hypotheses")
+            print(f"    ⚠ LLM ease selection failed, will verify all hypotheses")
+            return hypotheses
+        
+        # ── 打印评估结果 ──
+        assessments = result.get("difficulty_assessment", [])
+        for a in assessments:
+            difficulty = a.get("overall_difficulty", "?")
+            acq_diff = a.get("acquisition_difficulty", "?")
+            missing = a.get("data_missing", [])
+            print(f"    {a.get('hypothesis_id', '?')} [{difficulty} / acq={acq_diff}] "
+                  f"missing={len(missing)}: {a.get('claim_brief', '')[:40]}")
+        
+        # ── 根据 LLM 推荐选择假设 ──
+        recommended_ids = result.get("recommended_for_pilot", [])
+        reasoning = result.get("reasoning", "")
+        
+        if not recommended_ids:
+            logger.warning("LLM returned no recommendations, falling back to all hypotheses")
+            return hypotheses
+        
+        print(f"    ✅ LLM recommendation: {recommended_ids}")
+        print(f"    💡 Reason: {reasoning}")
+        
+        # 按 recommended_ids 的顺序从 hypotheses 中提取
+        selected = []
+        remaining_ids = list(recommended_ids)  # 复制, 防止修改原列表
+        
+        for h in hypotheses:
+            hyp_id = h.get("id", "H?")
+            if hyp_id in remaining_ids:
+                selected.append(h)
+                remaining_ids.remove(hyp_id)
+        
+        # 如果 LLM 推荐的 ID 在 hypotheses 中找不到, 用剩余假设补齐
+        if len(selected) < top_n:
+            logger.info(f"Only found {len(selected)} of {top_n} recommended hypotheses, "
+                        f"filling from remaining")
+            for h in hypotheses:
+                if h not in selected:
+                    selected.append(h)
+                    if len(selected) >= top_n:
+                        break
+        
+        # 如果还是不够, 返回所有假设
+        if len(selected) < top_n:
+            logger.info(f"Still only {len(selected)} hypotheses available, using all")
+            selected = hypotheses
+        
+        print(f"    📋 Selected {len(selected)} hypotheses for pilot verification:")
+        for s in selected:
+            print(f"      {s.get('id', '?')}: {s.get('claim', '')[:60]}...")
+        
+        return selected
+    
+    # ════════════════════════════════════════
     # Phase 2: 验证执行 (Agent 核心流程)
     # ════════════════════════════════════════
     
@@ -553,18 +716,20 @@ class HypothesisVerificationAgent:
                 last_execution_error = "代码生成失败"
                 continue
             
-            # --- Step 4: 执行验证代码 (带修正循环) ---
+            # --- Step 4: 执行验证代码 (带修正循环, 使用 Query-Based 修正) ---
             print(f"    ⚡ [Step 4] 执行验证代码...")
             execution_result, exec_error = self.executor.execute_with_correction_loop(
                 initial_code=code,
                 hypothesis_id=hyp_id,
                 llm_retry_helper=self.llm_retry,
-                fix_prompt_template=VERIFICATION_CODE_FIX_PROMPT,
+                fix_prompt_template=VERIFICATION_CODE_FIX_PROMPT,  # fallback (盲修模式)
                 injector=self.injector,
                 verification_data=verification_data,
                 output_file=os.path.join(workspace_dir, f"result_{hyp_id}.json"),
                 max_rounds=self.MAX_CODE_FIX_ROUNDS,
                 script_dir=workspace_dir,
+                code_query_tool=self._code_query_tool,   # 启用 Query-Based 修正
+                fix_context=VERIF_FIX_CONTEXT,             # 验证脚本上下文
             )
             
             if not execution_result:
@@ -643,16 +808,22 @@ class HypothesisVerificationAgent:
             preloaded_data=preloaded_data
         )
         
-        # 格式化已加载数据摘要
+        # 格式化已加载数据摘要 (含 DATA_FILE 中的实际 JSON 键名)
         loaded_data_summary = "## 已加载数据\n"
         for key, value in preloaded_data.items():
             if value is not None:
                 if isinstance(value, list):
-                    loaded_data_summary += f"- {key}: {len(value)} 项\n"
+                    if len(value) > 100:
+                        loaded_data_summary += f"- `{key}`: List, {len(value)} 项 → JSON 键: `{key}_sample` + `{key}_count`\n"
+                    else:
+                        loaded_data_summary += f"- `{key}`: List, {len(value)} 项 → JSON 键: `{key}`\n"
                 elif isinstance(value, dict):
-                    loaded_data_summary += f"- {key}: {len(value)} 个键\n"
+                    if len(value) > 2000:
+                        loaded_data_summary += f"- `{key}`: Dict, {len(value)} 条 → JSON 键: `{key}` + `{key}_total`\n"
+                    else:
+                        loaded_data_summary += f"- `{key}`: Dict, {len(value)} 个键 → JSON 键: `{key}`\n"
                 else:
-                    loaded_data_summary += f"- {key}: {type(value).__name__}\n"
+                    loaded_data_summary += f"- `{key}`: {type(value).__name__} → JSON 键: `{key}`\n"
         
         # 构建反思上下文
         reflection_context = ""
@@ -837,12 +1008,17 @@ class HypothesisVerificationAgent:
         # 构建可用数据描述 (动态, 不硬编码数据类型映射)
         available_data_desc = self._format_available_data_for_code(verification_data)
         
+        # 获取模型信息
+        model_info = verification_data.get("_model_info", {})
+        model_info_text = self._format_model_info_for_prompt(model_info, max_chars=6000)
+        
         plan_json = json.dumps(verification_plan, indent=2, ensure_ascii=False)
         
         prompt = VERIFICATION_CODE_PROMPT.format(
             hypothesis_claim=claim,
             verification_plan_json=plan_json,
             available_data_description=available_data_desc,
+            model_info=model_info_text,
             output_file_path=output_file,
             hypothesis_id=hyp_id,
         )
@@ -854,7 +1030,7 @@ class HypothesisVerificationAgent:
             "确保你使用 save_result() 函数将结果写入输出文件。"
         )
         
-        max_attempts = 3
+        max_attempts = 5
         last_error = ""
         
         for attempt in range(max_attempts):
@@ -879,7 +1055,8 @@ class HypothesisVerificationAgent:
             if not validation_errors:
                 # 使用 DataInjector wrap_script (最小注入: DATA_FILE + OUTPUT_FILE + save_result)
                 # LLM 自主决定 import 和数据加载逻辑
-                code = self.injector.wrap_script(code, verification_data, output_file)
+                code = self.injector.wrap_script(code, verification_data, output_file,
+                                                 model_info=verification_data.get("_model_info"))
                 return code
             
             last_error = "; ".join(validation_errors)
@@ -977,6 +1154,90 @@ class HypothesisVerificationAgent:
                 lines.append(f"- `{key}`: None (不可用)")
             else:
                 lines.append(f"- `{key}`: {type(value).__name__}")
+        
+        return "\n".join(lines)
+    
+    def _format_available_data_for_acquisition(self, verification_data: Dict,
+                                                prev_acquired_files: Dict[str, str] = None) -> str:
+        """
+        格式化可用数据描述 — 专为数据获取脚本定制
+        
+        与 _format_available_data_for_code 的区别:
+        - 正确描述数据访问方式: 通过 DATA_FILE 或 PREV_ACQUIRED_FILES 加载, 不是"Python 变量注入"
+        - 明确标注哪些数据是前一步已获取的 (可直接加载, 不需要重新获取)
+        - 提供具体的加载代码示例
+        
+        Args:
+            verification_data: 包含所有已获取数据的字典
+            prev_acquired_files: 前一步已获取数据的 JSON 文件路径映射 {data_name: file_path}
+        """
+        lines = [
+            "以下数据已通过 DATA_FILE 序列化, 可在脚本中加载使用:",
+            "加载方式: `data = json.load(open(DATA_FILE))`, 然后用 `data['key']` 访问具体数据。",
+            ""
+        ]
+        
+        if prev_acquired_files:
+            lines.append("⚠️ 以下数据是前一步已获取的, 有独立的 JSON 文件可直接加载 (优先使用 PREV_ACQUIRED_FILES):")
+            lines.append("")
+            for data_name, file_path in prev_acquired_files.items():
+                lines.append(f"- `{data_name}`: 已获取! 直接加载: `json.load(open(PREV_ACQUIRED_FILES['{data_name}']))`")
+                # 如果 verification_data 中有该数据, 展示其结构摘要
+                value = verification_data.get(data_name)
+                if value is not None and isinstance(value, dict):
+                    top_keys = list(value.keys())[:8]
+                    lines.append(f"  结构概览: Dict, 顶层 keys: {top_keys}")
+                    # 如果有 data 子字段, 展示其 keys
+                    inner_data = value.get("data")
+                    if isinstance(inner_data, dict):
+                        inner_keys = list(inner_data.keys())[:8]
+                        lines.append(f"  data 字段 keys: {inner_keys}")
+                elif value is not None and isinstance(value, list):
+                    lines.append(f"  结构概览: List, 长度 {len(value)}")
+            lines.append("")
+        
+        # 展示其他可用数据 (非前一步获取的)
+        other_data_keys = []
+        for key, value in verification_data.items():
+            if key.startswith("_"):
+                continue
+            if prev_acquired_files and key in prev_acquired_files:
+                continue  # 已在上面展示
+            other_data_keys.append(key)
+        
+        if other_data_keys:
+            lines.append("其他可用数据 (通过 DATA_FILE 加载):")
+            lines.append("")
+            for key in other_data_keys:
+                value = verification_data[key]
+                if isinstance(value, list):
+                    if len(value) > 100:
+                        lines.append(f"- `{key}`: List, 共 {len(value)} 项 → JSON 键: `{key}_sample` (样本) + `{key}_count` (总数)")
+                        if value and isinstance(value[0], dict):
+                            sample_keys = list(value[0].keys())[:8]
+                            lines.append(f"  每个元素的 keys: {sample_keys}")
+                    else:
+                        lines.append(f"- `{key}`: List, {len(value)} 项 → JSON 键: `{key}`")
+                        if value and isinstance(value[0], dict):
+                            sample_keys = list(value[0].keys())[:8]
+                            lines.append(f"  每个元素的 keys: {sample_keys}")
+                elif isinstance(value, dict):
+                    if len(value) > 2000:
+                        top_keys = list(value.keys())[:8]
+                        lines.append(f"- `{key}`: Dict, 共 {len(value)} 条 → JSON 键: `{key}` (截断) + `{key}_total` (总数)")
+                        if top_keys:
+                            lines.append(f"  顶层 keys: {top_keys}")
+                    else:
+                        lines.append(f"- `{key}`: Dict, {len(value)} 条记录 → JSON 键: `{key}`")
+                        if value:
+                            top_keys = list(value.keys())[:8]
+                            lines.append(f"  顶层 keys: {top_keys}")
+                elif isinstance(value, str):
+                    lines.append(f"- `{key}`: 文件路径字符串 `{value}` → JSON 键: `{key}`")
+                elif value is None:
+                    lines.append(f"- `{key}`: None (不可用)")
+                else:
+                    lines.append(f"- `{key}`: {type(value).__name__} → JSON 键: `{key}`")
         
         return "\n".join(lines)
     
@@ -1154,6 +1415,250 @@ class HypothesisVerificationAgent:
         return result
     
     # ════════════════════════════════════════
+    # Query-Based 脑本修正 (复用 CodeQueryTool, 与 core.py 一致)
+    # ════════════════════════════════════════
+    
+    def _fix_script_with_query_mode(
+        self,
+        error_output: str,
+        original_code: str,
+        fix_context: Dict,
+        extra_context: str = "",
+        system_prompt: str = None,
+        temperature: float = 0.1,
+        max_query_rounds: int = 3,
+        max_chars_per_query_result: int = 5000,
+    ) -> Optional[str]:
+        """
+        使用 CodeQueryTool 的多轮查询模式修正脚本
+        
+        与 core.py 的 _fix_with_query_mode 相同设计理念:
+        - LLM 先通过代码索引了解源码结构
+        - LLM 按需查询相关源码 (模型 API、类定义等)
+        - LLM 基于查询到的精确源码修正脚本
+        
+        输出: 修正后的完整 Python 脑本代码 (纯代码, 无 JSON wrapper)
+              或 None (修正失败)
+        
+        Args:
+            error_output: 执行错误信息
+            original_code: 原始脚本代码 (核心部分, 不含运行时基础设施)
+            fix_context: 修正上下文配置 (DATA_ACQ_FIX_CONTEXT 或 VERIF_FIX_CONTEXT)
+            extra_context: 额外上下文 (如 model_info, available_data_description 等)
+            system_prompt: system message 内容
+            temperature: LLM 温度
+            max_query_rounds: 最大查询轮数
+            max_chars_per_query_result: 每次查询结果最大字符数
+        """
+        if system_prompt is None:
+            system_prompt = (
+                "你是一位 Python 数据工程师，擅长修正数据获取和验证脚本。"
+                "你可以通过代码查询工具按需获取模型源码详情，"
+                "然后基于精确的代码知识提出修正后的脚本。"
+                "⚠ 重要: 如果你想修正脚本中使用的模型 API, 请先查询源码确认正确的用法!"
+            )
+        
+        # ── 构建代码索引 ──
+        code_index = self._code_query_tool.build_code_index()
+        
+        # ── 累积查询结果 ──
+        all_queried_code = ""
+        observation_summary = ""
+        reasoning_summary = ""
+        analysis_direction = ""
+        query_results_this_round = ""
+        
+        # ── 从 fix_context 提取配置 ──
+        context_title = fix_context.get("context_title", "脚本")
+        runtime_instructions = fix_context.get("runtime_infrastructure_instructions", "")
+        script_instructions = fix_context.get("script_output_instructions", "")
+        
+        # ── 构建通用 kwargs (各轮共用) ──
+        common_kwargs = {
+            "context_title": context_title,
+            "error_output": error_output[:2000],
+            "original_code": original_code,
+            "extra_context": extra_context,
+            "runtime_infrastructure_instructions": runtime_instructions,
+            "script_output_instructions": script_instructions,
+        }
+        
+        for round_idx in range(max_query_rounds):
+            print(f"    🔍 [Script Fix Query Round {round_idx + 1}/{max_query_rounds}]")
+            
+            # ── 构建当前轮的 prompt ──
+            if round_idx == 0:
+                # 第一轮: Phase 1 prompt (含代码索引)
+                kwargs = dict(common_kwargs)
+                kwargs["code_index"] = code_index
+                kwargs["queried_code"] = "(暂无 — 这是第一轮, 请提出你想查询的代码)"
+                prompt = QUERY_BASED_SCRIPT_FIX_PHASE1_PROMPT.format(**kwargs)
+            else:
+                # 后续轮: Phase 2 prompt (含查询结果)
+                kwargs = dict(common_kwargs)
+                kwargs["query_results"] = query_results_this_round
+                kwargs["previous_observation"] = observation_summary
+                kwargs["previous_analysis_direction"] = analysis_direction or "待确认"
+                prompt = QUERY_BASED_SCRIPT_FIX_PHASE2_PROMPT.format(**kwargs)
+            
+            # ── 调用 LLM ──
+            response = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=temperature,
+                max_tokens=4096,
+            )
+            
+            if response is None:
+                print(f"       ✗ [Script Fix Query] LLM 调用失败 at round {round_idx + 1}")
+                if round_idx == 0:
+                    return None  # 第一轮就失败 → 直接返回
+                break
+            
+            # ── 判断响应类型: query (JSON) 或 script (纯代码) ──
+            # 先尝试解析为 JSON (query 阶段)
+            parsed = self._parse_script_fix_query_response(response)
+            
+            if parsed and parsed.get("phase") == "query":
+                # ── LLM 提出查询请求 ──
+                queries = parsed.get("queries", [])
+                if not queries:
+                    print(f"       ⚠ No queries in response, forcing next round")
+                    continue
+                
+                print(f"       🔎 LLM queries: {len(queries)} requests")
+                
+                # ── 兼容 LLM 输出的简化格式: strings → dicts ──
+                normalized_queries = []
+                for q in queries:
+                    if isinstance(q, str):
+                        # 清洗格式污染前缀
+                        cleaned_q = re.sub(
+                            r'^\s*(SEARCH|REPLACE)\s*:\s*(class\s+|def\s+)?', '',
+                            q.strip(), flags=re.IGNORECASE
+                        ).strip().strip('"\'`<>')
+                        normalized_queries.append({"action": "search_function", "args": {"name": cleaned_q}})
+                        print(f"         → search_function(name={cleaned_q})  [auto-converted]")
+                    elif isinstance(q, dict):
+                        normalized_queries.append(q)
+                    else:
+                        print(f"         ⚠ Skipping invalid query: {type(q)}")
+                queries = normalized_queries
+                
+                if not queries:
+                    continue
+                
+                # ── 执行查询 ──
+                query_results_this_round = self._code_query_tool.execute_queries(queries)
+                
+                # 限制查询结果大小
+                if len(query_results_this_round) > max_chars_per_query_result:
+                    query_results_this_round = query_results_this_round[:max_chars_per_query_result] + \
+                        f"\n\n⚠ 查询结果超过 {max_chars_per_query_result} 字符, 已截断。"
+                
+                all_queried_code += "\n\n" + query_results_this_round
+                
+                # 刷新缓存 (源码可能已被修改)
+                self._code_query_tool.refresh_cache()
+                
+                print(f"         Results: {len(query_results_this_round)} chars returned")
+                
+                # ── 记录观察和分析 ──
+                observation_summary = parsed.get("observation", observation_summary)
+                reasoning_summary = parsed.get("reasoning", reasoning_summary)
+                analysis_direction = parsed.get("analysis_direction", "")
+            
+            else:
+                # ── 不是 JSON query → 尝试作为修正后的脚本解析 ──
+                fixed_code = clean_code_response(response)
+                
+                if fixed_code and len(fixed_code) > 20:
+                    print(f"       ✓ [Script Fix Query] LLM produced fixed script after {round_idx + 1} round(s)")
+                    return fixed_code
+                
+                # 解析失败 → 继续下一轮
+                print(f"       ✗ [Script Fix Query] Response parse failed at round {round_idx + 1}")
+                if round_idx == 0:
+                    return None
+                break
+        
+        # ── 查询轮数用尽 → 强制输出修正脚本 ──
+        print(f"    📢 [Script Fix Query] Max rounds reached, forcing final script output")
+        kwargs = dict(common_kwargs)
+        kwargs["all_queried_code"] = all_queried_code
+        kwargs["observation_summary"] = observation_summary
+        kwargs["reasoning_summary"] = reasoning_summary
+        final_prompt = QUERY_BASED_SCRIPT_FIX_FINAL_PROMPT.format(**kwargs)
+        
+        response = self.llm.chat(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": final_prompt},
+            ],
+            temperature=temperature,
+            max_tokens=4096,
+        )
+        
+        if response is None:
+            return None
+        
+        fixed_code = clean_code_response(response)
+        if fixed_code and len(fixed_code) > 20:
+            print(f"    ✓ [Script Fix Query] Final round produced fixed script ({len(fixed_code)} chars)")
+            return fixed_code
+        
+        # 尝试从 query 格式中的 JSON 提取脚本
+        parsed = self._parse_script_fix_query_response(response)
+        if parsed and parsed.get("phase") == "script" and parsed.get("script"):
+            return parsed["script"]
+        
+        logger.warning("Script fix query mode failed to produce valid code")
+        return None
+    
+    def _parse_script_fix_query_response(self, response: str) -> Optional[dict]:
+        """
+        解析 LLM 在脚本修正查询模式中的回复
+        
+        只识别 query 阶段的 JSON 格式:
+        {"phase": "query", "observation": "...", "reasoning": "...", "queries": [...], "analysis_direction": "..."}
+        
+        其他格式 (纯代码、proposal 格式等) 都不匹配, 返回 None,
+        让调用方用 clean_code_response 处理。
+        """
+        # 提取 JSON
+        json_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', response, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(1)
+        else:
+            start = response.find('{')
+            end = response.rfind('}')
+            if start >= 0 and end > start:
+                json_str = response[start:end + 1]
+            else:
+                return None
+        
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError:
+            try:
+                import ast as ast_module
+                data = ast_module.literal_eval(json_str)
+                if not isinstance(data, dict):
+                    return None
+            except Exception:
+                return None
+        
+        # 只识别明确的 query 阶段
+        phase = data.get("phase", "")
+        if phase == "query" and "queries" in data:
+            return data
+        
+        # 不识别其他格式 (交给 clean_code_response 处理)
+        return None
+    
+    # ════════════════════════════════════════
     # Step 3b: 数据获取 (多步迭代版本)
     # ════════════════════════════════════════
     
@@ -1230,6 +1735,7 @@ class HypothesisVerificationAgent:
         # ── Step 2: 按策略顺序获取数据 (每策略一个脚本) ──
         failed_data_names = []   # 记录失败的数据名 (用于重规划)
         failed_reasons = {}      # 记录失败原因
+        prev_acquired_files = {} # 记录已成功获取数据的 JSON 文件路径 {data_name: output_file_path}
         
         for strat_idx, strat in enumerate(ordered_strategies):
             # Sanitize data_name: LLM may generate path-like names (e.g. "data/Beauty_test.txt")
@@ -1253,6 +1759,7 @@ class HypothesisVerificationAgent:
                 strategy=strat,
                 verification_data=updated_data,
                 output_file=output_file,
+                prev_acquired_files=prev_acquired_files,
             )
             
             if not code:
@@ -1271,43 +1778,62 @@ class HypothesisVerificationAgent:
             )
             
             # ── 修正循环 ──
-            max_fix_rounds = 3 if difficulty in ["complex", "very_complex"] else 2
+            # 重要: 修正循环需要处理两类失败:
+            #   1) subprocess 返回非零 (success=False) — error 有值
+            #   2) subprocess 成功但脚本内部标记 success=False — result 有值但 data.success=False
+            # 两种情况都需要进入修正循环，不能直接放弃
+            max_fix_rounds = 3 if difficulty in ["complex", "very_complex"] else 3
+            
+            model_info = updated_data.get("_model_info", {})
+            model_info_text = self._format_model_info_for_prompt(model_info, max_chars=4000)
             
             for fix_round in range(max_fix_rounds):
-                if success and result is not None:
+                # ── 判断当前是否需要修正 ──
+                needs_fix = False
+                fix_error_msg = ""
+                
+                if not success and error:
+                    # subprocess 执行失败 (返回非零退出码)
+                    needs_fix = True
+                    fix_error_msg = error
+                elif success and result is not None:
+                    # subprocess 成功，但脚本内部可能标记了失败
+                    step_data = result.get("data", result)
+                    if isinstance(step_data, dict) and step_data.get("success") is False:
+                        needs_fix = True
+                        fix_error_msg = step_data.get("error", "脚本标记 success=False") or "脚本标记 success=False (无具体错误信息)"
+                        # 将脚本内部的错误信息作为修正依据
+                        error = fix_error_msg
+                
+                if not needs_fix:
+                    # 真正成功了，跳出修正循环
                     break
                 
-                if not error:
-                    break
+                print(f"    🔄 修正获取脚本 (第 {fix_round+1}/{max_fix_rounds} 次)... 错误: {fix_error_msg}")
                 
-                print(f"    🔄 修正获取脚本 (第 {fix_round+1} 次)...")
+                # ── 使用 Query-Based 修正 (复用 CodeQueryTool) ──
+                extra_context_parts = []
+                extra_context_parts.append(f"## 步骤名称\n- {raw_data_name}")
+                extra_context_parts.append(f"{self.injector.format_data_keys_for_prompt(updated_data, prev_acquired_files=prev_acquired_files, model_info=updated_data.get('_model_info'))}")
+                extra_context = "\n\n".join(extra_context_parts)
                 
-                fix_prompt = DATA_ACQUISITION_FIX_PROMPT.format(
-                    step_name=raw_data_name,
+                fixed_code = self._fix_script_with_query_mode(
+                    error_output=fix_error_msg,
                     original_code=self.injector.extract_core_code(code),
-                    error_output=error[:1500],
-                    available_data_description=self._format_available_data_for_code(updated_data),
-                )
-                
-                fixed_response = self.llm_retry.call_llm(
-                    prompt=fix_prompt,
-                    system_content=(
-                        "你是一位 Python 数据工程师，擅长根据错误信息修正数据获取脚本。"
-                        "只修正导致错误的部分，保持获取逻辑不变。"
-                        "如果数据确实无法获取，设置 success=false 并说明原因。"
-                        "绝对不要模拟或假设数据。"
-                    ),
+                    fix_context=DATA_ACQ_FIX_CONTEXT,
+                    extra_context=extra_context,
                     temperature=0.1,
-                    max_tokens=4096,
-                    suppress_response_log=True,  # 代码响应不输出到日志
+                    max_query_rounds=5,
                 )
                 
-                if not fixed_response:
+                if not fixed_code:
+                    print(f"    ⚠️ Query-based 修正未产生有效代码，继续下一轮...")
                     continue
                 
-                from .llm_utils import clean_code_response
-                code = clean_code_response(fixed_response)
-                code = self.injector.wrap_script(code, updated_data, output_file)
+                code = self.injector.wrap_script(
+                    fixed_code, updated_data, output_file,
+                    prev_acquired_files=prev_acquired_files
+                )
                 
                 # 保存修正后的脚本
                 with open(script_file, 'w', encoding='utf-8') as f:
@@ -1361,16 +1887,21 @@ class HypothesisVerificationAgent:
                         # 保存到 DataInfrastructure 缓存
                         self.data_infra.save_to_cache(safe_data_name, step_data)
                         
-                        print(f"    ✅ 成功获取数据 '{expected_output}'")
+                        # ── 记录已获取数据的 output JSON 文件路径 ──
+                        # 后续策略可通过 PREV_ACQUIRED_FILES 常量直接加载此文件,
+                        # 不需要重新获取
+                        prev_acquired_files[expected_output] = output_file
+                        
+                        print(f"    ✅ 成功获取数据 '{expected_output}' (文件: {output_file})")
                 else:
-                    # 脚本明确标记 success=False
+                    # 脚本明确标记 success=False (即使经过修正循环仍失败)
                     error_msg = step_data.get("error", "未知原因") if isinstance(step_data, dict) else "数据格式错误"
-                    print(f"    ❌ 数据 '{raw_data_name}' 获取失败 (脚本返回 success=False): {error_msg}")
+                    print(f"    ❌ 数据 '{raw_data_name}' 获取失败 (修正{max_fix_rounds}轮后仍返回 success=False): {error_msg}")
                     failed_data_names.append(raw_data_name)
                     failed_reasons[raw_data_name] = error_msg
             else:
-                # 脚本执行本身就失败了 (subprocess 返回非零)
-                print(f"    ❌ 获取脚本执行失败: {(error or '')[:100]}")
+                # 脚本执行本身就失败了 (subprocess 返回非零, 修正循环也未修复)
+                print(f"    ❌ 获取脚本执行失败 (修正{max_fix_rounds}轮后仍未修复): {(error or '')[:100]}")
                 failed_data_names.append(raw_data_name)
                 failed_reasons[raw_data_name] = (error or "执行失败")[:200]
         
@@ -1413,29 +1944,50 @@ class HypothesisVerificationAgent:
                         script_file, output_file
                     )
                     
-                    # 修正循环 (1次)
-                    if not success and error:
-                        fix_prompt = DATA_ACQUISITION_FIX_PROMPT.format(
-                            step_name=raw_data_name,
+                    # ── 修正循环 (重规划阶段也使用迭代修正，不只1次) ──
+                    replan_max_fix_rounds = 5
+                    replan_model_info_text = self._format_model_info_for_prompt(
+                        updated_data.get("_model_info", {}), max_chars=4000
+                    )
+                    
+                    for fix_round in range(replan_max_fix_rounds):
+                        needs_fix = False
+                        fix_error_msg = ""
+                        
+                        if not success and error:
+                            needs_fix = True
+                            fix_error_msg = error
+                        elif success and result is not None:
+                            step_data_check = result.get("data", result)
+                            if isinstance(step_data_check, dict) and step_data_check.get("success") is False:
+                                needs_fix = True
+                                fix_error_msg = step_data_check.get("error", "脚本标记 success=False") or "脚本标记 success=False (无具体错误信息)"
+                                error = fix_error_msg
+                        
+                        if not needs_fix:
+                            break
+                        
+                        print(f"    🔄 重规划修正 (第 {fix_round+1}/{replan_max_fix_rounds} 次)... 错误: {fix_error_msg[:80]}")
+                        
+                        # ── 使用 Query-Based 修正 (复用 CodeQueryTool) ──
+                        replan_extra_context_parts = []
+                        replan_extra_context_parts.append(f"## 步骤名称\n- {raw_data_name}")
+                        replan_extra_context_parts.append(f"{self.injector.format_data_keys_for_prompt(updated_data, prev_acquired_files=prev_acquired_files, model_info=updated_data.get('_model_info'))}")
+                        replan_extra_context = "\n\n".join(replan_extra_context_parts)
+                        
+                        fixed_code = self._fix_script_with_query_mode(
+                            error_output=fix_error_msg,
                             original_code=self.injector.extract_core_code(code),
-                            error_output=error[:1500],
-                            available_data_description=self._format_available_data_for_code(updated_data),
-                        )
-                        fixed_response = self.llm_retry.call_llm(
-                            prompt=fix_prompt,
-                            system_content=(
-                                "你是一位 Python 数据工程师，擅长根据错误信息修正数据获取脚本。"
-                                "只修正导致错误的部分，保持获取逻辑不变。"
-                                "绝对不要模拟或假设数据。"
-                            ),
+                            fix_context=DATA_ACQ_FIX_CONTEXT,
+                            extra_context=replan_extra_context,
                             temperature=0.1,
-                            max_tokens=4096,
-                            suppress_response_log=True,  # 代码响应不输出到日志
+                            max_query_rounds=5,  # 重规划阶段用更少查询轮次
                         )
-                        if fixed_response:
-                            from .llm_utils import clean_code_response
-                            code = clean_code_response(fixed_response)
-                            code = self.injector.wrap_script(code, updated_data, output_file)
+                        if fixed_code:
+                            code = self.injector.wrap_script(
+                                fixed_code, updated_data, output_file,
+                                prev_acquired_files=prev_acquired_files
+                            )
                             with open(script_file, 'w', encoding='utf-8') as f:
                                 f.write(code)
                             success, result, error = self._execute_acquisition_script(
@@ -1543,7 +2095,8 @@ class HypothesisVerificationAgent:
     def _generate_acquisition_script(self,
                                       strategy: Dict,
                                       verification_data: Dict,
-                                      output_file: str) -> Optional[str]:
+                                      output_file: str,
+                                      prev_acquired_files: Dict[str, str] = None) -> Optional[str]:
         """
         为整个策略生成一个连贯的获取脚本
         
@@ -1554,15 +2107,49 @@ class HypothesisVerificationAgent:
         策略蓝图的 acquisition_steps 作为 LLM 的参考，帮助它理解步骤顺序，
         但生成的代码是一个连贯的 pipeline，不是多个独立脚本。
         
+        新增 prev_acquired_files 参数:
+        - 包含前一步已获取数据的 JSON 文件路径
+        - LLM 可通过 PREV_ACQUIRED_FILES 常量直接加载这些数据
+        - 不需要从头重新获取依赖数据
+        
         返回经过 DataInjector wrap_script 的完整脚本
         """
         data_name = strategy.get("data_name", "unknown")
         data_type = strategy.get("data_type", "unknown")
         difficulty = strategy.get("difficulty", "medium")
         
-        available_data_desc = self._format_available_data_for_code(verification_data)
+        # 使用数据获取专用的格式化方法 (正确描述 DATA_FILE / PREV_ACQUIRED_FILES 访问方式)
+        available_data_desc = self._format_available_data_for_acquisition(
+            verification_data, prev_acquired_files=prev_acquired_files
+        )
         data_inventory = verification_data.get("_data_inventory", "无数据盘点信息")
         model_info = verification_data.get("_model_info", {})
+        
+        # ── 构建前一步已获取数据说明 ──
+        prev_acquired_data_section = ""
+        if prev_acquired_files:
+            prev_lines = [
+                "## ⚠️ 前一步已获取的数据 (不要重复获取!)",
+                "",
+                "以下数据已经在前面的策略步骤中成功获取, 你可以直接从 JSON 文件加载, **绝对不要从头重新获取**:",
+                ""
+            ]
+            for dep_name, dep_file in prev_acquired_files.items():
+                prev_lines.append(f"- **{dep_name}**: 文件路径 `PREV_ACQUIRED_FILES['{dep_name}']` = `{dep_file}`")
+                prev_lines.append(f"  加载方式: `prev_data = json.load(open(PREV_ACQUIRED_FILES['{dep_name}']))`")
+                # 展示该数据的结构概览
+                dep_value = verification_data.get(dep_name)
+                if dep_value is not None and isinstance(dep_value, dict):
+                    dep_top_keys = list(dep_value.keys())[:8]
+                    prev_lines.append(f"  结构: Dict, 顶层 keys: {dep_top_keys}")
+                    inner = dep_value.get("data")
+                    if isinstance(inner, dict):
+                        inner_keys = list(inner.keys())[:8]
+                        prev_lines.append(f"  data 子字段 keys: {inner_keys}")
+                prev_lines.append("")
+            
+            prev_lines.append("**关键提醒**: 如果策略蓝图的 `dependencies` 中引用了以上数据, 直接从 PREV_ACQUIRED_FILES 加载即可, 不要重新构建模型、加载权重、运行推理等。")
+            prev_acquired_data_section = "\n".join(prev_lines)
         
         prompt = DATA_ACQUISITION_SCRIPT_PROMPT.format(
             data_name=data_name,
@@ -1572,6 +2159,7 @@ class HypothesisVerificationAgent:
             data_inventory=data_inventory,
             model_info=self._format_model_info_for_prompt(model_info, max_chars=8000),
             available_data_description=available_data_desc,
+            prev_acquired_data_section=prev_acquired_data_section,
         )
         
         response = self.llm_retry.call_llm(
@@ -1581,6 +2169,8 @@ class HypothesisVerificationAgent:
                 "你需要将策略规划中的多个步骤合并为一个连贯的 Python 脚本。"
                 "步骤之间通过 Python 变量传递中间结果 (如 model_instance, test_dataset)，"
                 "而不是分成多个独立脚本。"
+                "⚠️ 如果策略的 dependencies 中引用了已获取的数据，必须从 PREV_ACQUIRED_FILES 加载，"
+                "不要从头重新获取 (如重新构建模型、运行推理等)。"
                 "对于模型内部数据，使用 torch.load() + PyTorch hooks。"
                 "绝对不要模拟或假设数据 — 如果无法获取，标记失败。"
                 "确保使用 save_result() 将结果保存到 JSON 文件。"
@@ -1595,7 +2185,10 @@ class HypothesisVerificationAgent:
         
         from .llm_utils import clean_code_response
         code = clean_code_response(response)
-        code = self.injector.wrap_script(code, verification_data, output_file)
+        code = self.injector.wrap_script(
+            code, verification_data, output_file,
+            prev_acquired_files=prev_acquired_files
+        )
         
         return code
     
@@ -1753,6 +2346,52 @@ class HypothesisVerificationAgent:
         
         return "\n".join(lines)
     
+    def _validate_execution_result(self, result: Dict) -> Dict:
+        """
+        验证执行结果的有效性
+        
+        检查:
+        1. success 字段是否为 false
+        2. 统计值是否为 0、NaN、None、无效值
+        3. 是否缺少必需的 statistics 字段
+        
+        Returns:
+            {"is_valid": bool, "reason": str}
+        """
+        if not isinstance(result, dict):
+            return {"is_valid": False, "reason": "结果不是字典类型"}
+        
+        # 检查 success 字段
+        if result.get("success") is False:
+            return {"is_valid": False, "reason": f"脚本标记 success=false: {result.get('error', '未知错误')}"}
+        
+        # 检查 statistics
+        statistics = result.get("statistics", result)
+        if not statistics or not isinstance(statistics, dict):
+            return {"is_valid": False, "reason": "缺少有效的 statistics 字段"}
+        
+        # 检查统计值是否有效
+        invalid_reasons = []
+        for key, value in statistics.items():
+            if value is None:
+                invalid_reasons.append(f"{key}=None")
+            elif isinstance(value, (int, float)):
+                if value == 0:
+                    invalid_reasons.append(f"{key}=0")
+                elif isinstance(value, float):
+                    val_str = str(value).lower()
+                    if val_str == "nan" or val_str == "inf" or val_str == "-inf":
+                        invalid_reasons.append(f"{key}={value}")
+        
+        if invalid_reasons:
+            return {"is_valid": False, "reason": f"统计值无效: {', '.join(invalid_reasons)}"}
+        
+        # 检查是否有数据被处理 (不是空结果)
+        if "data_processed" in result and result["data_processed"] == 0:
+            return {"is_valid": False, "reason": "没有处理任何数据 (data_processed=0)"}
+        
+        return {"is_valid": True, "reason": "OK"}
+    
     # ════════════════════════════════════════
     # Step 5: 结果分析
     # ════════════════════════════════════════
@@ -1763,11 +2402,30 @@ class HypothesisVerificationAgent:
                          execution_result: Dict) -> Dict:
         """
         LLM 解读验证代码的执行结果, 判断假设是否成立
+        
+        新增: 在分析前先验证结果有效性, 如果是 0/NaN/None 等无效值, 判为 UNVERIFIABLE (无法查证)
         """
         hyp_id = hypothesis.get("id", "H?")
         claim = hypothesis.get("claim", "")
         expected_true = hypothesis.get("expected_if_true", "")
         expected_false = hypothesis.get("expected_if_false", "")
+        
+        # ── Step 1: 验证结果有效性 ──
+        validity_check = self._validate_execution_result(execution_result)
+        if not validity_check["is_valid"]:
+            logger.warning(f"Verification result invalid for {hyp_id}: {validity_check['reason']}")
+            return {
+                "status": self.UNVERIFIABLE,
+                "brief": f"验证未能成功执行: {validity_check['reason']}",
+                "detailed_reasoning": f"验证脚本执行出错或结果无效: {validity_check['reason']}。这不代表假设被否决，而是验证本身未能完成，因此无法查证假设。",
+                "evidence_summary": {
+                    "key_statistic": "N/A",
+                    "comparison": "无法进行有效比较",
+                    "confidence": 0.0
+                },
+                "method": "result_validation_failed",
+                "raw_result": execution_result,
+            }
         
         plan_json = json.dumps(verification_plan, indent=2, ensure_ascii=False)
         result_json = json.dumps(execution_result, indent=2, ensure_ascii=False)
