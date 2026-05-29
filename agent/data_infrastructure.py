@@ -386,6 +386,160 @@ class DataInfrastructure:
 
         return "\n".join(lines)
 
+    def collect_data_samples(self, max_lines_per_file: int = 5,
+                             max_json_entries: int = 3) -> str:
+        """
+        读取数据文件的前几行/条目, 生成 LLM prompt 可用的样本描述
+
+        核心价值: 让 LLM 在编写数据获取/处理代码时, 先感知数据的实际格式,
+        避免猜测分隔符、编码方式等导致解析错误。
+
+        例如:
+        - LLM 看到 "1\t2,3\t4" 就知道分隔符是 tab 而非空格
+        - LLM 看到 JSON 第一条的结构就知道字段名和嵌套关系
+
+        处理策略:
+        - .txt 文件: 读取前几行原始文本, 保留原始格式 (tab、空格、逗号等)
+        - .json 文件: 解析后展示前几条的结构摘要 + 原始文本片段
+        - 其他文件: 仅展示文件元信息 (无法采样文本内容)
+
+        Args:
+            max_lines_per_file: 每个文本文件最多读取的行数
+            max_json_entries: 每个 JSON 文件最多展示的条目数
+
+        Returns:
+            格式化的数据样本描述文本, 可直接注入到 prompt 中
+        """
+        inventory = self.discover_data()
+        sample_lines = []
+
+        # ── 采样文本数据文件 (.txt) ──
+        for df in inventory.get("data_files", []):
+            abs_path = self._resolve_to_abs_path(df['path'])
+            fpath = Path(abs_path)
+            if not fpath.exists() or fpath.stat().st_size == 0:
+                sample_lines.append(f"### {fpath.name} (空文件或不存在)")
+                continue
+
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                    lines = []
+                    for i, line in enumerate(f):
+                        if i >= max_lines_per_file:
+                            break
+                        raw = line.rstrip('\n')
+                        if raw:  # 跳过空行
+                            lines.append(raw)
+
+                if lines:
+                    sample_lines.append(f"### {fpath.name} (前 {len(lines)} 行样本)")
+                    for idx, line in enumerate(lines):
+                        # 展示原始内容, 让 LLM 观察真实分隔符 (tab/space/comma)
+                        # 保留原始格式不做替换, 避免 LLM 误认替换符号为分隔符
+                        sample_lines.append(f"  行{idx+1}: {line}")
+                    # 附加格式分析提示
+                    first_line = lines[0]
+                    tab_count = first_line.count('\t')
+                    space_splits = len(first_line.split(' '))
+                    comma_splits = len(first_line.split(','))
+                    format_hints = []
+                    if tab_count > 0:
+                        format_hints.append(f"tab分隔 ({tab_count} 个\t字段)")
+                    if space_splits > 2:
+                        format_hints.append(f"空格分隔 (split(' ')→{space_splits}段)")
+                    if comma_splits > 2:
+                        format_hints.append(f"逗号分隔 (split(',')→{comma_splits}段)")
+                    if format_hints:
+                        sample_lines.append(f"  格式分析: {', '.join(format_hints)}")
+                else:
+                    sample_lines.append(f"### {fpath.name} (文件非空但无有效内容行)")
+            except Exception as e:
+                sample_lines.append(f"### {fpath.name} (读取失败: {e})")
+
+        # ── 采样 JSON 元数据文件 ──
+        for mf in inventory.get("metadata_files", []):
+            abs_path = self._resolve_to_abs_path(mf['path'])
+            fpath = Path(abs_path)
+            if not fpath.exists() or fpath.stat().st_size == 0:
+                sample_lines.append(f"### {fpath.name} (空文件或不存在)")
+                continue
+
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                    data = json.load(f)
+
+                if isinstance(data, dict):
+                    top_keys = list(data.keys())[:10]
+                    sample_lines.append(f"### {fpath.name} (Dict, 顶层 keys: {top_keys})")
+                    # 展示前几条条目
+                    for i, (k, v) in enumerate(list(data.items())[:max_json_entries]):
+                        val_repr = repr(v) if not isinstance(v, (dict, list)) else f"{type(v).__name__}({len(v) if isinstance(v, (list, dict)) else '...'})"
+                        sample_lines.append(f"  条目{i+1}: key={k}, value={val_repr}")
+                    if isinstance(data, dict) and len(data) > max_json_entries:
+                        sample_lines.append(f"  ... 共 {len(data)} 条")
+                elif isinstance(data, list):
+                    sample_lines.append(f"### {fpath.name} (List, 共 {len(data)} 项)")
+                    for i, item in enumerate(data[:max_json_entries]):
+                        if isinstance(item, dict):
+                            item_keys = list(item.keys())[:8]
+                            sample_lines.append(f"  条目{i+1}: Dict, keys={item_keys}")
+                        else:
+                            sample_lines.append(f"  条目{i+1}: {repr(item)[:200]}")
+                    if len(data) > max_json_entries:
+                        sample_lines.append(f"  ... 共 {len(data)} 项")
+                else:
+                    sample_lines.append(f"### {fpath.name} ({type(data).__name__})")
+            except Exception as e:
+                # JSON 解析失败, 尝试读取前几行原始文本
+                try:
+                    with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                        raw_lines = [line.rstrip('\n') for line in f if line.strip()][:max_lines_per_file]
+                    if raw_lines:
+                        sample_lines.append(f"### {fpath.name} (JSON 解析失败, 原始前几行):")
+                        for idx, rl in enumerate(raw_lines):
+                            sample_lines.append(f"  行{idx+1}: {rl[:200]}")
+                    else:
+                        sample_lines.append(f"### {fpath.name} (读取失败: {e})")
+                except Exception:
+                    sample_lines.append(f"### {fpath.name} (读取失败: {e})")
+
+        # ── 采样预计算结果文件 (.json) ──
+        for pf in inventory.get("precomputed_results", []):
+            abs_path = self._resolve_to_abs_path(pf['path'])
+            fpath = Path(abs_path)
+            if not fpath.exists() or fpath.stat().st_size == 0:
+                continue  # 非关键数据, 空文件不报错
+
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                    data = json.load(f)
+
+                if isinstance(data, dict):
+                    top_keys = list(data.keys())[:10]
+                    sample_lines.append(f"### {fpath.name} (Dict, 顶层 keys: {top_keys})")
+                    for i, (k, v) in enumerate(list(data.items())[:max_json_entries]):
+                        val_repr = repr(v) if not isinstance(v, (dict, list)) else f"{type(v).__name__}({len(v) if isinstance(v, (list, dict)) else '...'})"
+                        sample_lines.append(f"  条目{i+1}: key={k}, value={val_repr}")
+                    if len(data) > max_json_entries:
+                        sample_lines.append(f"  ... 共 {len(data)} 条")
+                elif isinstance(data, list):
+                    sample_lines.append(f"### {fpath.name} (List, 共 {len(data)} 项)")
+                    for i, item in enumerate(data[:max_json_entries]):
+                        if isinstance(item, dict):
+                            item_keys = list(item.keys())[:8]
+                            sample_lines.append(f"  条目{i+1}: Dict, keys={item_keys}")
+                        else:
+                            sample_lines.append(f"  条目{i+1}: {repr(item)[:200]}")
+                else:
+                    sample_lines.append(f"### {fpath.name} ({type(data).__name__})")
+            except Exception:
+                pass  # 非关键数据, 采样失败不影响主流程
+
+        if not sample_lines:
+            return "无可用数据样本 (项目数据目录中未找到数据文件)"
+
+        return "\n".join(sample_lines)
+
     # ─── 脚本执行 ───────────────────────────────────────────────
 
     def execute_script(self, script_content: str, timeout: int = None,

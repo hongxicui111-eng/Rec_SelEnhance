@@ -730,6 +730,7 @@ class HypothesisVerificationAgent:
                 script_dir=workspace_dir,
                 code_query_tool=self._code_query_tool,   # 启用 Query-Based 修正
                 fix_context=VERIF_FIX_CONTEXT,             # 验证脚本上下文
+                data_samples=self.data_infra.collect_data_samples(),  # 数据样本感知
             )
             
             if not execution_result:
@@ -1476,7 +1477,7 @@ class HypothesisVerificationAgent:
         # ── 构建通用 kwargs (各轮共用) ──
         common_kwargs = {
             "context_title": context_title,
-            "error_output": error_output[:2000],
+            "error_output": error_output,
             "original_code": original_code,
             "extra_context": extra_context,
             "runtime_infrastructure_instructions": runtime_instructions,
@@ -1815,6 +1816,10 @@ class HypothesisVerificationAgent:
                 extra_context_parts = []
                 extra_context_parts.append(f"## 步骤名称\n- {raw_data_name}")
                 extra_context_parts.append(f"{self.injector.format_data_keys_for_prompt(updated_data, prev_acquired_files=prev_acquired_files, model_info=updated_data.get('_model_info'))}")
+                # ── 数据样本感知: 让修正 LLM 也看到数据真实格式 ──
+                data_samples = self.data_infra.collect_data_samples()
+                if data_samples and data_samples != "无可用数据样本 (项目数据目录中未找到数据文件)":
+                    extra_context_parts.append(f"## ⚠️ 数据样本 (请严格按此格式解析数据!)\n{data_samples}")
                 extra_context = "\n\n".join(extra_context_parts)
                 
                 fixed_code = self._fix_script_with_query_mode(
@@ -1973,6 +1978,10 @@ class HypothesisVerificationAgent:
                         replan_extra_context_parts = []
                         replan_extra_context_parts.append(f"## 步骤名称\n- {raw_data_name}")
                         replan_extra_context_parts.append(f"{self.injector.format_data_keys_for_prompt(updated_data, prev_acquired_files=prev_acquired_files, model_info=updated_data.get('_model_info'))}")
+                        # ── 数据样本感知: 让修正 LLM 也看到数据真实格式 ──
+                        replan_data_samples = self.data_infra.collect_data_samples()
+                        if replan_data_samples and replan_data_samples != "无可用数据样本 (项目数据目录中未找到数据文件)":
+                            replan_extra_context_parts.append(f"## ⚠️ 数据样本 (请严格按此格式解析数据!)\n{replan_data_samples}")
                         replan_extra_context = "\n\n".join(replan_extra_context_parts)
                         
                         fixed_code = self._fix_script_with_query_mode(
@@ -2125,6 +2134,9 @@ class HypothesisVerificationAgent:
         data_inventory = verification_data.get("_data_inventory", "无数据盘点信息")
         model_info = verification_data.get("_model_info", {})
         
+        # ── 读取数据文件的真实样本 (让 LLM 感知数据格式) ──
+        data_samples = self.data_infra.collect_data_samples()
+        
         # ── 构建前一步已获取数据说明 ──
         prev_acquired_data_section = ""
         if prev_acquired_files:
@@ -2157,6 +2169,7 @@ class HypothesisVerificationAgent:
             difficulty=difficulty,
             strategy_context=json.dumps(strategy, ensure_ascii=False),
             data_inventory=data_inventory,
+            data_samples=data_samples,
             model_info=self._format_model_info_for_prompt(model_info, max_chars=8000),
             available_data_description=available_data_desc,
             prev_acquired_data_section=prev_acquired_data_section,

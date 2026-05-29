@@ -1437,6 +1437,40 @@ class TestLLMCaseAnalyzer(unittest.TestCase):
         self.assertIsNotNone(analyzer)
 
 
+class TestHypothesisEaseSelection(unittest.TestCase):
+    """测试假设易验证性筛选功能"""
+
+    def setUp(self):
+        from agent.hypothesis_verification_agent import HypothesisVerificationAgent
+        self.HypothesisVerificationAgent = HypothesisVerificationAgent
+
+    def test_select_easiest_method_exists(self):
+        """测试 select_easiest_hypotheses 方法存在"""
+        self.assertTrue(
+            hasattr(self.HypothesisVerificationAgent, 'select_easiest_hypotheses'),
+            "HypothesisVerificationAgent should have select_easiest_hypotheses method"
+        )
+
+    def test_prompt_exists_and_valid(self):
+        """测试 HYPOTHESIS_EASE_SELECTION_PROMPT 存在且包含必要占位符"""
+        from agent.prompts import HYPOTHESIS_EASE_SELECTION_PROMPT
+        self.assertIsInstance(HYPOTHESIS_EASE_SELECTION_PROMPT, str)
+        self.assertGreater(len(HYPOTHESIS_EASE_SELECTION_PROMPT), 100)
+        # 检查必要占位符
+        self.assertIn("{hypotheses_json}", HYPOTHESIS_EASE_SELECTION_PROMPT)
+        self.assertIn("{data_inventory}", HYPOTHESIS_EASE_SELECTION_PROMPT)
+        self.assertIn("{model_info}", HYPOTHESIS_EASE_SELECTION_PROMPT)
+        self.assertIn("{available_data_description}", HYPOTHESIS_EASE_SELECTION_PROMPT)
+        # 检查难度评估维度
+        self.assertIn("difficulty_assessment", HYPOTHESIS_EASE_SELECTION_PROMPT)
+        self.assertIn("recommended_for_pilot", HYPOTHESIS_EASE_SELECTION_PROMPT)
+
+    def test_prompt_importable(self):
+        """测试 HYPOTHESIS_EASE_SELECTION_PROMPT 可从 hypothesis_verification_agent 导入"""
+        from agent.hypothesis_verification_agent import HYPOTHESIS_EASE_SELECTION_PROMPT
+        self.assertIsInstance(HYPOTHESIS_EASE_SELECTION_PROMPT, str)
+
+
 # ══════════════════════════════════════════════════════════════════
 # 17. 代码应用器测试
 # ══════════════════════════════════════════════════════════════════

@@ -684,17 +684,46 @@ class RecSelfEvolveAgent:
 
                 # 执行守卫决策
                 if guard_decision["action"] == "REVERT_TO_BEST":
-                    print(f"  ↩ Reverting to iter {guard_decision.get('best_iteration', '?')}")
                     best_iter = guard_decision.get('best_iteration', 0)
-                    if structural_changes and struct_result and struct_result["status"] in ("SUCCESS", "PARTIAL_SUCCESS"):
-                        self.struct_applier.rollback_last_changes()
-                        print(f"  ↩ Structural changes also rolled back")
-                        self.iter_memory.record_rollback(
-                            iteration=i,
-                            reason=f"Quality guard reverted to best iter {best_iter}",
-                            rollback_to_iteration=best_iter,
-                        )
-                    self.trainer.run(param_overrides=self.guard.best_config)
+                    print(f"  ↩ Reverting to iter {best_iter}")
+                    
+                    # ★★★ 关键修复: 恢复到最优迭代轮次的完整源码 + 参数 ★★★
+                    # 原有逻辑只 rollback_last_changes() (仅回滚最后一轮修改)
+                    # 新逻辑: restore_source_snapshot(best_iter) (恢复到最优轮次的完整状态)
+                    
+                    # Step 1: 恢复源码到最优轮次
+                    restore_result = self.iter_memory.restore_source_snapshot(best_iter)
+                    if restore_result.get("ok"):
+                        print(f"  ↩ Source code restored to iter {best_iter}: {restore_result.get('restored_files', [])}")
+                    else:
+                        # 快照恢复失败 → 降级使用 StructureApplier 的单步回滚
+                        print(f"  ⚠ Snapshot restore failed: {restore_result.get('error', '')}")
+                        if structural_changes and struct_result and struct_result["status"] in ("SUCCESS", "PARTIAL_SUCCESS"):
+                            self.struct_applier.rollback_last_changes()
+                            print(f"  ↩ Structural changes rolled back (single-step fallback)")
+                    
+                    self.iter_memory.record_rollback(
+                        iteration=i,
+                        reason=f"Quality guard reverted to best iter {best_iter} (regression: {guard_decision.get('regression_type', 'degradation')})",
+                        rollback_to_iteration=best_iter,
+                    )
+                    
+                    # Step 2: 清空 last_retrain_metrics → 下一轮用恢复后的代码做 baseline 训练
+                    last_retrain_metrics = None
+                    last_retrain_result = None
+                    print(f"  ↩ next iteration will use restored code for baseline training")
+                    
+                    # Step 3: 重新训练恢复后的代码 (使用最优参数)
+                    if self.guard.best_config:
+                        print(f"  ↩ Retraining with best config: {self.guard.best_config}")
+                        retrain_result = self.trainer.run(param_overrides=self.guard.best_config)
+                        if retrain_result.get("status") == "SUCCESS":
+                            retrain_metrics = retrain_result.get("metrics", {})
+                            last_retrain_metrics = retrain_metrics
+                            last_retrain_result = retrain_result
+                            print(f"  ✓ Retrain with best config succeeded: {self.adapter.format_metrics_for_llm(retrain_metrics)}")
+                        else:
+                            print(f"  ⚠ Retrain with best config failed, next iteration will do fresh baseline")
                 elif guard_decision["action"] == "SWITCH_STRATEGY":
                     self.current_strategy = guard_decision.get("strategy", "aggressive")
                     print(f"  🔄 Strategy → {self.current_strategy}")
@@ -723,10 +752,44 @@ class RecSelfEvolveAgent:
                     "fix_attempts": new_train.get("fix_attempts", 0),
                 })
                 
-                # 回退到 best config
-                if self.guard.best_config:
-                    print(f"  ↩ Falling back to best config")
-                    self.trainer.run(param_overrides=self.guard.best_config)
+                # ★★★ 关键修复: retrain 失败 → 回滚源码到最优轮次, 不仅是参数 ★★★
+                # 原有逻辑: 只恢复 best_config 参数, 源码仍保留失败的修改
+                # 新逻辑: 先恢复源码到最优轮次, 再用最优参数重新训练
+                if self.guard.best_index >= 0:
+                    best_iter = self.guard.best_index
+                    print(f"  ↩ Retrain failed → restoring source code to best iter {best_iter}")
+                    
+                    # Step 1: 恢复源码到最优轮次
+                    restore_result = self.iter_memory.restore_source_snapshot(best_iter)
+                    if restore_result.get("ok"):
+                        print(f"  ↩ Source code restored: {restore_result.get('restored_files', [])}")
+                    else:
+                        # 快照不存在 → 回滚到初始状态
+                        print(f"  ↩ Snapshot for iter {best_iter} not found, rolling back to initial state")
+                        self._rollback_all_source_changes()
+                    
+                    self.iter_memory.record_rollback(
+                        iteration=i,
+                        reason=f"Retrain failed, reverted to best iter {best_iter}",
+                        rollback_to_iteration=best_iter,
+                    )
+                    
+                    # Step 2: 用最优参数重新训练恢复后的代码
+                    if self.guard.best_config:
+                        print(f"  ↩ Retraining restored code with best config: {self.guard.best_config}")
+                        retrain_result = self.trainer.run(param_overrides=self.guard.best_config)
+                        if retrain_result.get("status") == "SUCCESS":
+                            retrain_metrics = retrain_result.get("metrics", {})
+                            last_retrain_metrics = retrain_metrics
+                            last_retrain_result = retrain_result
+                            self._consecutive_fail_count = 0
+                            print(f"  ✓ Retrain with restored code + best config succeeded: {self.adapter.format_metrics_for_llm(retrain_metrics)}")
+                        else:
+                            print(f"  ⚠ Retrain even with restored code failed, next iteration will do fresh baseline")
+                else:
+                    # 没有最优迭代记录 → 回滚到初始状态
+                    print(f"  ↩ No best iteration recorded → rolling back to initial state")
+                    self._rollback_all_source_changes()
 
         # ---- 完成 ----
         summary = self.guard.get_summary()
@@ -2181,17 +2244,27 @@ class RecSelfEvolveAgent:
         
         return {"action": "data_fix_failed", "error": "No data path fixes proposed"}
 
-    def _rollback_all_source_changes(self):
+    def _rollback_all_source_changes(self, target_iteration: int = 0):
         """
-        回滚所有源码修改 — 当连续失败次数过多时, 回滚到初始状态
+        回滚所有源码修改 — 恢复到指定迭代轮次的源码状态
         
-        从 IterativeMemory 的快照目录恢复第 0 轮的源码文件。
+        Args:
+            target_iteration: 要恢复到的迭代轮次 (默认 0 = 初始状态)
+            
+        当有 best_iteration 时, 优先恢复到最优轮次而非初始状态。
+        从 IterativeMemory 的快照目录恢复指定轮次的源码文件。
         """
-        print(f"  ↩↩↩ 回滚所有源码修改到初始状态!")
+        # ★★★ 关键改进: 如果有最优迭代记录, 优先恢复到最优轮次而非 iter_000 ★★★
+        if target_iteration == 0 and self.guard.best_index >= 0:
+            target_iteration = self.guard.best_index
+            print(f"  ↩↩↩ 回滚到最优轮次 iter_{target_iteration:03d} (而非初始状态)")
+        else:
+            print(f"  ↩↩↩ 回滚所有源码修改到 iter_{target_iteration:03d}!")
         
-        # 从 IterativeMemory 的快照目录恢复 iter_000 的源码
-        snapshot_dir = self.iter_memory.snapshot_dir / "iter_000"
+        # 从 IterativeMemory 的快照目录恢复指定轮次的源码
+        snapshot_dir = self.iter_memory.snapshot_dir / f"iter_{target_iteration:03d}"
         if snapshot_dir.exists():
+            restored = []
             for file_key in self.iter_memory.source_files:
                 snapshot_path = snapshot_dir / file_key
                 if snapshot_path.exists():
@@ -2200,14 +2273,23 @@ class RecSelfEvolveAgent:
                     if actual_path and os.path.exists(actual_path):
                         try:
                             shutil.copy2(str(snapshot_path), actual_path)
-                            logger.info(f"Restored {file_key} to initial state: {snapshot_path} → {actual_path}")
-                            print(f"    ✓ {file_key} restored")
+                            logger.info(f"Restored {file_key} to iter_{target_iteration:03d}: {snapshot_path} → {actual_path}")
+                            print(f"    ✓ {file_key} restored to iter_{target_iteration:03d}")
+                            restored.append(file_key)
                         except Exception as e:
                             logger.warning(f"Failed to restore {file_key}: {e}")
                     else:
                         logger.warning(f"Source file not found for {file_key}")
+            
+            if restored:
+                print(f"  ↩ Restored {len(restored)} files to iter_{target_iteration:03d}")
+                self.iter_memory.record_rollback(
+                    iteration=self.current_iteration,
+                    reason=f"Consecutive failures, reverted to iter_{target_iteration:03d}",
+                    rollback_to_iteration=target_iteration,
+                )
         else:
-            logger.warning("No iter_000 snapshot found for rollback")
+            logger.warning(f"No iter_{target_iteration:03d} snapshot found for rollback")
             # 也使用 StructureApplier 的回滚作为后备
             self.struct_applier.rollback_last_changes()
 
@@ -2773,6 +2855,11 @@ class RecSelfEvolveAgent:
         if rollback_warning:
             prompt += rollback_warning
 
+        # ★ 添加当前轮次验证结果 (已确认方向 + 已反驳方向)
+        verification_ctx = self._build_current_verification_context()
+        if verification_ctx:
+            prompt += verification_ctx
+
         strategy_instruction = self._get_strategy_instruction()
         if strategy_instruction:
             prompt += f"\n\n## 当前探索策略\n{strategy_instruction}"
@@ -2881,6 +2968,37 @@ class RecSelfEvolveAgent:
 - **模型瓶颈**: {json.dumps(ca.get("model_bottleneck", {}), ensure_ascii=False)}
 - **改进建议**: {json.dumps(ca.get("improvement_suggestions", []), ensure_ascii=False)[:800]}
 """
+                # ★ 添加当前轮次的验证状态 (之前遗漏!)
+                if self._last_verification_report:
+                    vm = ca.get("verification_meta", {})
+                    if vm:
+                        refuted = vm.get("refuted_claims", [])
+                        credibility = vm.get("overall_credibility", "LOW")
+                        field_verification = vm.get("field_verification", {})
+                        
+                        verification_info = f"""
+## ⚠ 当前轮次假设验证结果
+**综合可信度**: {credibility} (已确认{vm.get('confirmed_pct', 0):.0f}%, 被反驳{vm.get('refuted_pct', 0):.0f}%)
+
+"""
+                        if refuted:
+                            verification_info += "**❌ 以下结论被数据反驳, 不要基于这些结论提出改进**:\n"
+                            for rc in refuted:
+                                verification_info += f"- ❌ {rc}\n"
+                            verification_info += "\n"
+                        
+                        if field_verification:
+                            verification_info += "**逐字段验证状态**:\n"
+                            for field, verifications in field_verification.items():
+                                statuses = [v.get("status", "?") for v in verifications]
+                                confirmed_count = sum(1 for s in statuses if s == "CONFIRMED")
+                                refuted_count = sum(1 for s in statuses if s == "REFUTED")
+                                verification_info += f"- {field}: {confirmed_count}确认 / {refuted_count}反驳\n"
+                        
+                        case_info += verification_info
+        
+        # ★ 构建当前轮次验证结果上下文
+        verification_ctx = self._build_current_verification_context()
         
         # ── 累积查询结果 ──
         all_queried_code = ""
@@ -2904,7 +3022,7 @@ class RecSelfEvolveAgent:
                     queried_code="(暂无 — 这是第一轮, 请提出你想查询的代码)",
                     structural_history=structural_history,
                     rollback_warning=rollback_warning,
-                    surprise_info=surprise_info + case_info,
+                    surprise_info=surprise_info + case_info + verification_ctx,
                     current_hidden_size=self.adapter.base_args.get("hidden_size", 64),
                 )
             else:
@@ -3059,6 +3177,10 @@ class RecSelfEvolveAgent:
         strategy_instruction = self._get_strategy_instruction()
         if strategy_instruction:
             final_prompt += f"\n\n## 当前探索策略\n{strategy_instruction}"
+        
+        # ★ 添加当前轮次验证结果 (让最终提案也参考已确认/反驳的假设)
+        if verification_ctx:
+            final_prompt += verification_ctx
         
         final_response = self.llm.chat(
             messages=[
@@ -3236,6 +3358,35 @@ class RecSelfEvolveAgent:
 """
             planner_prompt += surprise_info
         
+        # ★ 添加当前轮次验证结果 (让 Planner 知道哪些方向被确认/反驳)
+        verification_ctx = self._build_current_verification_context()
+        if verification_ctx:
+            planner_prompt += verification_ctx
+        
+        # ★ 添加当前轮次的案例分析 + 验证状态 (之前完全遗漏!)
+        if self._last_case_analysis:
+            ca = self._last_case_analysis
+            if ca.get("parse_success"):
+                planner_prompt += f"""
+## LLM 对错误案例的分析结论
+- **错误模式**: {json.dumps(ca.get("error_patterns", {}), ensure_ascii=False)}
+- **模型瓶颈**: {json.dumps(ca.get("model_bottleneck", {}), ensure_ascii=False)}
+- **改进建议**: {json.dumps(ca.get("improvement_suggestions", []), ensure_ascii=False)[:800]}
+"""
+                # 添加当前验证状态
+                if self._last_verification_report:
+                    vm = ca.get("verification_meta", {})
+                    if vm:
+                        planner_prompt += f"""
+## 当前轮次假设验证结果
+综合可信度: {vm.get('overall_credibility', 'LOW')} (确认{vm.get('confirmed_pct', 0):.0f}%, 反驳{vm.get('refuted_pct', 0):.0f}%)
+"""
+                        refuted = vm.get("refuted_claims", [])
+                        if refuted:
+                            planner_prompt += "被反驳的结论 (不应基于这些方向改进):\n"
+                            for rc in refuted:
+                                planner_prompt += f"- ❌ {rc}\n"
+        
         strategy_instruction = self._get_strategy_instruction()
         if strategy_instruction:
             planner_prompt += f"\n\n## 当前探索策略\n{strategy_instruction}"
@@ -3365,6 +3516,10 @@ class RecSelfEvolveAgent:
             target_metrics=metrics_str,
             source_code_context=source_code_ctx,
         )
+        
+        # ★ 添加当前轮次验证约束 (让 Coder 也知道哪些方向被数据确认/反驳)
+        if verification_ctx:
+            coder_prompt += verification_ctx
         
         coder_response = self.llm.chat(
             messages=[
@@ -4896,6 +5051,11 @@ class RecSelfEvolveAgent:
             surprise_info = f"\n\n## 惊喜评估结果\n```json\n{json.dumps(self._last_surprise_report.get('evaluation_report_summary', {}), indent=2, ensure_ascii=False)[:800]}\n```"
             prompt += surprise_info
         
+        # ★ 添加当前轮次验证结果 (让重新提案也参考已确认/反驳的假设)
+        verification_ctx = self._build_current_verification_context()
+        if verification_ctx:
+            prompt += verification_ctx
+        
         strategy_instruction = self._get_strategy_instruction()
         if strategy_instruction:
             prompt += f"\n\n## 当前探索策略\n{strategy_instruction}"
@@ -5383,6 +5543,67 @@ class RecSelfEvolveAgent:
             "focused": "当前策略: 问题驱动 — 仔细观察实验数据中的短板并针对性地改进",
         }
         return instructions.get(self.current_strategy, "")
+
+    def _build_current_verification_context(self) -> str:
+        """
+        构建当前轮次的假设验证上下文 — 让 LLM 在制定修改策略时参考本轮已验证/反驳的假设
+        
+        注意: 只使用当前轮次的验证结果, 不累积历史轮次。
+        因为每轮迭代模型都会被修改, 之前轮次对旧模型的验证结论已不再适用于当前模型。
+        
+        核心逻辑:
+        - 已确认(CONFIRMED)的假设 → 是当前模型的可靠发现, 应基于这些方向继续改进
+        - 已反驳(REFUTED)的假设 → 已被数据证明是错误的, 不应基于这些方向提出改进方案
+        
+        Returns:
+            格式化的文本, 可直接注入到 LLM prompt 中
+        """
+        if not self._last_verification_report:
+            return ""
+        
+        report = self._last_verification_report
+        
+        confirmed = [r.get("claim", "") for r in report.get("confirmed", [])]
+        partially_confirmed = [r.get("claim", "") for r in report.get("partially_confirmed", [])]
+        refuted = [r.get("claim", "") for r in report.get("refuted", [])]
+        
+        if not confirmed and not refuted and not partially_confirmed:
+            return ""
+        
+        # ── 构建上下文文本 ──
+        context = """
+## 🔬 当前轮次假设验证结果 (数据对 LLM 分析结论的验证)
+> 以下结论已通过实际数据验证, 在制定改进策略时必须参考:
+- ✅ **已确认**的结论是可靠发现 → 应基于这些方向继续改进
+- ❌ **已反驳**的结论已被数据证明错误 → 不应基于这些方向提出改进方案
+- ⚠️ **部分确认**的结论有一定依据但不够全面 → 可谨慎参考
+
+"""
+        if confirmed:
+            context += f"**✅ 已确认的可靠发现 ({len(confirmed)} 个)**:\n"
+            for claim in confirmed:
+                context += f"- ✅ {claim}\n"
+            context += "\n> 💡 **改进策略指引**: 基于这些已确认的发现, 你应该优先在这些方向继续深入改进。\n\n"
+        
+        if partially_confirmed:
+            context += f"**⚠️ 部分确认的发现 ({len(partially_confirmed)} 个)**:\n"
+            for claim in partially_confirmed:
+                context += f"- ⚠️ {claim}\n"
+            context += "\n"
+        
+        if refuted:
+            context += f"**❌ 已被数据反驳的错误结论 ({len(refuted)} 个)**:\n"
+            for claim in refuted:
+                context += f"- ❌ {claim}\n"
+            context += "\n> ⛔ **改进策略约束**: 不要基于以上已被反驳的结论提出改进方案, 这些方向已被数据证明无效。\n\n"
+        
+        # ── 综合可信度 ──
+        credibility = report.get("overall_credibility", "LOW")
+        confirmed_pct = report.get("confirmed_pct", 0)
+        refuted_pct = report.get("refuted_pct", 0)
+        context += f"综合可信度: {credibility} (确认{confirmed_pct:.0f}%, 反驳{refuted_pct:.0f}%)\n"
+        
+        return context
 
     def _get_temperature(self) -> float:
         temps = {"balanced": 0.7, "aggressive": 0.9,

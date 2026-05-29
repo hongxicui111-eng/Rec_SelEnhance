@@ -483,6 +483,7 @@ class ScriptExecutor:
         script_dir: str = None,
         code_query_tool = None,
         fix_context: Dict = None,
+        data_samples: str = "",
     ) -> Tuple[Optional[Dict], Optional[str]]:
         """
         执行验证代码, 如果失败则修正重试
@@ -553,13 +554,18 @@ class ScriptExecutor:
                     if code_query_tool is not None and fix_context is not None:
                         # ── Query-Based 修正: LLM 先查源码再修正 ──
                         logger.info(f"Using query-based fix mode for {hypothesis_id}")
+                        # 构建含数据样本的 extra_context
+                        query_fix_context_parts = [data_info]
+                        if data_samples and data_samples != "无可用数据样本 (项目数据目录中未找到数据文件)":
+                            query_fix_context_parts.append(f"## ⚠️ 数据样本 (请严格按此格式解析数据!)\n{data_samples}")
+                        query_fix_extra_context = "\n\n".join(query_fix_context_parts)
                         fixed_core = self._query_based_fix_script(
                             code_query_tool=code_query_tool,
                             llm_retry_helper=llm_retry_helper,
                             error_output=error,
                             original_code=core_code,
                             fix_context=fix_context,
-                            extra_context=data_info,
+                            extra_context=query_fix_extra_context,
                         )
                     else:
                         # ── 传统盲修模式 ──
@@ -572,6 +578,7 @@ class ScriptExecutor:
                             error_output=error[:1500],
                             output_file_path=output_path,
                             data_info=data_info,
+                            data_samples=data_samples,
                         )
                         
                         fixed_response = llm_retry_helper.call_llm(

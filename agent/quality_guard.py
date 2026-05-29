@@ -19,15 +19,20 @@ class EvolutionQualityGuard:
     def __init__(self, window_size: int = 5,
                  degrade_threshold: float = 0.95,
                  plateau_threshold: float = 0.001,
-                 primary_metric: str = "ndcg@5"):
+                 primary_metric: str = "ndcg@5",
+                 severe_regression_ratio: float = 0.50,
+                 regression_vs_best_ratio: float = 0.80):
         self.window_size = window_size
         self.degrade_threshold = degrade_threshold
         self.plateau_threshold = plateau_threshold
         self.primary_metric = primary_metric
+        self.severe_regression_ratio = severe_regression_ratio  # 性能低于best的50% → 立即回滚
+        self.regression_vs_best_ratio = regression_vs_best_ratio  # 性能低于best的80% → 回滚
         self.history = []          # 指标历史
         self.best_index = -1       # 历史最优轮次
         self.best_metrics = {}     # 历史最优指标
         self.best_config = None    # 历史最优配置
+        self.baseline_metrics = {} # 第一轮基线指标 (用于 vs-baseline 比较)
 
     def update(self, iteration: int, metrics: dict, config: Optional[dict] = None):
         """
@@ -43,6 +48,11 @@ class EvolutionQualityGuard:
         entry = {"iteration": iteration, "metrics": metrics, "config": config}
         self.history.append(entry)
 
+        # ---- 记录基线指标 (第一轮) ----
+        if len(self.history) == 1 and metrics:
+            self.baseline_metrics = metrics
+            logger.info(f"Baseline recorded: {self._format_metrics(metrics)}")
+
         # ---- 更新最优 ----
         current_value = self._get_primary_value(metrics)
         best_value = self._get_primary_value(self.best_metrics)
@@ -55,7 +65,20 @@ class EvolutionQualityGuard:
             self.best_config = config
             logger.info(f"New best at iteration {iteration}: {self._format_metrics(metrics)}")
 
-        # ---- 需要足够历史才能做决策 ----
+        # ---- ★★★ 新增: 与最优指标的即时对比 (每轮都检查!) ★★★ ----
+        regression = self._check_regression_vs_best(iteration, metrics)
+        if regression:
+            logger.warning(f"Regression vs best detected: {regression['reason']}")
+            return {
+                "action": "REVERT_TO_BEST",
+                "reason": regression["reason"],
+                "best_iteration": self.best_index,
+                "best_metrics": self.best_metrics,
+                "regression_type": regression.get("type", "regression_vs_best"),
+                "regression_severity": regression.get("severity", "moderate"),
+            }
+
+        # ---- 原有: 连续退化检测 (保留作为补充) ----
         if len(self.history) < 3:
             return {"action": "CONTINUE"}
 
@@ -86,6 +109,74 @@ class EvolutionQualityGuard:
     # ════════════════════════════════════════
     # 内部检查
     # ════════════════════════════════════════
+
+    def _check_regression_vs_best(self, iteration: int, metrics: dict) -> Optional[dict]:
+        """
+        ★★★ 新增: 每轮与历史最优指标即时对比 ★★★
+        
+        核心改进: 不再等待6轮历史才检测退化, 每轮都与 best_metrics 比较。
+        只要当前性能显著低于历史最优, 就立即触发 REVERT_TO_BEST。
+        
+        两级退化判定:
+        - severe_regression: 当前性能 < best × severe_regression_ratio (默认50%)
+          → 立即回滚到最优状态
+        - moderate_regression: 当前性能 < best × regression_vs_best_ratio (默认80%)  
+          → 回滚到最优状态
+        
+        这样即使只有1轮历史, 只要性能暴跌82%也能立刻检测到并回滚!
+        """
+        current_value = self._get_primary_value(metrics)
+        best_value = self._get_primary_value(self.best_metrics)
+
+        # 如果没有最优值或当前值为空, 无法比较
+        if current_value is None or best_value is None:
+            return None
+
+        # 如果本轮就是最优, 无退化
+        if iteration == self.best_index:
+            return None
+
+        # 性能为0 → 立即回滚 (训练失败的特殊情况)
+        if current_value <= 0:
+            return {
+                "type": "zero_metric",
+                "severity": "severe",
+                "reason": f"性能归零: 当前值 {current_value} vs 最优 {best_value:.4f} (iter {self.best_index})",
+                "current_value": current_value,
+                "best_value": best_value,
+                "drop_pct": 100.0,
+            }
+
+        # 计算退化比例
+        ratio = current_value / best_value
+
+        # 严重退化: 性能低于最优的 50%
+        if ratio < self.severe_regression_ratio:
+            drop_pct = (1 - ratio) * 100
+            return {
+                "type": "severe_regression_vs_best",
+                "severity": "severe",
+                "reason": f"严重退化: 当前 {current_value:.4f} 仅是最优 {best_value:.4f} (iter {self.best_index}) 的 {ratio*100:.1f}% (↓{drop_pct:.1f}%)",
+                "current_value": current_value,
+                "best_value": best_value,
+                "ratio": ratio,
+                "drop_pct": drop_pct,
+            }
+
+        # 中度退化: 性能低于最优的 80%
+        if ratio < self.regression_vs_best_ratio:
+            drop_pct = (1 - ratio) * 100
+            return {
+                "type": "moderate_regression_vs_best",
+                "severity": "moderate",
+                "reason": f"中度退化: 当前 {current_value:.4f} < 最优 {best_value:.4f} (iter {self.best_index}) × {self.regression_vs_best_ratio} (↓{drop_pct:.1f}%)",
+                "current_value": current_value,
+                "best_value": best_value,
+                "ratio": ratio,
+                "drop_pct": drop_pct,
+            }
+
+        return None
 
     def _check_degradation(self) -> Optional[dict]:
         """
