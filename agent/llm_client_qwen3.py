@@ -20,7 +20,8 @@ class LLMClient:
                  model: str = "Qwen2.5-72B-Instruct",
                  timeout: int = 120, max_retries: int = 3,
                  max_context_tokens: int = 32768,
-                 prompt_safety_ratio: float = 0.75):
+                 prompt_safety_ratio: float = 0.75,
+                 default_max_tokens: int = 4096):
         self.api_url = api_url.rstrip("/") + "/v1" if "/v1" not in api_url else api_url.rstrip("/")
         self.api_key = api_key
         self.model = model
@@ -28,6 +29,7 @@ class LLMClient:
         self.max_retries = max_retries
         self.max_context_tokens = max_context_tokens
         self.prompt_safety_ratio = max(0.1, min(prompt_safety_ratio, 0.95))
+        self.default_max_tokens = default_max_tokens
         self._client = None
 
     @property
@@ -143,14 +145,17 @@ class LLMClient:
         return fitted
 
     def chat(self, messages: list, temperature: float = 0.7,
-             max_tokens: int = 4096, suppress_response_log: bool = False) -> Optional[str]:
+             max_tokens: int = None, suppress_response_log: bool = False) -> Optional[str]:
         """
         调用 LLM 聊天接口, 带完整重试逻辑
         返回: 模型回复文本, 或 None (所有重试均失败)
         
         Args:
+            max_tokens: 最大输出 token 数 (None=使用 self.default_max_tokens)
             suppress_response_log: 如果为 True, 不输出响应日志 (用于代码生成等场景)
         """
+        if max_tokens is None:
+            max_tokens = self.default_max_tokens
         last_error = None
         messages = self._fit_messages_to_context(messages, max_tokens=max_tokens)
         est_tokens = self._estimate_messages_tokens(messages)
@@ -255,8 +260,8 @@ class LLMClient:
                     print(f"\n{'✗'*30} LLM ERROR: Context too long {'✗'*30}\n")
                     logger.error("Context too long, retry with more aggressive compression")
                     messages = self._fit_messages_to_context(messages, max_tokens=max_tokens)
-                    # 进一步降低输出长度，换取更多输入空间
-                    max_tokens = max(512, int(max_tokens * 0.8))
+                    # 降低输出长度，换取更多输入空间，但保底不低于 4096 以确保 JSON 输出不被截断
+                    max_tokens = max(4096, int(max_tokens * 0.8))
                     if attempt < self.max_retries:
                         continue
                     return None
@@ -283,18 +288,20 @@ class LLMClient:
         return None
 
     async def async_chat(self, prompt_or_messages, temperature: float = 0.7,
-                         max_tokens: int = 4096) -> Optional[str]:
+                         max_tokens: int = None) -> Optional[str]:
         """
         异步包装版本 — 支持传入字符串 prompt 或 messages 列表
         
         Args:
             prompt_or_messages: 字符串 prompt (会自动转为 messages 列表) 或 messages 列表
             temperature: 采样温度
-            max_tokens: 最大输出 token 数
+            max_tokens: 最大输出 token 数 (None=使用 self.default_max_tokens)
             
         Returns:
             模型回复文本, 或 None (所有重试均失败)
         """
+        if max_tokens is None:
+            max_tokens = self.default_max_tokens
         import asyncio
         
         # 如果传入字符串, 自动转为 messages 列表

@@ -32,6 +32,8 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("rec_self_evolve.hypothesis_verifier")
 
+from .llm_utils import LLMRetryHelper, parse_json_from_response
+
 
 # ════════════════════════════════════════
 # 假设提取 Prompt
@@ -121,6 +123,7 @@ class HypothesisVerifier:
         """
         self.llm = llm_client
         self.item_text_map = item_text_map or {}
+        self.llm_retry = LLMRetryHelper(llm_client)
     
     # ════════════════════════════════════════
     # Phase 1: 假设提取
@@ -140,47 +143,40 @@ class HypothesisVerifier:
             logger.warning("Cannot extract hypotheses from invalid LLM analysis")
             return None
         
-        # 构建 prompt
+        # 构建 prompt — 传递完整分析 JSON, 不截断
+        # (截断会丢失 structural_change_detail 等关键信息，导致假设提取不完整;
+        #  LLMClient._fit_messages_to_context 会自动处理超长上下文)
         analysis_json = json.dumps(llm_analysis, indent=2, ensure_ascii=False)
-        # 截断过长的 JSON (避免超 token)
-        if len(analysis_json) > 6000:
-            # 保留关键字段, 截断 improvement_suggestions
-            truncated = dict(llm_analysis)
-            suggestions = truncated.get("improvement_suggestions", [])
-            if suggestions:
-                truncated["improvement_suggestions"] = [
-                    {k: v for k, v in s.items() if k != "structural_change_detail"}
-                    for s in suggestions[:3]
-                ]
-            analysis_json = json.dumps(truncated, indent=2, ensure_ascii=False)
         
         prompt = HYPOTHESIS_EXTRACTION_PROMPT.format(
             llm_analysis_json=analysis_json,
         )
         
-        response = self.llm.chat(
-            messages=[
-                {"role": "system", "content": (
-                    "你是一位严谨的数据科学家，擅长从分析结论中识别可验证的假设。"
-                    "你的目标是区分LLM的有数据支撑的结论和可能的主观臆断。"
-                    "每个假设必须是可以用数据统计来验证的。"
-                )},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,  # 低温度 → 更精确的假设提取
-            max_tokens=2048,
+        system_content = (
+            "你是一位严谨的数据科学家，擅长从分析结论中识别可验证的假设。"
+            "你的目标是区分LLM的有数据支撑的结论和可能的主观臆断。"
+            "每个假设必须是可以用数据统计来验证的。"
         )
         
-        if response is None:
-            logger.error("Hypothesis extraction failed - no LLM response")
-            return None
+        # 使用 LLMRetryHelper: LLM 调用 + 健壮解析 + JSON 格式失败自动重试
+        parsed = self.llm_retry.call_and_parse_with_retry(
+            prompt=prompt,
+            system_content=system_content,
+            temperature=0.3,  # 低温度 → 更精确的假设提取
+            max_retries=2,
+            additional_instructions=(
+                "5. 保持 JSON 结构包含: "
+                "{ \"hypotheses\": [{ \"id\": \"H1\", \"claim\": \"...\", "
+                "\"verification_method\": \"...\", \"expected_result\": \"...\", "
+                "\"source_field\": \"...\" }], \"summary\": \"...\" }"
+            ),
+        )
         
-        # 解析假设列表
-        parsed = self._parse_hypothesis_response(response)
         if parsed and parsed.get("hypotheses"):
             logger.info(f"Extracted {len(parsed['hypotheses'])} verifiable hypotheses")
             return parsed["hypotheses"]
         
+        logger.warning("Hypothesis extraction failed - all retries exhausted")
         return None
     
     # ════════════════════════════════════════
@@ -1054,17 +1050,15 @@ class HypothesisVerifier:
         return ""
     
     def _parse_hypothesis_response(self, response: str) -> Optional[Dict]:
-        """解析 LLM 假设提取回复 (增强版 — 多策略健壮解析 + 结构验证)"""
-        import re
+        """解析 LLM 假设提取回复 (使用 llm_utils 的健壮解析器)
         
-        # 提取 JSON block
-        json_str = self._extract_json_block(response)
-        if json_str is None:
-            logger.warning("Cannot extract JSON from hypothesis extraction response")
-            return None
+        注意: extract_hypotheses() 已改用 LLMRetryHelper.call_and_parse_with_retry()
+        完成调用+解析+重试。此方法作为备用解析工具保留。
         
-        # 健壮解析
-        parsed = self._robust_json_parse(json_str)
+        改进: 使用 parse_json_from_response (5策略健壮解析) 替代原来的
+        _robust_json_parse (也是5策略，但此处代码是重复实现)。
+        """
+        parsed = parse_json_from_response(response)
         if parsed is not None:
             validated = self._validate_hypotheses_structure(parsed)
             if validated is not None:
@@ -1075,86 +1069,21 @@ class HypothesisVerifier:
         
         return None
     
+    # NOTE: _extract_json_block 和 _robust_json_parse 已合并到 llm_utils.py 的
+    # parse_json_from_response (extract_json_block + robust_json_parse, 5策略)
+    # 此处保留为向后兼容的简单委托方法
+    
     @staticmethod
     def _extract_json_block(response: str) -> Optional[str]:
-        """从 LLM 回复中提取 JSON block"""
-        import re
-        
-        json_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', response, re.DOTALL)
-        if json_match:
-            return json_match.group(1)
-        
-        start = response.find('{')
-        end = response.rfind('}')
-        if start >= 0 and end > start:
-            return response[start:end + 1]
-        
-        return None
+        """从 LLM 回复中提取 JSON block (委托到 llm_utils)"""
+        from .llm_utils import extract_json_block
+        return extract_json_block(response)
     
     @staticmethod
     def _robust_json_parse(json_str: str) -> Optional[Dict]:
-        """
-        多策略 JSON 解析, 带模糊修复
-        
-        Strategy 1: 标准 json.loads
-        Strategy 2: ast.literal_eval
-        Strategy 3: 修复常见格式问题后重试
-        Strategy 4: 修复缺失引号的键
-        """
-        # --- Strategy 1: 标准解析 ---
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
-            pass
-        
-        # --- Strategy 2: Python literal ---
-        try:
-            import ast
-            parsed = ast.literal_eval(json_str)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-        
-        # --- Strategy 3: 修复常见 JSON 格式问题 ---
-        fixed = json_str
-        
-        # 移除注释
-        fixed = re.sub(r'//[^\n]*', '', fixed)
-        fixed = re.sub(r'/\*.*?\*/', '', fixed, flags=re.DOTALL)
-        
-        # 移除尾随逗号
-        fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
-        
-        # Python 字面量 → JSON 字面量
-        fixed = fixed.replace(': None', ': null')
-        fixed = fixed.replace(': True', ': true')
-        fixed = fixed.replace(': False', ': false')
-        
-        try:
-            return json.loads(fixed)
-        except json.JSONDecodeError:
-            pass
-        
-        # --- Strategy 4: 修复缺失引号的键 ---
-        fixed2 = re.sub(
-            r'(?<![:"\w])([a-zA-Z_][a-zA-Z0-9_]*)\s*:',
-            r'"\1":',
-            fixed
-        )
-        try:
-            return json.loads(fixed2)
-        except json.JSONDecodeError:
-            pass
-        
-        # --- Strategy 5: 单引号 → 双引号 ---
-        fixed3 = fixed2.replace("'", '"')
-        try:
-            return json.loads(fixed3)
-        except json.JSONDecodeError:
-            pass
-        
-        return None
+        """多策略 JSON 解析 (委托到 llm_utils, 5策略+模糊修复)"""
+        from .llm_utils import robust_json_parse
+        return robust_json_parse(json_str)
     
     @staticmethod
     def _validate_hypotheses_structure(parsed: Dict) -> Optional[Dict]:

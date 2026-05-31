@@ -16,7 +16,9 @@ class AgentConfig:
     llm_timeout: int = 120
     llm_max_retries: int = 3
     llm_temperature: float = 0.7
-    llm_max_tokens: int = 8192
+    llm_output_tokens: int = 32768           # LLM 单次输出的最大 token 数 (统一超参)
+                                             # 对于 thinking/推理模型，需要同时容纳 think chain + 最终回答，
+                                             # 推荐 ≥ 16384；纯指令模型可设为 4096-8192
     llm_max_context_tokens: int = 32000       # LLM 最大上下文 token 数
     llm_prompt_safety_ratio: float = 0.85      # prompt 占上下文比例的安全阈值
 

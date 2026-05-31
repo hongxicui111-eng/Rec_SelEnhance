@@ -17,6 +17,8 @@ import logging
 import random
 from typing import Dict, List, Optional
 
+from .llm_utils import LLMRetryHelper, parse_json_from_response
+
 logger = logging.getLogger("rec_self_evolve.llm_analyzer")
 
 
@@ -236,10 +238,11 @@ class LLMCaseAnalyzer:
         """
         Args:
             llm_client: LLMClient 实例 (来自 agent.llm_client)
-            item_text_map: 物品 ID → 元数据 dict (id_meta_data.json 格式) 或 flat str 映射
+            item_text_map: 物品 ID → 元数据 dict (id_meta-data.json 格式) 或 flat str 映射
         """
         self.llm = llm_client
         self.item_text_map = item_text_map or {}
+        self.llm_retry = LLMRetryHelper(llm_client)
 
     def item_id_to_text(self, item_id: int) -> str:
         """将物品 ID 转化为文本描述，支持 id_meta_data.json 的 nested dict 格式"""
@@ -373,27 +376,37 @@ class LLMCaseAnalyzer:
             source_code_summary=source_code_summary or "SASRec: models.py (SRModel, SASRec) + modules.py (SelfAttention, Intermediate, Encoder, EncoderLayer) + trainers.py",
         )
         
-        # 调用 LLM
-        response = self.llm.chat(
-            messages=[
-                {"role": "system", "content": (
-                    "你是一位严谨的推荐系统算法专家，擅长从错误案例中推理模型瓶颈。"
-                    "你不仅分析指标问题，更重要的是能识别出模型架构层面的根本瓶颈，"
-                    "并提出具体的代码结构修改方案 (不仅仅是调参数)。"
-                )},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.7,
-            max_tokens=4096,
+        system_content = (
+            "你是一位严谨的推荐系统算法专家，擅长从错误案例中推理模型瓶颈。"
+            "你不仅分析指标问题，更重要的是能识别出模型架构层面的根本瓶颈，"
+            "并提出具体的代码结构修改方案 (不仅仅是调参数)。"
         )
         
-        if response is None:
-            logger.error("LLM case analysis failed - no response")
-            return None
+        # 使用 LLMRetryHelper: LLM 调用 + 健壮解析 + JSON 格式失败自动重试
+        result = self.llm_retry.call_and_parse_with_retry(
+            prompt=prompt,
+            system_content=system_content,
+            temperature=0.7,
+            max_retries=2,
+            additional_instructions=(
+                "5. 保持 JSON 结构包含以下字段: "
+                "error_patterns, model_bottleneck, surprise_failure_reasons, "
+                "improvement_suggestions (每个包含 priority, action_type, description, "
+                "param_changes, structural_change_detail, expected_effect, risk), "
+                "summary"
+            ),
+        )
         
-        # 解析 LLM 的回复
-        parsed = self._parse_llm_response(response)
-        return parsed
+        if result is None:
+            logger.error("LLM case analysis failed - all retries exhausted")
+            return {
+                "raw_response": "",
+                "parse_success": False,
+                "parse_error": "All LLM retries exhausted (robust_parse + 2 LLM fix retries)",
+            }
+        
+        result["parse_success"] = True
+        return result
 
     def analyze_surprise_optimization(self, overall_metrics: Dict,
                                        surprise_metrics: Dict,
@@ -421,76 +434,52 @@ class LLMCaseAnalyzer:
             source_code_summary=source_code_summary or "SASRec: models.py (SRModel, SASRec) + modules.py (SelfAttention, Intermediate, Encoder, EncoderLayer) + trainers.py",
         )
         
-        response = self.llm.chat(
-            messages=[
-                {"role": "system", "content": "你是一位推荐系统专家，专注于惊喜性(Serendipity)研究。"},
-                {"role": "user", "content": prompt},
-            ],
+        response = self.llm_retry.call_and_parse_with_retry(
+            prompt=prompt,
+            system_content="你是一位推荐系统专家，专注于惊喜性(Serendipity)研究。",
             temperature=0.7,
-            max_tokens=4096,
+            max_retries=2,
+            additional_instructions=(
+                "5. 保持 JSON 结构包含以下字段: "
+                "surprise_patterns, surprise_bottleneck, optimization_suggestions, "
+                "summary"
+            ),
         )
         
         if response is None:
-            logger.error("LLM surprise analysis failed - no response")
-            return None
+            logger.error("LLM surprise analysis failed - all retries exhausted")
+            return {
+                "raw_response": "",
+                "parse_success": False,
+                "parse_error": "All LLM retries exhausted (robust_parse + 2 LLM fix retries)",
+            }
         
-        return self._parse_llm_response(response)
+        response["parse_success"] = True
+        return response
 
     def _parse_llm_response(self, response: str) -> Optional[Dict]:
         """
-        解析 LLM 的回复为结构化 JSON
+        解析 LLM 的回复为结构化 JSON (使用 llm_utils 的健壮解析器)
         
-        支持多种格式:
-        1. 完整 JSON (被 markdown code block 包裹)
-        2. 纯 JSON 字串
-        3. 自然语言 + JSON 混合
+        注意: 主要的分析方法 (analyze_wrong_cases, analyze_surprise_optimization)
+        已改用 LLMRetryHelper.call_and_parse_with_retry() 完成调用+解析+重试。
+        此方法作为备用/直接调用场景的解析工具保留。
+        
+        改进: 使用 parse_json_from_response (5策略健壮解析) 替代原来的
+        json.loads + ast.literal_eval 两策略解析。
         """
-        import re
-        
-        # 尝试提取 JSON code block
-        json_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', response, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(1)
-        else:
-            # 尝试找最外层的 {...}
-            start = response.find('{')
-            end = response.rfind('}')
-            if start >= 0 and end > start:
-                json_str = response[start:end + 1]
-            else:
-                print(f"\n  ⚠ [LLM_ANALYZER PARSE] Cannot extract JSON from LLM response")
-                print(f"     Response : {response}")
-                logger.warning(f"Cannot extract JSON from LLM response")
-                # 保存原始回复供参考
-                return {
-                    "raw_response": response,
-                    "parse_success": False,
-                }
-        
-        try:
-            parsed = json.loads(json_str)
+        parsed = parse_json_from_response(response)
+        if parsed is not None:
             parsed["parse_success"] = True
             return parsed
-        except json.JSONDecodeError as e:
-            print(f"\n  ⚠ [LLM_ANALYZER PARSE] JSON decode failed: {e}")
-            print(f"     Extracted JSON string first 200 chars: {json_str[:200]}")
-            logger.warning(f"JSON parse error: {e}")
-            # 尝试宽松解析
-            try:
-                import ast
-                parsed = ast.literal_eval(json_str)
-                if isinstance(parsed, dict):
-                    parsed["parse_success"] = True
-                    return parsed
-            except Exception:
-                pass
-            
-            return {
-                "raw_response": response,
-                "json_str": json_str,
-                "parse_success": False,
-                "parse_error": str(e),
-            }
+        
+        # 无法提取 JSON block
+        logger.warning(f"Cannot parse LLM response with robust parser")
+        return {
+            "raw_response": response,
+            "parse_success": False,
+            "parse_error": "All 5 robust parsing strategies failed",
+        }
 
     def _compute_gap_percentage(self, overall: Dict, surprise: Dict) -> str:
         """计算惊喜子集与整体的差距百分比"""

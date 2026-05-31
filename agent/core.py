@@ -82,6 +82,7 @@ class RecSelfEvolveAgent:
             max_retries=self.config.llm_max_retries,
             max_context_tokens=self.config.llm_max_context_tokens,
             prompt_safety_ratio=self.config.llm_prompt_safety_ratio,
+            default_max_tokens=self.config.llm_output_tokens,
         )
         self.trainer = FaultTolerantTrainRunner(
             adapter=self.adapter,
@@ -170,6 +171,7 @@ class RecSelfEvolveAgent:
                 max_reflection_times=self.config.max_reflection_rounds,
                 timeout=self.config.llm_timeout,
                 max_retries=self.config.llm_max_retries,
+                default_max_tokens=self.config.llm_output_tokens,
             )
             self._coder_agent = CoderAgent(
                 api_url=self.config.llm_api_url,
@@ -179,6 +181,7 @@ class RecSelfEvolveAgent:
                 max_reflection_times=self.config.max_reflection_rounds,
                 timeout=self.config.llm_timeout,
                 max_retries=self.config.llm_max_retries,
+                default_max_tokens=self.config.llm_output_tokens,
             )
             # Debugger 使用独立 LLM 调用 (温度更低, 更精确)
             self._debugger_llm = LLMClient(
@@ -189,6 +192,7 @@ class RecSelfEvolveAgent:
                 max_retries=self.config.llm_max_retries,
                 max_context_tokens=self.config.llm_max_context_tokens,
                 prompt_safety_ratio=self.config.llm_prompt_safety_ratio,
+                default_max_tokens=self.config.llm_output_tokens,
             )
             logger.info("Multi-role workflow enabled: Planner→Researcher→Coder→Debugger")
 
@@ -933,7 +937,7 @@ class RecSelfEvolveAgent:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=temperature,
-                max_tokens=self.config.llm_max_tokens,
+                max_tokens=self.config.llm_output_tokens,
             )
             
             if response is None:
@@ -1067,7 +1071,7 @@ class RecSelfEvolveAgent:
                 {"role": "user", "content": final_prompt},
             ],
             temperature=temperature,
-            max_tokens=self.config.llm_max_tokens,
+            max_tokens=self.config.llm_output_tokens,
         )
         
         if response is None:
@@ -1173,7 +1177,7 @@ class RecSelfEvolveAgent:
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.2,
-                    max_tokens=self.config.llm_max_tokens,
+                    max_tokens=self.config.llm_output_tokens,
                     suppress_response_log=True,  # 代码响应不输出到日志
                 )
                 
@@ -1683,7 +1687,7 @@ class RecSelfEvolveAgent:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.2,  # 代码修复用极低温度
-                max_tokens=self.config.llm_max_tokens,
+                max_tokens=self.config.llm_output_tokens,
                 suppress_response_log=True,  # 代码响应不输出到日志
             )
             
@@ -1930,7 +1934,7 @@ class RecSelfEvolveAgent:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.2,
-                max_tokens=self.config.llm_max_tokens,
+                max_tokens=self.config.llm_output_tokens,
                 suppress_response_log=True,  # 代码响应不输出到日志
             )
             
@@ -2085,7 +2089,7 @@ class RecSelfEvolveAgent:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
-            max_tokens=self.config.llm_max_tokens,
+            max_tokens=self.config.llm_output_tokens,
             suppress_response_log=True,  # 代码响应不输出到日志
         )
         
@@ -2206,7 +2210,7 @@ class RecSelfEvolveAgent:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
-            max_tokens=2048,
+
         )
         
         if response is None:
@@ -2875,7 +2879,7 @@ class RecSelfEvolveAgent:
                 {"role": "user", "content": prompt},
             ],
             temperature=self._get_temperature(),
-            max_tokens=self.config.llm_max_tokens,
+            max_tokens=self.config.llm_output_tokens,
         )
 
         if response is None:
@@ -3050,7 +3054,7 @@ class RecSelfEvolveAgent:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=self._get_temperature(),
-                max_tokens=self.config.llm_max_tokens,
+                max_tokens=self.config.llm_output_tokens,
             )
             
             if response is None:
@@ -3192,7 +3196,7 @@ class RecSelfEvolveAgent:
                 {"role": "user", "content": final_prompt},
             ],
             temperature=self._get_temperature(),
-            max_tokens=self.config.llm_max_tokens,
+            max_tokens=self.config.llm_output_tokens,
         )
         
         if final_response is None:
@@ -3397,7 +3401,7 @@ class RecSelfEvolveAgent:
                 {"role": "user", "content": planner_prompt},
             ],
             temperature=self.config.planner_temperature,
-            max_tokens=self.config.llm_max_tokens,
+            max_tokens=self.config.llm_output_tokens,
         )
         
         if planner_response is None:
@@ -3440,7 +3444,7 @@ class RecSelfEvolveAgent:
                 {"role": "user", "content": researcher_prompt},
             ],
             temperature=self.config.researcher_temperature,
-            max_tokens=self.config.llm_max_tokens,
+            max_tokens=self.config.llm_output_tokens,
         )
         
         if researcher_response is None:
@@ -3454,7 +3458,13 @@ class RecSelfEvolveAgent:
         
         # 提取推荐方案
         recommended = researcher_result.get("recommended_solution", {})
-        chosen_solution = recommended.get("choice", primary_direction)
+        # 防御性检查: LLM 输出可能使 recommended_solution 成为 set/list 等非 dict 类型
+        if not isinstance(recommended, dict):
+            logger.warning(f"recommended_solution is {type(recommended).__name__}, expected dict — "
+                           f"falling back to primary_direction")
+            chosen_solution = primary_direction
+        else:
+            chosen_solution = recommended.get("choice", primary_direction)
         proposed_solutions = researcher_result.get("proposed_solutions", [])
         
         # 选择推荐方案或第一个方案
@@ -3489,7 +3499,7 @@ class RecSelfEvolveAgent:
                     {"role": "user", "content": reflection_prompt},
                 ],
                 temperature=self.config.planner_temperature,
-                max_tokens=self.config.llm_max_tokens,
+                max_tokens=self.config.llm_output_tokens,
             )
             
             if reflection_response:
@@ -3530,7 +3540,7 @@ class RecSelfEvolveAgent:
                 {"role": "user", "content": coder_prompt},
             ],
             temperature=self.config.coder_temperature,
-            max_tokens=self.config.llm_max_tokens,
+            max_tokens=self.config.llm_output_tokens,
         )
         
         if coder_response is None:
@@ -3562,7 +3572,7 @@ class RecSelfEvolveAgent:
                     {"role": "user", "content": debugger_prompt},
                 ],
                 temperature=self.config.debugger_temperature,
-                max_tokens=self.config.llm_max_tokens,
+                max_tokens=self.config.llm_output_tokens,
             )
             
             if debugger_response:
@@ -4456,7 +4466,7 @@ class RecSelfEvolveAgent:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.3,  # 自纠错时使用低温度，确保精确性
-                max_tokens=self.config.llm_max_tokens,
+                max_tokens=self.config.llm_output_tokens,
                 suppress_response_log=True,  # 代码响应不输出到日志
             )
             
@@ -4676,7 +4686,7 @@ class RecSelfEvolveAgent:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.2,  # 代码修正使用极低温度，确保精确性
-                max_tokens=self.config.llm_max_tokens,
+                max_tokens=self.config.llm_output_tokens,
                 suppress_response_log=True,  # 代码响应不输出到日志
             )
             
@@ -4832,7 +4842,7 @@ class RecSelfEvolveAgent:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.1,  # 极低温度, 确保精确复制源码
-                max_tokens=self.config.llm_max_tokens,
+                max_tokens=self.config.llm_output_tokens,
             )
             
             if response is None:
@@ -5073,7 +5083,7 @@ class RecSelfEvolveAgent:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.7,  # 较高温度鼓励提出不同的方案
-            max_tokens=self.config.llm_max_tokens,
+            max_tokens=self.config.llm_output_tokens,
         )
         
         if response is None:
@@ -5458,7 +5468,7 @@ class RecSelfEvolveAgent:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.2,
-                max_tokens=2048,
+
             )
             
             if response is None:

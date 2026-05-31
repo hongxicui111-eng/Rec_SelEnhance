@@ -591,7 +591,7 @@ class ScriptExecutor:
                                 "使用 json.load(open(DATA_FILE)) 加载可用数据。"
                             ),
                             temperature=0.1,
-                            max_tokens=4096,
+
                         )
                         
                         if fixed_response is None:
@@ -704,7 +704,7 @@ class ScriptExecutor:
                 prompt=prompt,
                 system_content=system_prompt,
                 temperature=0.1,
-                max_tokens=4096,
+
             )
             
             if response is None:
@@ -773,7 +773,7 @@ class ScriptExecutor:
             prompt=final_prompt,
             system_content=system_prompt,
             temperature=0.1,
-            max_tokens=4096,
+
         )
         
         if response is None:

@@ -9,6 +9,8 @@ import json
 import logging
 from typing import Optional
 
+from .llm_utils import parse_json_from_response
+
 logger = logging.getLogger("rec_self_evolve.error_handler")
 
 
@@ -299,7 +301,7 @@ class LLMFixer:
         print(f"\n  🔁 [LLMFixer] Asking LLM to fix format (reason: {error_reason})")
         result = self.llm.chat([
             {"role": "user", "content": prompt}
-        ], temperature=0.1, max_tokens=4096)
+        ], temperature=0.1)
         if result is None:
             print(f"  ✗ [LLMFixer] LLM format fix call failed, returning original output")
             logger.warning("LLMFixer: LLM format fix call failed")

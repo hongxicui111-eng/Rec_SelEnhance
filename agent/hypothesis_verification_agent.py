@@ -211,7 +211,6 @@ class HypothesisVerificationAgent:
                 "不要局限于固定验证类型，任何可以用数据回答的问题都是可验证假设。"
             ),
             temperature=0.3,
-            max_tokens=2048,
         )
         if response is None:
             logger.error("Hypothesis extraction failed - no LLM response")
@@ -305,7 +304,6 @@ class HypothesisVerificationAgent:
                     "请重新输出，确保是严格合法的 JSON 格式。"
                 ),
                 temperature=0.2,
-                max_tokens=2048,
             )
             
             if response is None:
@@ -516,7 +514,6 @@ class HypothesisVerificationAgent:
                 "然后选出最容易验证的假设。"
             ),
             temperature=0.3,
-            max_tokens=2048,
             max_retries=2,
             validate_func=_validate_selection,
         )
@@ -872,7 +869,6 @@ class HypothesisVerificationAgent:
                 "如果某些数据不可用，方案应该说明替代方法。"
             ),
             temperature=0.3,
-            max_tokens=2048,
             max_retries=2,
             additional_instructions=(
                 "输出格式必须包含: verification_plan 对象 "
@@ -1039,7 +1035,6 @@ class HypothesisVerificationAgent:
                 prompt=prompt + (f"\n\n## 上一次尝试的问题\n{last_error}" if last_error else ""),
                 system_content=system_content,
                 temperature=0.2 if attempt == 0 else 0.3,
-                max_tokens=4096,
                 suppress_response_log=True,  # 代码响应不输出到日志
             )
             
@@ -1403,7 +1398,6 @@ class HypothesisVerificationAgent:
                 "请仔细分析验证方案，确定需要哪些数据，并检查这些数据是否可用。"
             ),
             temperature=0.3,
-            max_tokens=2048,
             max_retries=2,
             validate_func=_validate_analysis,
         )
@@ -1509,7 +1503,6 @@ class HypothesisVerificationAgent:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=temperature,
-                max_tokens=4096,
             )
             
             if response is None:
@@ -1599,7 +1592,6 @@ class HypothesisVerificationAgent:
                 {"role": "user", "content": final_prompt},
             ],
             temperature=temperature,
-            max_tokens=4096,
         )
         
         if response is None:
@@ -2084,7 +2076,6 @@ class HypothesisVerificationAgent:
                 "不要直接生成代码，只规划获取步骤。"
             ),
             temperature=0.3,
-            max_tokens=2048,
             max_retries=2,
             validate_func=_validate_strategy,
         )
@@ -2189,7 +2180,6 @@ class HypothesisVerificationAgent:
                 "确保使用 save_result() 将结果保存到 JSON 文件。"
             ),
             temperature=0.2,
-            max_tokens=4096,
             suppress_response_log=True,  # 代码响应不输出到日志
         )
         
@@ -2477,7 +2467,6 @@ class HypothesisVerificationAgent:
                 "判断基于数据，而非直觉。如果数据不支持假设, 就判为 REFUTED。"
             ),
             temperature=0.2,
-            max_tokens=1024,
             max_retries=2,
             additional_instructions=(
                 "输出格式必须包含: status (CONFIRMED|PARTIALLY_CONFIRMED|REFUTED|UNVERIFIABLE), "
@@ -2492,18 +2481,58 @@ class HypothesisVerificationAgent:
             parsed["method"] = "agent_autonomous"
             return parsed
         
-        # 重试耗尽 → 尝试从执行结果中提取部分状态
-        logger.warning(f"Result analysis failed for {hyp_id}, trying partial extraction")
+        # 重试耗尽 → 尝试从执行结果中提取已有的验证结论
+        logger.warning(f"Result analysis LLM parsing failed for {hyp_id}, trying extraction from execution result")
+        
+        # ── Fallback 1: 从执行结果中提取 verification_result 字段 ──
+        # 验证脚本可能已输出明确的结论 (如 "confirmed"/"refuted")
+        raw_verdict = execution_result.get("verification_result", "")
+        verdict_map = {
+            "confirmed": self.CONFIRMED,
+            "refuted": self.REFUTED,
+            "partially_confirmed": self.PARTIALLY_CONFIRMED,
+            "unverifiable": self.UNVERIFIABLE,
+            # 兼容大写
+            "CONFIRMED": self.CONFIRMED,
+            "REFUTED": self.REFUTED,
+            "PARTIALLY_CONFIRMED": self.PARTIALLY_CONFIRMED,
+            "UNVERIFIABLE": self.UNVERIFIABLE,
+        }
+        
+        if raw_verdict and isinstance(raw_verdict, str):
+            mapped_status = verdict_map.get(raw_verdict.lower().strip(), None)
+            if mapped_status:
+                logger.info(f"Extracted verification_result '{raw_verdict}' → mapped to '{mapped_status}' for {hyp_id}")
+                statistics = execution_result.get("statistics", execution_result)
+                conclusion = execution_result.get("conclusion", "")
+                interpretation = execution_result.get("interpretation", "")
+                brief_text = conclusion or interpretation or f"验证脚本判定: {raw_verdict}"
+                return {
+                    "status": mapped_status,
+                    "reason": f"LLM 二次分析格式失败, 但验证脚本已输出明确结论 '{raw_verdict}', 采用脚本结论",
+                    "brief": brief_text[:200] if brief_text else f"验证脚本判定: {raw_verdict}",
+                    "detailed_reasoning": interpretation or conclusion or f"验证脚本执行成功，输出结论为 {raw_verdict}",
+                    "evidence": statistics if isinstance(statistics, dict) else execution_result,
+                    "evidence_summary": {
+                        "key_statistic": "从验证脚本结果提取",
+                        "comparison": interpretation or "参见原始统计数据",
+                        "confidence": 0.7 if mapped_status == self.CONFIRMED else 0.6,
+                    },
+                    "method": "agent_autonomous_extracted",
+                }
+        
+        # ── Fallback 2: 有统计数据但无明确结论 → UNVERIFIABLE (保留原始数据) ──
         statistics = execution_result.get("statistics", execution_result)
         if isinstance(statistics, dict) and statistics:
             return {
                 "status": self.UNVERIFIABLE,
-                "reason": "LLM 分析结果格式错误, 但原始统计数据可用",
+                "reason": "LLM 分析结果格式错误, 且执行结果无明确验证结论",
                 "brief": "结果分析格式错误, 请查看原始统计数据",
                 "evidence": statistics,
                 "method": "agent_autonomous",
             }
         
+        # ── Fallback 3: 完全无可用数据 ──
         return {
             "status": self.UNVERIFIABLE,
             "reason": "LLM 分析结果解析失败 (重试耗尽)",
@@ -2568,7 +2597,6 @@ class HypothesisVerificationAgent:
                 "请给出具体可执行的调整建议，而不是泛泛而谈。"
             ),
             temperature=0.3,
-            max_tokens=1024,
             max_retries=1,
         )
         

@@ -25,6 +25,7 @@ from agent.llm_client import LLMClient
 from agent.prompts import (
     RESEARCHER_INSTRUCTIONS, SEARCH_INSTRUCTIONS, REFLECTION_INSTRUCTIONS,
 )
+from agent.llm_utils import parse_json_from_response, diagnose_json_error
 
 logger = logging.getLogger("rec_self_evolve.researcher")
 
@@ -88,6 +89,7 @@ class ResearcherAgent:
         search_time_bias: float = 0.5,
         timeout: int = 120,
         max_retries: int = 3,
+        default_max_tokens: int = 4096,
     ):
         self.model = model
         self.temperature = temperature
@@ -100,6 +102,7 @@ class ResearcherAgent:
             model=model,
             timeout=timeout,
             max_retries=max_retries,
+            default_max_tokens=default_max_tokens,
         )
         
         # 研究主题上下文
@@ -215,7 +218,7 @@ class ResearcherAgent:
             search_prompt += search_results_str
             
             try:
-                search_response = await self.llm_client.async_chat(search_prompt, temperature=0.5, max_tokens=1500)
+                search_response = await self.llm_client.async_chat(search_prompt, temperature=0.5)
                 # 解析搜索分析结果以提取更多关键词
                 search_analysis = self._parse_researcher_response(search_response)
                 if search_analysis and search_analysis.get("synthesis"):
@@ -307,7 +310,7 @@ class ResearcherAgent:
         if search_str:
             prompt += f"\n\n{search_str}"
         
-        response = await self.llm_client.async_chat(prompt, temperature=self.temperature, max_tokens=2000)
+        response = await self.llm_client.async_chat(prompt, temperature=self.temperature)
         try:
             result = self._parse_researcher_response(response)
             if result and result.get("proposed_solutions"):
@@ -376,7 +379,7 @@ class ResearcherAgent:
 ]
 ```"""
         
-        response = await self.llm_client.async_chat(fallback_prompt, temperature=self.temperature, max_tokens=2000)
+        response = await self.llm_client.async_chat(fallback_prompt, temperature=self.temperature)
         
         try:
             plans = self._parse_plans(response)
@@ -390,6 +393,9 @@ class ResearcherAgent:
         """
         解析 RESEARCHER_INSTRUCTIONS 的 JSON 输出格式
         
+        使用 llm_utils.parse_json_from_response (5策略健壮解析)
+        替代原来的多 pattern + json.loads 两策略解析
+        
         输出格式:
         {
           "problem_analysis": {...},
@@ -397,34 +403,37 @@ class ResearcherAgent:
           "recommended_solution": {...}
         }
         """
+        result = parse_json_from_response(response)
+        if result is not None:
+            return result
+        
+        # 降级: 尝试直接提取 {...} (parse_json_from_response 可能因格式过乱而失败)
         import re
-        
-        # 提取 JSON
-        json_patterns = [
-            r'```json\s*\n(.*?)```',
-            r'```(.*?)```',
-            r'\{.*\}',
-        ]
-        
-        for pattern in json_patterns:
-            match = re.search(pattern, response, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(1) if '```' in pattern else match.group(0))
-                except json.JSONDecodeError:
-                    continue
+        json_match = re.search(r'\{.*\}', response, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group())
+            except json.JSONDecodeError:
+                pass
         
         return None
         
     def _parse_plans(self, response: str) -> List[ResearchPlan]:
-        """解析研究计划"""
-        import re
+        """解析研究计划 (使用 llm_utils.parse_json_from_response)"""
+        result = parse_json_from_response(response)
+        if result and isinstance(result, list):
+            return [ResearchPlan(**item) for item in result]
         
-        # 尝试提取 JSON
+        # 降级: 尝试直接提取 [...] (parse_json_from_response 可能因格式过乱而失败)
+        import re
         json_match = re.search(r'\[.*\]', response, re.DOTALL)
         if json_match:
-            data = json.loads(json_match.group())
-            return [ResearchPlan(**item) for item in data]
+            try:
+                data = json.loads(json_match.group())
+                return [ResearchPlan(**item) for item in data]
+            except (json.JSONDecodeError, TypeError):
+                pass
+        
         return []
         
     async def _generate_report(
@@ -498,12 +507,10 @@ class ResearcherAgent:
 }}
 ```"""
         
-        response = await self.llm_client.async_chat(prompt, temperature=self.temperature, max_tokens=2000)
+        response = await self.llm_client.async_chat(prompt, temperature=self.temperature)
         try:
-            import re
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                idea_data = json.loads(json_match.group())
+            idea_data = parse_json_from_response(response)
+            if idea_data:
                 idea = IdeaData(**idea_data)
             else:
                 idea = IdeaData(
@@ -596,7 +603,7 @@ class ResearcherAgent:
         # 添加之前的报告内容
         prompt += f"\n\n## 之前的研究报告\n{report.markdown_report}"
         
-        response = await self.llm_client.async_chat(prompt, temperature=self.temperature, max_tokens=2000)
+        response = await self.llm_client.async_chat(prompt, temperature=self.temperature)
         try:
             reflection_result = self._parse_researcher_response(response)
             if reflection_result:
@@ -654,7 +661,7 @@ class ResearcherAgent:
 ]
 ```"""
         
-        response = await self.llm_client.async_chat(fallback_prompt, temperature=self.temperature, max_tokens=2000)
+        response = await self.llm_client.async_chat(fallback_prompt, temperature=self.temperature)
         
         try:
             plans = self._parse_plans(response)
@@ -690,13 +697,11 @@ class ResearcherAgent:
 }}
 ```"""
         
-        response = await self.llm_client.async_chat(prompt, temperature=self.temperature, max_tokens=2000)
+        response = await self.llm_client.async_chat(prompt, temperature=self.temperature)
         
         try:
-            import re
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                idea_data = json.loads(json_match.group())
+            idea_data = parse_json_from_response(response)
+            if idea_data:
                 return IdeaData(**idea_data)
         except Exception as e:
             logger.warning(f"Failed to parse paper: {e}")

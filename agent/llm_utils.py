@@ -27,6 +27,58 @@ logger = logging.getLogger("rec_self_evolve.llm_utils")
 
 
 # ════════════════════════════════════════
+# 思考模式前缀清理
+# ════════════════════════════════════════
+
+def _strip_thinking_prefix(response: str) -> str:
+    """
+    截断 thinking 模型的思考过程，只保留实际回复部分
+    
+    Thinking 模型（如 Qwen3/Qwen3.5）在思考模式下会首先输出一段思考内容，
+    以 </think> 标记结束思考块，之后才是实际回复。思考过程中可能包含 JSON
+    代码块等干扰内容，需要在 JSON 提取之前先截断。
+    
+    示例:
+        输入:
+            <think>
+            [思考过程...]
+            ```json
+            { "key": "value" }  ← 思考中的示例 JSON，非实际输出
+            ```
+            </think>
+            { "real_key": "real_value" }  ← 实际输出
+            
+        输出:
+            { "real_key": "real_value" }
+    
+    Args:
+        response: LLM 原始响应文本
+        
+    Returns:
+        如果检测到 </think> 标记，返回标记之后的内容；
+        否则返回原始响应（非 thinking 模式或没有 thinking 内容）
+    """
+    if not response:
+        return response
+    
+    # 匹配思考模型结束标记 </think>
+    # 思考模型的输出格式: <think>...思考内容...</think>\n实际回复
+    # 我们只需要找到 </think> 标记，截断之前的一切思考内容
+    match = re.search(r'</think>\s*', response)
+    if match:
+        end_pos = match.end()
+        result = response[end_pos:].strip()
+        if result:
+            logger.debug(
+                f"Stripped thinking prefix: {len(response)} chars → "
+                f"{len(result)} chars (</think> at pos {match.start()})"
+            )
+            return result
+    
+    return response
+
+
+# ════════════════════════════════════════
 # JSON 解析工具 (多策略健壮解析)
 # ════════════════════════════════════════
 
@@ -35,6 +87,7 @@ def extract_json_block(response: str) -> Optional[str]:
     从 LLM 回复中提取 JSON block
     
     策略:
+    0. 先截断 thinking 前缀 (思考模型的 `response` 标记之前的内容)
     1. 优先提取 markdown code block (```json ... ```)
     2. 回退: 找第一个 { 到最后 }
     
@@ -44,6 +97,9 @@ def extract_json_block(response: str) -> Optional[str]:
     Returns:
         JSON 字符串, 或 None
     """
+    # 截断思考模型前缀
+    response = _strip_thinking_prefix(response)
+    
     # 优先提取 markdown code block
     json_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', response, re.DOTALL)
     if json_match:
@@ -58,6 +114,27 @@ def extract_json_block(response: str) -> Optional[str]:
     return None
 
 
+def _normalize_ast_result(obj):
+    """
+    将 ast.literal_eval 的结果中的非 JSON 类型规范化:
+    - set → list (排序以保持稳定顺序)
+    - tuple → list
+    - 递归处理嵌套的 dict / list
+    
+    如果规范化后发现顶层是 set/tuple 而非 dict/list, 返回 None
+    """
+    if isinstance(obj, set):
+        return sorted(obj, key=str)
+    if isinstance(obj, tuple):
+        return list(obj)
+    if isinstance(obj, dict):
+        return {k: _normalize_ast_result(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_normalize_ast_result(item) for item in obj]
+    # 基本类型 (str, int, float, bool, None) — 直接返回
+    return obj
+
+
 def robust_json_parse(json_str: str) -> Optional[Dict]:
     """
     多策略 JSON 解析, 带模糊修复
@@ -67,6 +144,7 @@ def robust_json_parse(json_str: str) -> Optional[Dict]:
     Strategy 3: 修复常见格式问题后重试 (注释、尾随逗号、Python bool)
     Strategy 4: 修复缺失引号的键
     Strategy 5: 单引号→双引号
+    Strategy 6: 修复冒号后缺失引号的字符串值
     
     Args:
         json_str: 待解析的 JSON 字符串
@@ -84,7 +162,9 @@ def robust_json_parse(json_str: str) -> Optional[Dict]:
     try:
         parsed = ast.literal_eval(json_str)
         if isinstance(parsed, (dict, list)):
-            return parsed
+            parsed = _normalize_ast_result(parsed)
+            if parsed is not None:
+                return parsed
     except Exception:
         pass
     
@@ -126,7 +206,63 @@ def robust_json_parse(json_str: str) -> Optional[Dict]:
     except json.JSONDecodeError:
         pass
     
+    # --- Strategy 6: 修复冒号后缺失引号的字符串值 ---
+    # 常见 LLM 输出错误: "description":修改损失函数... (值缺少开头双引号)
+    fixed4 = _fix_unquoted_string_values(fixed3)
+    try:
+        return json.loads(fixed4)
+    except json.JSONDecodeError:
+        pass
+    
     return None
+
+
+def _fix_unquoted_string_values(text: str) -> str:
+    """
+    修复 JSON 字符串值缺少双引号的问题
+    
+    常见 LLM 输出错误模式:
+        "description":修改损失函数结构，从纯 InfoNCE 改为...
+    期望修复为:
+        "description": "修改损失函数结构，从纯 InfoNCE 改为..."
+    
+    算法:逐行扫描，当发现 "key": <裸值> 模式时，将裸值用双引号包裹。
+    裸值判定:冒号后的值不以合法 JSON 值起始字符开始。
+    合法 JSON 值起始字符: " { [ 数字 - t/f/n
+    
+    Args:
+        text: 待修复的 JSON 文本
+        
+    Returns:
+        修复后的文本
+    """
+    valid_value_starts = '"{[-tfnN'
+    
+    lines = text.split('\n')
+    fixed_lines = []
+    
+    for line in lines:
+        m = re.match(
+            r'^(\s*"[^"]+"\s*:\s*)'
+            r'([^\s' + valid_value_starts + r'][^,\n]*?)'
+            r'(\s*,?\s*)$',
+            line
+        )
+        if m:
+            prefix = m.group(1)
+            value = m.group(2).rstrip()
+            suffix = m.group(3)
+            has_comma = value.endswith(',') or suffix.strip() == ','
+            value = value.rstrip(',').rstrip()
+            value = value.replace('"', '\\"')
+            if has_comma:
+                fixed_lines.append(f'{prefix}"{value}",')
+            else:
+                fixed_lines.append(f'{prefix}"{value}"')
+        else:
+            fixed_lines.append(line)
+    
+    return '\n'.join(fixed_lines)
 
 
 def diagnose_json_error(response: str) -> str:
@@ -186,7 +322,7 @@ def parse_json_from_response(response: str) -> Optional[Dict]:
     """
     从 LLM 回复中解析 JSON (多策略健壮解析)
     
-    组合: extract_json_block → robust_json_parse
+    组合: _strip_thinking_prefix → extract_json_block → robust_json_parse
     
     Args:
         response: LLM 响应文本
@@ -298,9 +434,9 @@ def clean_markdown_wrapper(text: str) -> str:
 # 通用 JSON 修正 Prompt (不包含任何领域特定内容)
 JSON_FIX_PROMPT_TEMPLATE = """你之前输出的 JSON 格式有误, 请根据以下**原始输出**和**解析错误**信息, 重新输出**正确的 JSON**。
 
-## 你之前的原始输出 (RAW)
+## 你之前的原始输出 (完整内容, 未截断)
 ```
-{raw_response_truncated}
+{raw_response_full}
 ```
 
 ## 解析错误
@@ -330,7 +466,7 @@ class LLMRetryHelper:
         prompt="...",
         system_content="...",
         temperature=0.3,
-        max_tokens=2048,
+        max_tokens=None,   # None = 使用 llm_client.default_max_tokens (统一配置)
         max_retries=2,
         additional_instructions="...",
         validate_func=my_validate_func,
@@ -350,7 +486,7 @@ class LLMRetryHelper:
         prompt: str,
         system_content: str,
         temperature: float = 0.3,
-        max_tokens: int = 2048,
+        max_tokens: int = None,
         max_retries: int = 2,
         additional_instructions: str = "",
         validate_func: Optional[Callable[[Dict], bool]] = None,
@@ -363,7 +499,7 @@ class LLMRetryHelper:
             prompt: 调用的 prompt
             system_content: system message 内容
             temperature: LLM temperature
-            max_tokens: 最大 token 数
+            max_tokens: 最大 token 数 (None=使用 llm_client 的 default_max_tokens)
             max_retries: 最大重试次数
             additional_instructions: JSON_FIX_PROMPT 额外说明
             validate_func: 可选验证函数, 接收 parsed dict, 返回 bool
@@ -372,6 +508,8 @@ class LLMRetryHelper:
         Returns:
             Parsed JSON dict, 或 None
         """
+        if max_tokens is None:
+            max_tokens = getattr(self.llm, 'default_max_tokens', 4096)
         response = self.llm.chat(
             messages=[
                 {"role": "system", "content": system_content},
@@ -403,25 +541,24 @@ class LLMRetryHelper:
             if attempt >= max_retries:
                 logger.warning(
                     f"All {max_retries + 1} attempts exhausted. "
-                    f"Response preview: {(response[:300] if response else 'None')}..."
+                    f"Response preview: {(response if response else 'None')}..."
                 )
                 return None
             
-            # 准备重试
-            raw_truncated = (response[:3000] + "..."
-                             if response and len(response) > 3000
-                             else (response or "None"))
+            # 准备重试 — 传递完整原始响应, 不截断 (截断会导致 LLM 无法重建完整 JSON)
+            # 先剔除 thinking 模型的思考前缀, 避免干扰 LLM 修正 JSON
+            raw_response_full = _strip_thinking_prefix(response) or "None"
             parse_error = diagnose_json_error(response)
             
             retry_prompt = JSON_FIX_PROMPT_TEMPLATE.format(
-                raw_response_truncated=raw_truncated,
+                raw_response_full=raw_response_full,
                 parse_error=parse_error,
                 additional_instructions=additional_instructions,
             )
             
             logger.info(
                 f"JSON retry #{attempt + 1}/{max_retries} "
-                f"(parse error: {parse_error[:60]}...)"
+                f"(parse error: {parse_error}...)"
             )
             
             response = self.llm.chat(
@@ -443,7 +580,7 @@ class LLMRetryHelper:
         return None
     
     def call_llm(self, prompt: str, system_content: str,
-                 temperature: float = 0.3, max_tokens: int = 2048,
+                 temperature: float = 0.3, max_tokens: int = None,
                  suppress_response_log: bool = False) -> Optional[str]:
         """
         简单 LLM 调用 (不带解析/重试)
@@ -452,12 +589,14 @@ class LLMRetryHelper:
             prompt: 用户 prompt
             system_content: system message
             temperature: 温度
-            max_tokens: 最大 token
+            max_tokens: 最大 token (None=使用 llm_client 的 default_max_tokens)
             suppress_response_log: 如果为 True, 不输出响应日志 (用于代码生成等场景)
             
         Returns:
             LLM 响应字符串, 或 None
         """
+        if max_tokens is None:
+            max_tokens = getattr(self.llm, 'default_max_tokens', 4096)
         return self.llm.chat(
             messages=[
                 {"role": "system", "content": system_content},

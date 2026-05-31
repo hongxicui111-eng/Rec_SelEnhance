@@ -23,6 +23,7 @@ from datetime import datetime
 
 from agent.llm_client import LLMClient
 from agent.prompts import CODER_INSTRUCTIONS, DEBUGGER_INSTRUCTIONS
+from agent.llm_utils import parse_json_from_response
 
 logger = logging.getLogger("rec_self_evolve.coder")
 
@@ -68,6 +69,7 @@ class CoderAgent:
         max_reflection_times: int = 3,
         timeout: int = 120,
         max_retries: int = 3,
+        default_max_tokens: int = 4096,
     ):
         self.model = model
         self.temperature = temperature
@@ -79,6 +81,7 @@ class CoderAgent:
             model=model,
             timeout=timeout,
             max_retries=max_retries,
+            default_max_tokens=default_max_tokens,
         )
         
         # 主题上下文
@@ -200,7 +203,7 @@ class CoderAgent:
             source_code_context=source_code_context or f"推荐系统模型: {self.problem_name}\n问题描述: {self.problem_description}",
         )
         
-        response = await self.llm_client.async_chat(prompt, temperature=self.temperature, max_tokens=2000)
+        response = await self.llm_client.async_chat(prompt, temperature=self.temperature)
         try:
             result = self._parse_code_response_with_diff(response, research_idea)
             if result and result.success:
@@ -313,21 +316,19 @@ class CoderAgent:
         return '\n'.join(clean_lines)
             
     def _parse_code_response(self, response: str) -> CodeResult:
-        """解析代码响应"""
+        """解析代码响应 (使用 llm_utils.parse_json_from_response)"""
         
-        # 提取 JSON 部分
-        json_match = re.search(r'\{{.*\}}', response, re.DOTALL)
+        # 使用健壮解析器提取 JSON
+        data = parse_json_from_response(response)
         
         changes = []
         code = ""
         
-        if json_match:
+        if data and 'changes' in data:
             try:
-                data = json.loads(json_match.group())
-                if 'changes' in data:
-                    changes = [CodeChange(**c) for c in data['changes']]
+                changes = [CodeChange(**c) for c in data['changes']]
             except Exception as e:
-                logger.warning(f"JSON parse error: {e}")
+                logger.warning(f"CodeChange parse error: {e}")
                 
         # 提取代码部分（查找 ```python ... ```）
         code_blocks = re.findall(r'```python\n(.*?)```', response, re.DOTALL)
@@ -407,7 +408,7 @@ class CoderAgent:
         if new_idea:
             debugger_prompt += f"\n\n## 研究想法\n标题: {new_idea.title}\n描述: {new_idea.description}"
         
-        debugger_response = await self.llm_client.async_chat(debugger_prompt, temperature=max(0.1, self.temperature - 0.2), max_tokens=2000)
+        debugger_response = await self.llm_client.async_chat(debugger_prompt, temperature=max(0.1, self.temperature - 0.2))
         
         # 解析 DEBUGGER_INSTRUCTIONS 输出 — 支持 SEARCH/REPLACE 和 JSON 格式
         # 尝试解析 SEARCH/REPLACE 格式
@@ -460,7 +461,7 @@ class CoderAgent:
 - 确保维度对齐正确
 """
         
-        fallback_response = await self.llm_client.async_chat(fallback_prompt, temperature=max(0.1, self.temperature - 0.2), max_tokens=2000)
+        fallback_response = await self.llm_client.async_chat(fallback_prompt, temperature=max(0.1, self.temperature - 0.2))
         
         try:
             result = self._parse_code_response(fallback_response)
